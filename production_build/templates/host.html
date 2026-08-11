@@ -231,7 +231,7 @@
                        placeholder="e.g. Hobbies">
                 <button type="button" class="btn btn-outline-secondary" id="addFieldBtn">+ Add Field</button>
               </div>
-              <div class="form-text mb-2 text-muted">(Max 50 characters allowed)</div>
+              <div class="form-text mb-2 text-muted">(Max 200 characters allowed)</div>
               <div class="form-check form-check-inline mb-3 ms-1">
                 <input class="form-check-input" type="checkbox" id="newFieldRequired">
                 <label class="form-check-label small" for="newFieldRequired">Required?</label>
@@ -429,7 +429,7 @@
       labelInput.className = 'form-control form-control-sm cf-name';
       labelInput.value = name || '';
       labelInput.placeholder = 'Field name';
-      labelInput.maxLength = 30;
+      labelInput.maxLength = 200;
       labelInput.required = true;
 
       const reqLabel = document.createElement('label');

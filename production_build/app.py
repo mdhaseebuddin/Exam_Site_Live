@@ -1404,7 +1404,7 @@ def host_reset_password():
             error = f"Password must be at least {MIN_PASSWORD_LEN} characters."
         elif password != confirm:
             error = "Passwords do not match."
-    else:
+        else:
             # 2. OTP and Host verification
             host = find_host(email)
             if host is None:
@@ -1819,8 +1819,8 @@ def exam_register(exam_id):
             value = request.form.get(slug, "").strip()
             if cf.get("required") and not value:
                 missing.append(cf.get("name", slug))
-            if len(value) > 30:
-                err = f"{cf.get('name', slug)} cannot exceed 30 characters."
+            if len(value) > 200:
+                err = f"{cf.get('name', slug)} cannot exceed 200 characters."
                 return render_template("register.html", error=err, form=request.form, captcha=captcha_payload(), **template_vars), 400
             student_data[slug] = value
 
@@ -1884,19 +1884,21 @@ def exam_register(exam_id):
             if slug in student_data:
                 custom_vals[slug] = student_data[slug]
 
-        # Generate OTP code for the student's phone verification step
-        otp_code = f"{secrets.randbelow(1000000):06d}"
-        print(f"\n[STUDENT OTP DEBUG] Phone: {phone_val} | Code: {otp_code}\n")
-
+                # Generate OTP code for the student's phone verification step
+        otp_code = _generate_otp()
+        
         # Store pending registration details in the session
         session["student_pending"] = {
             "exam_id": exam_id,
             "name": student_data.get("name", ""),
             "phone": phone_val,
             "custom_fields": custom_vals,
-            "otp_code": otp_code,
+            "otp_code_hash": hash_password(otp_code),
             "otp_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
         }
+        
+        # Log/Print the OTP (in a real scenario this would send an SMS)
+        print(f"\n[STUDENT OTP DEBUG] Phone: {phone_val} | Code: {otp_code}\n")
 
         return redirect(url_for("exam_verify", exam_id=exam_id))
     return render_template(
@@ -1928,9 +1930,9 @@ def exam_verify(exam_id):
         action = request.form.get("action", "verify")
 
         if action == "resend":
-            otp_code = f"{secrets.randbelow(1000000):06d}"
+            otp_code = _generate_otp()
             print(f"\n[STUDENT OTP RESEND DEBUG] Phone: {pending['phone']} | Code: {otp_code}\n")
-            pending["otp_code"] = otp_code
+            pending["otp_code_hash"] = hash_password(otp_code)
             pending["otp_expires_at"] = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
             session["student_pending"] = pending
             flash("A new verification code has been sent.")
@@ -1941,9 +1943,9 @@ def exam_verify(exam_id):
 
         if datetime.now(timezone.utc) > expires_at:
             error = "Verification code has expired. Please request a new one."
-        elif submitted_code != pending.get("otp_code"):
+        elif not verify_password(submitted_code, pending.get("otp_code_hash", "")):
             error = "Invalid verification code. Please try again."
-    else:
+        else:
             # Code is valid! Create the student's isolated Session and Student record.
             session_id = uuid.uuid4().hex[:16]
             now = datetime.now(timezone.utc)
