@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+<title>Exam Result — {{ session.session_id }}</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; font-size: 12px; color: #222; line-height: 1.5; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .sub { color: #666; margin-bottom: 20px; }
+    .score-box { border: 2px solid #198754; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px; background: #f0faf4; }
+    .score-box .big { font-size: 30px; font-weight: bold; color: #198754; }
+    .q { border: 1px solid #ddd; border-radius: 6px; padding: 12px 14px; margin-bottom: 14px; page-break-inside: avoid; }
+    .q .text { font-weight: bold; margin-bottom: 6px; }
+    .q .badge { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 10px; background: #eee; color: #555; text-transform: uppercase; }
+    .opt { padding: 2px 0; }
+    .correct { color: #198754; font-weight: bold; }
+    .wrong { color: #dc3545; font-weight: bold; }
+    .muted { color: #666; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <h1>🎓 Exam Result</h1>
+  <div class="sub">
+    Session {{ session.session_id }} &nbsp;·&nbsp; Submitted {{ session.completed_at }}
+  </div>
+
+  {% if session.score is not none %}
+    <div class="score-box">
+      <div class="big">{{ session.score }} / {{ session.total_selected }}</div>
+      <div class="muted">Auto-graded multiple-choice score</div>
+    </div>
+  {% else %}
+    <div class="score-box">
+      <div class="big">Awaiting review</div>
+      <div class="muted">This exam contains essay/coding answers which require manual review.</div>
+    </div>
+  {% endif %}
+
+  <h2 style="font-size:16px;">Answer Review</h2>
+  {% for q in session.questions %}
+    {% set g = session.graded[loop.index0] %}
+    {% set qtype = q.get('type', 'mcq') %}
+    <div class="q">
+      <div class="text">Q{{ loop.index }}. {{ q.text }}</div>
+      <div><span class="badge">{{ qtype | upper }}</span></div>
+
+      {% if qtype == 'mcq' %}
+        <div class="muted mt-1">
+          {% if g.correct %}
+            ✅ Correct
+          {% elif g.correct is not none %}
+            ❌ Incorrect
+          {% endif %}
+        </div>
+        <ul style="list-style:none; padding-left:0; margin:6px 0 0;">
+          {% for opt in q.options %}
+            {% set oi = loop.index0 %}
+            {% set is_correct = oi == g.correct_index %}
+            {% set is_selected = g.selected is not none and oi == g.selected %}
+            <li class="opt {% if is_correct %}correct{% elif is_selected %}wrong{% endif %}">
+              {{ '•' if not is_correct and not is_selected else ('✔' if is_correct else '✘') }} {{ opt }}
+              {% if is_correct %} — Correct answer{% endif %}
+              {% if is_selected and not is_correct %} — Your answer{% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+        {% if g.selected is none %}
+          <div class="muted">⚠️ Not answered</div>
+        {% endif %}
+      {% else %}
+        <div class="muted mt-1">Answer:</div>
+        <div style="white-space: pre-wrap; border:1px solid #e5e5e5; background:#fafafa; padding:8px; border-radius:4px;">
+          {{ g.selected if g.selected else '⚠️ Not answered' }}
+        </div>
+        <div class="muted" style="margin-top:4px;">Awaiting manual review</div>
+      {% endif %}
+    </div>
+  {% endfor %}
+</body>
+</html>
+

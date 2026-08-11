@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Verify Phone — Exam Platform</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="{{ url_for('static', filename='style.css') }}" rel="stylesheet">
+</head>
+<body class="exam-body">
+    <main class="exam-main container-fluid px-3 py-4">
+    <div class="card shadow mx-auto w-100" style="max-width: 440px;">
+      <div class="card-body p-4 p-md-5">
+        <div class="text-center mb-4">
+          <div class="display-6 mb-2">📱</div>
+          <h1 class="h3">Verify Your Phone</h1>
+          <p class="text-muted mb-0">We sent a 6-digit code to <strong>{{ phone }}</strong>.</p>
+        </div>
+
+        {% if error %}
+          <div class="alert alert-danger py-2">{{ error }}</div>
+        {% endif %}
+
+        {% with messages = get_flashed_messages() %}
+          {% if messages %}
+            {% for msg in messages %}
+              <div class="alert alert-info py-2">{{ msg }}</div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+
+        <form method="POST" action="{{ url_for('exam_verify', exam_id=exam_id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="action" value="verify">
+
+          <div class="mb-3">
+            <label class="form-label">Verification Code (OTP)</label>
+            <input class="form-control form-control-lg text-center" type="text" name="otp" required 
+                   inputmode="numeric" pattern="[0-9]{6}" placeholder="000000" 
+                   autocomplete="one-time-code" autofocus>
+            <div class="form-text text-center">Enter the code to start your exam.</div>
+          </div>
+
+          <button type="submit" class="btn btn-primary w-100 py-2 mb-3">Verify & Start Exam</button>
+        </form>
+
+        <form method="POST" action="{{ url_for('exam_verify', exam_id=exam_id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="action" value="resend">
+          <div class="text-center small">
+            Didn't receive the code? 
+            <button type="submit" class="btn btn-link btn-sm p-0 align-baseline">Resend Code</button>
+          </div>
+        </form>
+
+        <div class="text-center mt-3 small">
+          <a href="{{ url_for('exam_register', exam_id=exam_id) }}" onclick="return confirm('Cancel registration? Current progress will be lost.');">Back to Registration</a>
+        </div>
+      </div>
+    </div>
+  </main>
+</body>
+</html>
+

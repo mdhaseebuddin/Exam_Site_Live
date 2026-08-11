@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Session Details — Exam Platform</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="{{ url_for('static', filename='style.css') }}" rel="stylesheet">
+</head>
+<body>
+  <nav class="navbar navbar-dark bg-dark px-3">
+    <span class="navbar-brand mb-0 h1">🎓 Session Details</span>
+    <div>
+      <a class="btn btn-outline-light btn-sm" href="/host">← Host Dashboard</a>
+      <a class="btn btn-outline-secondary btn-sm" href="/host/session/{{ session.session_id }}/details.pdf">⬇️ PDF</a>
+      <a class="btn btn-outline-primary btn-sm" href="/exam/{{ session.session_id }}" target="_blank" rel="noopener">Open Exam</a>
+    </div>
+  </nav>
+
+  <div class="container my-4">
+    <div class="row g-4">
+      <!-- ===== Student info ===== -->
+      <div class="col-lg-4">
+        <div class="card">
+          <div class="card-header fw-semibold">👤 Registered Student</div>
+          <div class="card-body">
+            {% if session.student %}
+              <table class="table table-sm mb-0">
+                <tbody>
+                  {# Core fields always shown: Name, Phone #}
+                  {% set labels = {
+                    'name': 'Name', 'phone': 'Phone'
+                  } %}
+                  {% for key, label in labels.items() %}
+                    {% if session.student.get(key) %}
+                      <tr><th class="text-muted" style="width: 40%;">{{ label }}</th><td>{{ session.student.get(key) }}</td></tr>
+                    {% endif %}
+                  {% endfor %}
+
+                  {# Custom dynamic fields defined by the host's Form Builder.
+                     Each is stored under its slug; show its display name. #}
+                  {% for cf in custom_registration_fields %}
+                    {% set slug = cf.slug %}
+                    {% if session.student.get(slug) %}
+                      <tr><th class="text-muted">{{ cf.name }}</th><td>{{ session.student.get(slug) }}</td></tr>
+                    {% endif %}
+                  {% endfor %}
+                </tbody>
+              </table>
+            {% else %}
+              <p class="text-muted mb-0">Not registered yet.</p>
+            {% endif %}
+            <hr>
+            <div class="small text-muted mb-1">Session</div>
+            <code class="small">{{ session.session_id }}</code>
+            <div class="small text-muted mt-2 mb-1">Status</div>
+            {% if session.status == 'completed' %}
+              <span class="badge bg-success">Completed</span>
+            {% elif session.status == 'started' %}
+              <span class="badge bg-warning text-dark">In Progress</span>
+            {% else %}
+              <span class="badge bg-secondary">Pending</span>
+            {% endif %}
+            {% if session.score is not none %}
+              <div class="small text-muted mt-2 mb-1">Score</div>
+              <strong>{{ session.score }} / {{ session.total_selected }}</strong>
+            {% elif session.status == 'completed' %}
+              <div class="small text-muted mt-2 mb-1">Score</div>
+              <span class="badge bg-info text-dark">Awaiting manual review</span>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Submitted answers ===== -->
+      <div class="col-lg-8">
+        <div class="card">
+          <div class="card-header fw-semibold">📋 Submitted Answers ({{ session.questions | length }})</div>
+          <div class="card-body">
+            {% if session.graded %}
+              {% for q in session.questions %}
+                {% set g = session.graded[loop.index0] %}
+                {% set qtype = q.get('type', 'mcq') %}
+                <div class="border rounded-3 p-3 mb-3">
+                  <div class="d-flex justify-content-between align-items-start gap-2">
+                    <strong>Q{{ loop.index }}. {{ q.text }}</strong>
+                    <span class="badge text-bg-light border">{{ qtype | upper }}</span>
+                  </div>
+
+                  {% if qtype == 'mcq' %}
+                    {% if g.correct is not none %}
+                      {% if g.correct %}
+                        <span class="badge bg-success mt-2">Correct</span>
+                      {% else %}
+                        <span class="badge bg-danger mt-2">Incorrect</span>
+                      {% endif %}
+                    {% endif %}
+                    <ul class="list-unstyled mt-2 mb-0">
+                      {% for opt in q.options %}
+                        {% set oi = loop.index0 %}
+                        {% set is_correct = g.correct_index is not none and oi == g.correct_index %}
+                        {% set is_selected = g.selected is not none and oi == g.selected %}
+                        <li class="p-1 {% if is_correct %}text-success fw-bold{% elif is_selected %}text-danger{% endif %}">
+                          {{ opt }}
+                          {% if is_correct %}<span class="badge bg-success ms-1">Correct answer</span>{% endif %}
+                          {% if is_selected and not is_correct %}<span class="badge bg-danger ms-1">Student's choice</span>{% endif %}
+                        </li>
+                      {% endfor %}
+                    </ul>
+                    {% if g.selected is none %}
+                      <div class="text-muted small mt-2">⚠️ Not answered</div>
+                    {% endif %}
+                  {% else %}
+                    <div class="mt-2">
+                      {% if g.selected %}
+                        <div class="p-2 border rounded bg-light">{{ g.selected }}</div>
+                      {% else %}
+                        <div class="text-muted small">⚠️ Not answered</div>
+                      {% endif %}
+                      <span class="badge bg-info text-dark mt-2">Awaiting manual review</span>
+                    </div>
+                  {% endif %}
+                </div>
+              {% endfor %}
+            {% else %}
+              <p class="text-muted mb-0">No submission yet.</p>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+

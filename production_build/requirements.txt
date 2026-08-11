@@ -1,0 +1,18 @@
+flask
+pdfkit
+reportlab
+flask-limiter
+python-dotenv
+flask-sqlalchemy
+flask-wtf
+marshmallow
+
+# Production WSGI servers
+#   gunicorn  = Linux/macOS (multi-worker, recommended for production)
+#   waitress  = Windows fallback (gunicorn does not run natively on Windows)
+gunicorn; sys_platform != 'win32'
+waitress; sys_platform == 'win32'
+
+# Load testing (install separately when you need it):
+#   pip install locust
+

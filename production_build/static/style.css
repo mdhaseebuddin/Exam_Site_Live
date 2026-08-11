@@ -1,0 +1,273 @@
+/* ===== Shared / dashboard ===== */
+body {
+  background: #f4f6f9;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  width: 100%;
+  max-width: 100vw;
+  overflow-x: hidden;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* Force wrapping across elements, containers, cards, tables, info boxes */
+*, .container, .container-fluid, .card, .student-info-panel, .student-info-value, .question-card, .question-text, td, th, div, p, span, code, pre {
+  word-break: break-word !important;
+  overflow-wrap: break-word !important;
+  white-space: normal !important;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.navbar-brand {
+  font-weight: 600;
+}
+
+.card {
+  border: none;
+  border-radius: 14px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+/* Responsive tables */
+.table-responsive {
+  border: 0;
+  margin-bottom: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Force nowrap on specified elements */
+.table td, .table th,
+.btn, .badge, .form-label, .small,
+.text-nowrap {
+  white-space: nowrap !important;
+}
+
+/* Override specifically for table cells that contain multiline content if needed */
+/* e.g., the student name/phone cell in exam_attempts */
+.table td.nowrap-off {
+  white-space: normal !important;
+  word-break: break-word !important;
+}
+
+code, .text-break {
+  word-break: break-all !important;
+  overflow-wrap: anywhere !important;
+  display: inline-block;
+  max-width: 100%;
+}
+
+/* ===== Mobile Layout Fixes (max-width: 768px) ===== */
+@media (max-width: 768px) {
+  body, html {
+    width: 100% !important;
+    max-width: 100% !important;
+    overflow-x: hidden !important;
+  }
+
+  .container, .container-fluid, .card, .question-card, .student-info-panel {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    margin-top: 0 !important;
+    border-radius: 0 !important;
+    padding-left: 15px !important;
+    padding-right: 15px !important;
+    box-sizing: border-box !important;
+  }
+
+  .exam-main {
+    width: 100% !important;
+    max-width: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  /* Form specific boxes often nested in cards */
+  form, .card-body {
+    width: 100% !important;
+    max-width: 100% !important;
+    padding-left: 10px !important;
+    padding-right: 10px !important;
+  }
+}
+
+
+/* ===== Exam page — distraction-free ===== */
+.exam-body {
+  background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.exam-header {
+  background: #ffffff;
+  padding: 1rem;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.exam-header-row {
+  margin-top: 1rem;
+}
+
+/* Prominent custom Exam Title / Heading */
+.exam-title-bar {
+  text-align: center;
+  padding: 0.5rem 0 1rem;
+  border-bottom: 2px solid #ffc107;
+  margin-bottom: 1rem;
+}
+
+.exam-title {
+  font-size: 1.25rem;
+  font-weight: 800;
+  color: #1e3c72;
+  margin: 0;
+  letter-spacing: 0.3px;
+  line-height: 1.3;
+}
+
+@media (min-width: 768px) {
+  .exam-title {
+    font-size: 1.6rem;
+  }
+}
+
+/* Dynamic Student Registration Details panel */
+.student-info-panel {
+  background: #fff8e7;
+  border: 1px solid #f0c36d;
+  border-radius: 12px;
+  padding: 0.75rem;
+}
+
+.student-info-title {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #8a6d1a;
+  margin-bottom: 0.5rem;
+}
+
+.student-info-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 0.5rem 1rem;
+}
+
+.student-info-item {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.2;
+}
+
+.student-info-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: #95731f;
+}
+
+.student-info-value {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #4a3a0e;
+  word-break: break-all;
+}
+
+.timer-pill {
+  background: #ffc107;
+  color: #212529;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  padding: 0.5rem 1rem;
+  border-radius: 50px;
+  font-size: 1.25rem;
+  letter-spacing: 1px;
+  min-width: 110px;
+  box-shadow: 0 2px 6px rgba(255, 193, 7, 0.4);
+  text-align: center;
+}
+
+@media (min-width: 768px) {
+  .timer-pill {
+    font-size: 1.5rem;
+    padding: 8px 22px;
+    min-width: 130px;
+  }
+}
+
+.timer-pill.time-up {
+  background: #dc3545;
+  color: #ffffff;
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.6; }
+}
+
+.exam-main {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.question-card {
+  width: 100%;
+  max-width: 760px;
+  border-radius: 16px;
+}
+
+.option-item {
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.option-item:hover {
+  background: #f0f4ff;
+  border-color: #0d6efd;
+}
+
+.option-item:has(input:checked) {
+  background: #e7f1ff;
+  border-color: #0d6efd;
+}
+
+.exam-footer {
+  background: #ffffff;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.05);
+}
+
+@media (min-width: 576px) {
+  .exam-footer {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+  }
+}
+
+/* Fix for long URLs/codes/text breaking layout */
+code, .question-text, .cf-label, .student-info-value {
+  word-break: break-word;
+  overflow-wrap: break-word;
+  white-space: normal;
+}
+

@@ -1,0 +1,37 @@
+# Secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+*.env
+
+# Local SQLite databases (created at runtime)
+instance/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Runtime-generated private/log folders
+logs/
+user_logins/
+tests_conducted/
+data/
+
+# Python
+venv/
+env/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+

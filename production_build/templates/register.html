@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Register — Exam Platform</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="{{ url_for('static', filename='style.css') }}" rel="stylesheet">
+</head>
+<body class="exam-body">
+        <main class="exam-main container-fluid">
+        <div class="card shadow mx-auto w-100">
+
+
+      <div class="card-body p-4 p-md-5">
+        <div class="text-center mb-4">
+          <div class="display-6 mb-2">📝</div>
+          <h1 class="h3">Student Registration</h1>
+          <p class="text-muted mb-0">Please provide the requested details before the exam starts.</p>
+        </div>
+
+        {% if error %}
+          <div class="alert alert-danger py-2">{{ error }}</div>
+        {% endif %}
+
+        <!-- Client-side validation errors are rendered here -->
+        <div id="clientError" class="alert alert-danger py-2" style="display:none;"></div>
+
+        <!-- The core fields (name/phone) plus the custom fields defined by
+             the host's Dynamic Form Builder are rendered below. The custom
+             fields loop over `custom_registration_fields`; each field marked
+             `required` gets the HTML `required` attribute. -->
+<form method="POST" action="{% if exam_id is defined and exam_id %}{{ url_for('exam_register', exam_id=exam_id) }}{% else %}{{ url_for('register', session_id=session_id) }}{% endif %}" id="regForm" novalidate>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          {% for field in required_fields %}
+            {% set label = field_labels.get(field, field | replace('_', ' ') | title) %}
+            <div class="mb-3">
+              <label class="form-label" for="f_{{ field }}">{{ label }}</label>
+
+              {% if field == 'phone' %}
+                <input class="form-control" id="f_{{ field }}" type="tel"
+                       name="{{ field }}" required inputmode="numeric" autocomplete="tel"
+                       minlength="10" maxlength="10" pattern="[0-9]{10}"
+                       value="{{ form.get(field, '') }}"
+                       placeholder="e.g. 03001234567"
+                       data-rule="phone">
+                <div class="form-text">Exactly 10 digits (numbers only). Note: A live OTP verification code will be sent to this number.</div>
+              {% elif field == 'name' %}
+                <input class="form-control" id="f_{{ field }}" type="text"
+                       name="{{ field }}" required autocomplete="name"
+                       maxlength="35"
+                       value="{{ form.get(field, '') }}"
+                       placeholder="e.g. Jane Doe"
+                       data-rule="name">
+                <div class="form-text">Alphabetic characters only (no numbers). Max 35 chars.</div>
+              {% endif %}
+            </div>
+          {% endfor %}
+
+          {# ===== Dynamic Form Builder: loop over custom registration fields ===== #}
+          {% for cf in custom_registration_fields %}
+            {% set cf_label = cf.name %}
+            {% set cf_slug = cf.slug %}
+            <div class="mb-3">
+              <label class="form-label" for="f_{{ cf_slug }}">{{ cf_label }}
+                {% if not cf.required %}<span class="text-muted small fw-normal">(optional)</span>{% endif %}
+              </label>
+              <input class="form-control" id="f_{{ cf_slug }}" type="text"
+                     name="{{ cf_slug }}" {% if cf.required %}required{% endif %}
+                     autocomplete="off" maxlength="50"
+                     value="{{ form.get(cf_slug, '') }}"
+                     placeholder="{{ cf_label }}">
+            </div>
+          {% endfor %}
+
+<!-- Math CAPTCHA — blocks automated bots from spamming registration -->
+          <div class="mb-3">
+            <label class="form-label">Security Check</label>
+            <div class="input-group">
+              <span class="input-group-text fw-semibold">{{ captcha.left }} {{ captcha.op }} {{ captcha.right }} =</span>
+              <input class="form-control" id="f_captcha" type="number" name="captcha" required
+                     placeholder="Your answer" autocomplete="off" inputmode="numeric">
+            </div>
+            <div class="form-text">Solve the math problem to prove you're human.</div>
+          </div>
+
+          <!-- Mandatory Privacy Policy & Legal Liability Disclaimer -->
+          <div class="form-check mb-3">
+            <input class="form-check-input" type="checkbox" id="agree" name="agree" value="1" required>
+            <label class="form-check-label small" for="agree">
+              I have read and agree to the
+              <a href="{{ url_for('privacy') }}" target="_blank" rel="noopener">
+                Privacy Policy &amp; Liability Disclaimer</a>.
+              I understand the platform is not liable for data loss, server downtime,
+              or illegal activities / cheating conducted through this exam.
+            </label>
+          </div>
+
+          <button type="submit" class="btn btn-primary w-100 py-2">Start Exam →</button>
+        </form>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    // ---- Client-side validation (mirrors the server-side rules) ----
+    const form = document.getElementById('regForm');
+    const errorBox = document.getElementById('clientError');
+
+    const nameRule = /^[A-Za-z][A-Za-z\s.'-]*$/;   // alphabetic only
+    const phoneRule = /^\d{10}$/;                  // exactly 10 digits
+
+    form.addEventListener('submit', (e) => {
+      const errors = [];
+
+      const nameInput = form.querySelector('input[name="name"]');
+      if (nameInput) {
+        const value = nameInput.value.trim();
+        if (!value) {
+          errors.push('Full Name is required.');
+        } else if (!nameRule.test(value)) {
+          errors.push('Full Name may only contain alphabetic characters (no numbers).');
+        } else if (value.length > 35) {
+          errors.push('Full Name cannot exceed 35 characters.');
+        }
+      }
+
+      const phoneInput = form.querySelector('input[name="phone"]');
+      if (phoneInput) {
+        const value = phoneInput.value.trim();
+        if (!value) {
+          errors.push('Phone Number is required.');
+        } else if (!phoneRule.test(value)) {
+          errors.push('Phone Number must be exactly 10 digits.');
+        }
+      }
+
+// Any other required fields must be filled in.
+      form.querySelectorAll('input[required]').forEach((input) => {
+        if (input.type === 'number' && input.name === 'captcha') {
+          if (!input.value.trim()) {
+            errors.push('Please answer the security check.');
+          }
+          return;
+        }
+        if (input.type === 'checkbox' && input.name === 'agree') {
+          if (!input.checked) {
+            errors.push('You must accept the Privacy Policy & Liability Disclaimer to continue.');
+          }
+          return;
+        }
+        if (!input.value.trim()) {
+          const label = input.closest('.mb-3').querySelector('.form-label').textContent;
+          errors.push(label + ' is required.');
+        }
+      });
+
+      if (errors.length) {
+        e.preventDefault();  // Do NOT let the form submit.
+        errorBox.textContent = errors[0];
+        errorBox.style.display = '';
+      } else {
+        errorBox.style.display = 'none';
+      }
+    });
+  </script>
+</body>
+</html>
+

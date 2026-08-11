@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Privacy Policy & Liability Disclaimer — Exam Platform</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="{{ url_for('static', filename='style.css') }}" rel="stylesheet">
+  <style>
+    body { background: #f4f6f9; }
+    .legal-container { max-width: 820px; margin: 3rem auto; padding: 0 1rem; }
+    .legal-card { border: none; border-radius: 14px; box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+  </style>
+</head>
+<body>
+  <nav class="navbar navbar-dark bg-dark px-3">
+    <span class="navbar-brand mb-0 h1">🎓 Exam Platform</span>
+    <span class="text-light small">Privacy Policy & Legal Disclaimer</span>
+  </nav>
+
+  <div class="legal-container">
+    <div class="card legal-card">
+      <div class="card-body p-4 p-md-5">
+        <h1 class="h3 mb-4">Privacy Policy &amp; Legal Liability Disclaimer</h1>
+
+        <p class="text-muted">Last updated: <span id="lastUpdated"></span></p>
+
+        <h5>1. Purpose</h5>
+        <p>
+          This platform provides an online examination service. It is offered as
+          open-source software and may be self-hosted or hosted by a third party.
+          By using this platform, you accept the terms and conditions described
+          below.
+        </p>
+
+        <h5>2. No Liability for Data Loss</h5>
+        <p>
+          We are <strong>not liable</strong> for any loss, corruption, or breach of
+          data, including but not limited to student registration details, submitted
+          answers, exam results, or configuration settings. Users are strongly
+          advised to maintain their own independent backups of all data. The service
+          is provided &ldquo;as-is&rdquo; without any warranty of any kind, express
+          or implied.
+        </p>
+
+        <h5>3. No Liability for Server Downtime</h5>
+        <p>
+          We are <strong>not liable</strong> for any interruption, delay, or failure
+          of the service, including server downtime, network outages, maintenance
+          windows, or any event that prevents an exam from being taken, submitted,
+          or graded. We make no guarantee of uninterrupted availability or
+          performance.
+        </p>
+
+        <h5>4. No Liability for Illegal Activities or Cheating</h5>
+        <p>
+          The platform is a neutral tool. We are <strong>not responsible</strong>
+          for, and disclaim all liability arising from, any illegal activities,
+          academic dishonesty, or cheating conducted through or by means of exams
+          generated with this software. It is the sole responsibility of the
+          exam organizer / host to ensure that their use of the platform complies
+          with all applicable laws, regulations, and institutional policies. The
+          platform does not employ anti-cheating measures beyond the technical
+          controls provided (e.g. server-side grading, per-session timers).
+        </p>
+
+        <h5>5. User Responsibility &amp; Code of Conduct</h5>
+        <p>
+          By registering for an exam, you agree to:
+        </p>
+        <ul>
+          <li>Provide accurate and truthful registration information.</li>
+          <li>Not engage in any form of cheating, impersonation, or unauthorized
+              assistance.</li>
+          <li>Not attempt to access, modify, or disrupt the platform or other
+              users&rsquo; data.</li>
+          <li>Use the service only for lawful purposes.</li>
+        </ul>
+
+        <h5>6. Data Collection &amp; Privacy</h5>
+        <p>
+          The platform collects information you provide during registration (e.g.
+          name, phone, and any custom fields configured by the host). This data is
+          stored to administer exams and is accessible to the exam host. We do not
+          sell your personal information. Please contact the individual exam host
+          for details about how your specific data is used and retained.
+        </p>
+
+        <h5>7. Changes to This Policy</h5>
+        <p>
+          We may update this policy from time to time. Continued use of the
+          platform after changes are posted constitutes acceptance of the revised
+          policy.
+        </p>
+
+        <div class="text-center mt-4">
+          <a class="btn btn-outline-secondary" href="javascript:window.close()">Close</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('lastUpdated').textContent = new Date().toLocaleDateString(undefined, {
+      year: 'numeric', month: 'long', day: 'numeric'
+    });
+  </script>
+</body>
+</html>

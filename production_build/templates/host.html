@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Host Dashboard — Exam Platform</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="{{ url_for('static', filename='style.css') }}" rel="stylesheet">
+</head>
+<body>
+<nav class="navbar navbar-dark bg-dark px-3">
+    <span class="navbar-brand mb-0 h1">🎓 Exam Platform</span>
+    <div class="d-flex align-items-center gap-3">
+      <span class="text-light small">
+        <span class="badge bg-info text-dark">👤 {{ (host.email if host else 'Host') }}</span>
+      </span>
+      <form method="POST" action="{{ url_for('host_logout') }}" class="mb-0">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="btn btn-sm btn-outline-light">Logout</button>
+      </form>
+    </div>
+  </nav>
+
+  <div class="container my-4">
+    <!-- Feedback alerts -->
+    {% if request.args.get('msg') == 'submissions_cleared' %}
+      <div class="alert alert-success">✅ All student submissions and exam sessions have been cleared. Your question bank is untouched.</div>
+    {% elif error %}
+      <div class="alert alert-warning">{{ error }}</div>
+    {% elif request.args.get('error') == 'session_not_found' %}
+      <div class="alert alert-warning">⚠️ That session link is invalid or no longer exists.</div>
+    {% elif request.args.get('error') == 'empty_bank' %}
+      <div class="alert alert-warning">⚠️ Add at least one question before generating an exam link.</div>
+    {% elif request.args.get('error') == 'invalid_question' %}
+      <div class="alert alert-warning">⚠️ Please provide question text and at least two options.</div>
+{% elif request.args.get('error') == 'invalid_config' %}
+      <div class="alert alert-warning">⚠️ Time and ratio must be positive whole numbers.</div>
+    {% elif request.args.get('error') == 'must_agree' %}
+      <div class="alert alert-warning">⚠️ You must check the "I Agree to the Terms & Privacy Policy" box before generating an exam session.</div>
+    {% endif %}
+
+    <!-- ================= Host-Only Informational Notice ================= -->
+    <div class="card mb-4 border-info">
+      <div class="card-header fw-semibold bg-info text-white">ℹ️ Important Notice — Exam Capacity</div>
+      <div class="card-body">
+        <p class="mb-2">
+          Only <strong>500 applicants/examinees</strong> can take this exam.
+          If you require more slots, please contact:
+        </p>
+        <ul class="mb-0">
+          <li>📧 Email: <a href="mailto:mdhaseebuddin889@gmail.com">mdhaseebuddin889@gmail.com</a></li>
+          <li>📱 Mobile: <a href="tel:7670966267">7670966267</a></li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- ================= Submission Capacity Counter ================= -->
+    <div class="card mb-4">
+      <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+        <span>📊 Submission Capacity</span>
+        <span class="badge {{ 'bg-danger' if completed_submissions >= max_capacity else 'bg-success' }}">
+          {{ completed_submissions }} / {{ max_capacity }}
+        </span>
+      </div>
+      <div class="card-body">
+        <div class="mb-2">
+          <span class="fw-semibold">Submissions: {{ completed_submissions }} / {{ max_capacity }}</span>
+          <span class="text-muted small ms-2">
+            {% set remaining = max_capacity - completed_submissions %}
+            {{ remaining }} slot(s) remaining
+          </span>
+        </div>
+        <div class="progress" id="capacityProgress" role="progressbar" aria-valuenow="{{ completed_submissions }}" aria-valuemin="0" aria-valuemax="{{ max_capacity }}">
+          <div id="capacityProgressBar" class="progress-bar {{ 'bg-danger' if completed_submissions >= max_capacity else (('bg-warning' if remaining <= 50 else 'bg-success')) }}"></div>
+        </div>
+        {% if completed_submissions >= max_capacity %}
+          <div class="alert alert-danger mb-0 mt-2 py-2">⚠️ Capacity reached — no more submissions will be accepted.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="row g-4">
+      <!-- ================= LEFT: Build the bank ================= -->
+      <div class="col-lg-5">
+        <!-- Add question -->
+        <div class="card mb-4">
+          <div class="card-header fw-semibold">➕ Add Question to Bank</div>
+          <div class="card-body">
+            <form method="POST" action="{{ url_for('add_question') }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <div class="mb-3">
+                <label class="form-label">Question Type</label>
+                <select class="form-select" name="type" id="questionType">
+                  <option value="mcq">Multiple Choice (MCQ)</option>
+                  <option value="essay">Essay (textarea)</option>
+                  <option value="coding">Coding (textarea)</option>
+                </select>
+              </div>
+
+              <div class="mb-3">
+                <label class="form-label">Question Text</label>
+                <textarea class="form-control" name="text" rows="2" required placeholder="e.g. What is the capital of France?"></textarea>
+              </div>
+
+              <!-- MCQ-only fields: options + correct answer -->
+              <div id="mcqFields">
+                <label class="form-label">Options</label>
+                <div id="optionsContainer" class="mb-2">
+                  <div class="mb-2 option-row">
+                    <div class="input-group">
+                      <span class="input-group-text">A</span>
+                      <input class="form-control" type="text" name="options" required placeholder="Option A">
+                    </div>
+                  </div>
+                  <div class="mb-2 option-row">
+                    <div class="input-group">
+                      <span class="input-group-text">B</span>
+                      <input class="form-control" type="text" name="options" required placeholder="Option B">
+                    </div>
+                  </div>
+                </div>
+                <button type="button" id="addOptionBtn" class="btn btn-sm btn-outline-secondary mb-3">+ Add Option</button>
+
+                <div class="mb-3">
+                  <label class="form-label">Correct Answer</label>
+                  <select class="form-select" name="correct_index" id="correctAnswer"></select>
+                </div>
+              </div>
+
+              <button type="submit" class="btn btn-primary w-100">Save Question</button>
+            </form>
+          </div>
+        </div>
+
+        <!-- Question bank -->
+        <div class="card">
+          <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+            <span>🗂️ Question Bank ({{ questions | length }})</span>
+            <form method="POST" action="{{ url_for('clear_questions') }}"
+                  onsubmit="return confirm('WARNING: Are you sure you want to delete ALL questions? This cannot be undone.');">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <button type="submit" class="btn btn-sm btn-outline-danger">Clear All Questions</button>
+            </form>
+          </div>
+          <div class="card-body">
+            {% if questions %}
+              {% for q in questions %}
+                {% set qtype = q.get('type', 'mcq') %}
+                <div class="border rounded-3 p-3 mb-2">
+                  <div class="d-flex align-items-center justify-content-between gap-3">
+                    <div class="flex-grow-1">
+                      <strong class="mb-1 d-block">
+                      {{ q.text }}
+                        <span class="badge text-bg-light border align-middle ms-1">
+                        {{ qtype | upper }}
+                      </span>
+                    </strong>
+                  {% if qtype == 'mcq' %}
+                    <ul class="small text-muted mb-0 ps-3">
+                      {% for opt in q.options %}
+                        <li>{{ opt }}{% if loop.index0 == q.correct_index %} ✅{% endif %}</li>
+                      {% endfor %}
+                    </ul>
+                  {% else %}
+                    <div class="small text-muted mb-0">✍️ Free-text {{ qtype }} answer — manually reviewed.</div>
+                  {% endif %}
+                </div>
+                    <div class="flex-shrink-0">
+                      <form method="POST" action="{{ url_for('delete_question', qid=q.id) }}" class="mb-0">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button class="btn btn-sm btn-outline-danger text-nowpx">Delete</button>
+            </form>
+          </div>
+        </div>
+            </div>
+                    {% endfor %}
+            {% else %}
+              <p class="text-muted mb-0">No questions yet — add your first one on the left.</p>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+
+      <!-- ================= RIGHT: Configure & generate ================= -->
+      <div class="col-lg-7">
+        <!-- Exam configuration -->
+        <div class="card mb-4">
+          <div class="card-header fw-semibold">⚙️ Exam Configuration</div>
+          <div class="card-body">
+            <form method="POST" action="{{ url_for('generate_session') }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <div class="mb-3">
+                <label class="form-label">📌 Exam Title / Heading</label>
+                <input type="text" class="form-control" name="exam_title" maxlength="200"
+                       placeholder="e.g. Final Semester Examination 2026 — Mathematics"
+                       value="">
+                <div class="form-text">Shown prominently at the top of the student's exam page.</div>
+    </div>
+              <div class="row g-3">
+                <div class="col-md-6">
+                  <label class="form-label">Total Time (1-240 minutes)</label>
+                  <input type="number" class="form-control" name="time_limit" min="1" max="240" value="30" required>
+                  <div class="form-text">Maximum 4 hours (240 min).</div>
+  </div>
+
+                <div class="col-md-6">
+                  <label class="form-label">Question Ratio</label>
+                  <input type="number" class="form-control" name="ratio" min="1" placeholder="e.g. 5" required>
+                  <div class="form-text">Random questions each candidate receives from the bank (max {{ questions | length }} available).</div>
+                </div>
+              </div>
+              <div class="form-text mt-2 text-info fw-semibold">
+                ℹ️ Note: If you add questions to the bank, you can set a Question Ratio so that students automatically receive a randomized subset of unique questions from your bank.
+              </div>
+
+              <!-- ====== Dynamic Form Builder: Field Manager ====== -->
+              <hr class="my-4">
+              <label class="form-label fw-semibold d-block">📋 Dynamic Registration Fields</label>
+              <p class="text-muted small mb-2">
+                Define any custom fields a student must provide at registration
+                (e.g. "Address", "Hobbies", "University"). Tick <em>Required?</em>
+                to force the field. Full Name and Phone are always collected.
+              </p>
+
+              <!-- Field Manager rows (one per custom field) -->
+              <div id="fieldManagerRows" class="mb-2"></div>
+
+              <div class="input-group mb-3 w-100">
+                <input type="text" class="form-control" id="newFieldName" maxlength="50"
+                       placeholder="e.g. Hobbies">
+                <button type="button" class="btn btn-outline-secondary" id="addFieldBtn">+ Add Field</button>
+              </div>
+              <div class="form-text mb-2 text-muted">(Max 50 characters allowed)</div>
+              <div class="form-check form-check-inline mb-3 ms-1">
+                <input class="form-check-input" type="checkbox" id="newFieldRequired">
+                <label class="form-check-label small" for="newFieldRequired">Required?</label>
+              </div>
+
+              <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" name="agree" id="agree" value="1" required>
+                <label class="form-check-label small" for="agree">
+                  I Agree to the
+                  <a href="{{ url_for('privacy') }}" target="_blank" rel="noopener">Terms &amp; Privacy Policy</a>.
+                  I confirm that I will not use the generated exams for illegal activities, cheating, or misuse,
+                  and I accept full responsibility for how the exam and its materials are used.
+                </label>
+              </div>
+
+              <button type="submit" class="btn btn-success mt-1">🔗 Generate Exam Link</button>
+            </form>
+          </div>
+        </div>
+
+<!-- Generated exams (universal entry points) -->
+        <div class="card">
+                    <div class="card-header fw-semibold d-flex flex-column flex-sm-row justify-content-between align-items-sm-center gap-2">
+            <span>🔗 Generated Exams ({{ exams | length }})</span>
+            <div class="d-flex flex-wrap gap-2">
+              <form method="POST" action="{{ url_for('clear_submissions') }}"
+                    onsubmit="return confirm('⚠️ WARNING: Are you sure you want to delete ALL student submissions and exam sessions? Your question bank will be preserved.');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="btn btn-sm btn-danger w-100 w-sm-auto">🗑️ Reset Exam Data</button>
+              </form>
+              <a class="btn btn-sm btn-success w-100 w-sm-auto" href="{{ url_for('download_all_zip') }}">⬇️ Download All (.zip)</a>
+            </div>
+          </div>
+
+          <div class="card-body p-0">
+            {% if exams %}
+              <div class="table-responsive">
+                <table class="table table-hover mb-0 align-middle">
+                  <thead>
+                    <tr>
+                      <th style="width: 32%;">Portal Link</th>
+                      <th style="width: 22%;">Title</th>
+                      <th style="width: 10%; white-space: nowrap;">Time</th>
+                      <th style="width: 8%; white-space: nowrap;">Qty</th>
+                      <th style="width: 10%; white-space: nowrap;">Attempts</th>
+                      <th style="width: 8%; white-space: nowrap;">Status</th>
+                      <th style="width: 10%; white-space: nowrap;">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for ex in exams | reverse %}
+                      <tr>
+                        <td>
+                          <div class="d-flex flex-column gap-1">
+                            <code class="small text-break">{{ request.host_url }}exam/register/{{ ex.exam_id }}</code>
+                            <div class="d-flex gap-1">
+                              <button class="btn btn-xs btn-outline-secondary copy-btn py-0 px-2" data-link="{{ request.host_url }}exam/register/{{ ex.exam_id }}">Copy</button>
+                              <a class="btn btn-xs btn-outline-primary py-0 px-2" href="/exam/register/{{ ex.exam_id }}" target="_blank" rel="noopener">Open</a>
+                            </div>
+                          </div>
+                        </td>
+
+                        <td>{{ ex.exam_title or '(untitled)' }}</td>
+                        <td>{{ ex.time_limit_minutes }} min</td>
+                        <td>{{ ex.questions | length }}</td>
+                        <td>
+                          <span class="badge bg-secondary">{{ ex.attempt_count }}</span>
+                        </td>
+                        <td>
+                          <span class="badge {{ 'bg-success' if ex.completed_count else 'bg-light text-dark' }}">{{ ex.completed_count }}</span>
+                        </td>
+                                                <td>
+                          <div class="d-flex flex-wrap gap-1">
+                            <a class="btn btn-sm btn-outline-secondary text-nowrap" href="{{ url_for('host_exam_attempts', exam_id=ex.exam_id) }}">View Attempts</a>
+                            <form method="POST" action="{{ url_for('delete_exam', exam_id=ex.exam_id) }}" class="d-inline">
+                              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                              <button class="btn btn-sm btn-outline-danger">Delete</button>
+                            </form>
+                          </div>
+                        </td>
+
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            {% else %}
+              <p class="text-muted mb-0 p-3">No exams yet — configure above and click "Generate Exam Link".</p>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ---- Submission Capacity progress bar ----
+    // Set the progress-bar width in JS using the numeric aria attributes
+    // already present on the element. Kept out of the inline style attribute
+    // so Jinja arithmetic doesn't trigger CSS linter warnings.
+    (function () {
+      const progress = document.getElementById('capacityProgress');
+      const bar = document.getElementById('capacityProgressBar');
+      if (progress && bar) {
+        const value = parseInt(progress.getAttribute('aria-valuenow') || '0', 10);
+        const max = parseInt(progress.getAttribute('aria-valuemax') || '0', 10);
+        const width = max > 0 ? Math.min(100, (value / max) * 100) : 0;
+        bar.style.width = width + '%';
+      }
+    })();
+
+    // ---- Question type toggle: hide MCQ-only fields for essay/coding ----
+    const questionType = document.getElementById('questionType');
+    const mcqFields = document.getElementById('mcqFields');
+
+    function syncMcqFields() {
+      const isMcq = questionType.value === 'mcq';
+      mcqFields.style.display = isMcq ? '' : 'none';
+      // Don't force "required" off (form still needs options when MCQ selected),
+      // but prevent HTML5 blocking when the fields are hidden.
+      mcqFields.querySelectorAll('input[name="options"]').forEach(inp => {
+        inp.required = isMcq;
+      });
+    }
+    questionType.addEventListener('change', syncMcqFields);
+
+    // ---- Dynamic options + correct-answer dropdown ----
+    const optionsContainer = document.getElementById('optionsContainer');
+    const correctAnswer = document.getElementById('correctAnswer');
+    const addOptionBtn = document.getElementById('addOptionBtn');
+
+    function refreshCorrectAnswer() {
+      const inputs = optionsContainer.querySelectorAll('input[name="options"]');
+      correctAnswer.innerHTML = '';
+      inputs.forEach((_, idx) => {
+        const opt = document.createElement('option');
+        opt.value = idx;
+        opt.textContent = 'Option ' + String.fromCharCode(65 + idx);
+        correctAnswer.appendChild(opt);
+      });
+    }
+
+    addOptionBtn.addEventListener('click', () => {
+      const count = optionsContainer.querySelectorAll('.option-row').length;
+      if (count >= 26) return;
+      const letter = String.fromCharCode(65 + count);
+      const row = document.createElement('div');
+      row.className = 'mb-2 option-row';
+      row.innerHTML = `
+        <div class="input-group">
+          <span class="input-group-text">${letter}</span>
+          <input class="form-control" type="text" name="options" required placeholder="Option ${letter}">
+          <button type="button" class="btn btn-outline-danger remove-option">✕</button>
+        </div>`;
+      optionsContainer.appendChild(row);
+      row.querySelector('.remove-option').addEventListener('click', () => {
+        row.remove();
+        refreshCorrectAnswer();
+      });
+      refreshCorrectAnswer();
+    });
+
+    // ---- Copy-to-clipboard for session links ----
+    document.querySelectorAll('.copy-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        navigator.clipboard.writeText(btn.dataset.link).then(() => {
+          btn.textContent = 'Copied!';
+          setTimeout(() => (btn.textContent = 'Copy'), 1500);
+        });
+      });
+    });
+
+    // ====================== Dynamic Form Builder ======================
+    // Field Manager — the host can add any number of registration fields.
+    // Each row is rendered with a text input (field name) and a Required?
+    // checkbox. On submit, the rows are serialized into parallel arrays
+    // (cf_name[], cf_required[], cf_slug[]) for the backend to consume.
+    // ------------------------------------------------------------------
+    const fieldRows = document.getElementById('fieldManagerRows');
+    const newFieldName = document.getElementById('newFieldName');
+    const newFieldRequired = document.getElementById('newFieldRequired');
+    const addFieldBtn = document.getElementById('addFieldBtn');
+
+    // Convert a display label into a safe HTML input name.
+    function slugify(label) {
+      return label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'field';
+    }
+
+    function addFieldRow(name, required) {
+      const row = document.createElement('div');
+      row.className = 'd-flex align-items-center gap-2 mb-2 field-row';
+
+      const labelInput = document.createElement('input');
+      labelInput.type = 'text';
+      labelInput.className = 'form-control form-control-sm cf-name';
+      labelInput.value = name || '';
+      labelInput.placeholder = 'Field name';
+      labelInput.maxLength = 30;
+      labelInput.required = true;
+
+      const reqLabel = document.createElement('label');
+      reqLabel.className = 'form-check form-check-inline mb-0 text-nowrap';
+      reqLabel.innerHTML = '<input class="form-check-input cf-required" type="checkbox">' +
+        '<span class="form-check-label small ms-1">Required?</span>';
+      if (required) {
+        reqLabel.querySelector('.cf-required').checked = true;
+      }
+
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'btn btn-sm btn-outline-danger';
+      removeBtn.textContent = '✕';
+      removeBtn.addEventListener('click', () => row.remove());
+
+      row.appendChild(labelInput);
+      row.appendChild(reqLabel);
+      row.appendChild(removeBtn);
+      fieldRows.appendChild(row);
+    }
+
+    addFieldBtn.addEventListener('click', () => {
+      const name = newFieldName.value.trim();
+      const required = newFieldRequired.checked;
+      if (!name) {
+        newFieldName.focus();
+        return;
+      }
+      addFieldRow(name, required);
+      newFieldName.value = '';
+      newFieldRequired.checked = false;
+      newFieldName.focus();
+    });
+
+    // Allow pressing Enter in the field-name box to add a row.
+    newFieldName.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        addFieldBtn.click();
+      }
+    });
+
+    // Before the form submits, serialize the dynamic rows into hidden fields
+    // named cf_name[], cf_required[], and cf_slug[] so Flask can read them.
+    const generateForm = document.querySelector('form[action="{{ url_for("generate_session") }}"]');
+    if (generateForm) {
+      generateForm.addEventListener('submit', (e) => {
+        // Remove any previously-injected hidden inputs (in case the user
+        // presses submit, fixes something, and submits again without reload).
+        generateForm.querySelectorAll('.cf-hidden').forEach((el) => el.remove());
+
+        document.querySelectorAll('.field-row').forEach((row) => {
+          const name = row.querySelector('.cf-name').value.trim();
+          if (!name) return;
+          const required = row.querySelector('.cf-required').checked;
+
+          const hName = document.createElement('input');
+          hName.type = 'hidden';
+          hName.className = 'cf-hidden';
+          hName.name = 'cf_name';
+          hName.value = name;
+
+          const hReq = document.createElement('input');
+          hReq.type = 'hidden';
+          hReq.className = 'cf-hidden';
+          hReq.name = 'cf_required';
+          hReq.value = required ? 'true' : 'false';
+
+          const hSlug = document.createElement('input');
+          hSlug.type = 'hidden';
+          hSlug.className = 'cf-hidden';
+          hSlug.name = 'cf_slug';
+          hSlug.value = slugify(name);
+
+          generateForm.appendChild(hName);
+          generateForm.appendChild(hReq);
+          generateForm.appendChild(hSlug);
+        });
+      });
+    }
+
+    refreshCorrectAnswer();
+  </script>
+</body>
+</html>
+

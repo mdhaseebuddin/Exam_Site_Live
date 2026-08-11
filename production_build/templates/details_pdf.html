@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+<title>Session Details — {{ session.session_id }}</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; font-size: 12px; color: #222; line-height: 1.5; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .sub { color: #666; margin-bottom: 20px; }
+    h2 { font-size: 16px; margin: 22px 0 8px; border-bottom: 2px solid #222; padding-bottom: 4px; }
+    table.info { border-collapse: collapse; width: 100%; margin-bottom: 8px; }
+    table.info th, table.info td { text-align: left; padding: 4px 8px; border: 1px solid #ddd; }
+    table.info th { background: #f5f5f5; width: 40%; }
+    .q { border: 1px solid #ddd; border-radius: 6px; padding: 12px 14px; margin-bottom: 14px; page-break-inside: avoid; }
+    .q .text { font-weight: bold; margin-bottom: 6px; }
+    .q .badge { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 10px; background: #eee; color: #555; text-transform: uppercase; }
+    .opt { padding: 2px 0; }
+    .correct { color: #198754; font-weight: bold; }
+    .wrong { color: #dc3545; font-weight: bold; }
+    .muted { color: #666; font-size: 11px; }
+    .status { display: inline-block; padding: 3px 10px; border-radius: 10px; font-size: 11px; }
+    .status.completed { background: #d4edda; color: #155724; }
+    .status.started { background: #fff3cd; color: #856404; }
+    .status.registered { background: #d1ecf1; color: #0c5460; }
+    .status.pending { background: #e2e3e5; color: #383d41; }
+  </style>
+</head>
+<body>
+  <h1>🎓 Session Details</h1>
+  <div class="sub">
+    Session {{ session.session_id }} &nbsp;·&nbsp;
+    Status: 
+    {% if session.status == 'completed' %}
+      <span class="status completed">Completed</span>
+    {% elif session.status == 'started' %}
+      <span class="status started">In Progress</span>
+    {% elif session.status == 'registered' %}
+      <span class="status registered">Registered</span>
+    {% else %}
+      <span class="status pending">Pending</span>
+    {% endif %}
+  </div>
+
+  <h2>👤 Registered Student</h2>
+  {% if session.student %}
+    <table class="info">
+      {% set labels = { 'name': 'Name', 'phone': 'Phone' } %}
+      {% for key, label in labels.items() %}
+        {% if session.student.get(key) %}
+          <tr><th>{{ label }}</th><td>{{ session.student.get(key) }}</td></tr>
+        {% endif %}
+      {% endfor %}
+      {% for cf in custom_registration_fields %}
+        {% if session.student.get(cf.slug) %}
+          <tr><th>{{ cf.name }}</th><td>{{ session.student.get(cf.slug) }}</td></tr>
+        {% endif %}
+      {% endfor %}
+      {% if session.student.get('registered_at') %}
+        <tr><th>Registered At</th><td>{{ session.student.get('registered_at') }}</td></tr>
+      {% endif %}
+    </table>
+  {% else %}
+    <p class="muted">Not registered yet.</p>
+  {% endif %}
+
+  {% if session.score is not none %}
+    <p><strong>Score:</strong> {{ session.score }} / {{ session.total_selected }}</p>
+  {% elif session.status == 'completed' %}
+    <p><strong>Score:</strong> Awaiting manual review</p>
+  {% endif %}
+
+  <h2>📋 Submitted Answers ({{ session.questions | length }})</h2>
+  {% if session.graded %}
+    {% for q in session.questions %}
+      {% set g = session.graded[loop.index0] %}
+      {% set qtype = q.get('type', 'mcq') %}
+      <div class="q">
+        <div class="text">Q{{ loop.index }}. {{ q.text }}</div>
+        <div><span class="badge">{{ qtype | upper }}</span></div>
+
+        {% if qtype == 'mcq' %}
+          <div class="muted mt-1">
+            {% if g.correct is not none %}
+              {% if g.correct %}✅ Correct{% else %}❌ Incorrect{% endif %}
+            {% endif %}
+          </div>
+          <ul style="list-style:none; padding-left:0; margin:6px 0 0;">
+            {% for opt in q.options %}
+              {% set oi = loop.index0 %}
+              {% set is_correct = g.correct_index is not none and oi == g.correct_index %}
+              {% set is_selected = g.selected is not none and oi == g.selected %}
+              <li class="opt {% if is_correct %}correct{% elif is_selected %}wrong{% endif %}">
+                {{ '•' if not is_correct and not is_selected else ('✔' if is_correct else '✘') }} {{ opt }}
+                {% if is_correct %} — Correct answer{% endif %}
+                {% if is_selected and not is_correct %} — Student's choice{% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+          {% if g.selected is none %}
+            <div class="muted">⚠️ Not answered</div>
+          {% endif %}
+        {% else %}
+          <div class="muted mt-1">Answer:</div>
+          <div style="white-space: pre-wrap; border:1px solid #e5e5e5; background:#fafafa; padding:8px; border-radius:4px;">
+            {{ g.selected if g.selected else '⚠️ Not answered' }}
+          </div>
+          <div class="muted" style="margin-top:4px;">Awaiting manual review</div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  {% else %}
+    <p class="muted">No submission yet.</p>
+  {% endif %}
+</body>
+</html>
+
