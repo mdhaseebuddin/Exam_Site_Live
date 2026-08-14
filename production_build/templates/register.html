@@ -9,8 +9,8 @@
   <link href="{{ url_for('static', filename='style.css') }}" rel="stylesheet">
 </head>
 <body class="exam-body">
-        <main class="exam-main container-fluid">
-        <div class="card shadow mx-auto w-100">
+        <main class="exam-main container-fluid register-page">
+        <div class="card shadow mx-auto w-100 register-card">
 
 
       <div class="card-body p-4 p-md-5">
@@ -49,11 +49,12 @@
               {% elif field == 'name' %}
                 <input class="form-control" id="f_{{ field }}" type="text"
                        name="{{ field }}" required autocomplete="name"
-                                              maxlength="50"
+                                                                                            maxlength="100"
                                               value="{{ form.get(field, '') }}"
                                               placeholder="e.g. Jane Doe"
                                               data-rule="name">
-                <div class="form-text">Alphabetic characters only (no numbers). Max 50 chars.</div>
+                <div class="form-text">Alphabetic characters only (no numbers). Max 100 chars.</div>
+
               {% endif %}
             </div>
           {% endfor %}
@@ -66,12 +67,13 @@
               <label class="form-label" for="f_{{ cf_slug }}">{{ cf_label }}
                 {% if not cf.required %}<span class="text-muted small fw-normal">(optional)</span>{% endif %}
               </label>
-              <input class="form-control" id="f_{{ cf_slug }}" type="text"
+                            <input class="form-control" id="f_{{ cf_slug }}" type="text"
                      name="{{ cf_slug }}" {% if cf.required %}required{% endif %}
-                                          autocomplete="off" maxlength="200"
+                                          autocomplete="off" maxlength="35"
                                           value="{{ form.get(cf_slug, '') }}"
                      placeholder="{{ cf_label }}">
             </div>
+
           {% endfor %}
 
 <!-- Math CAPTCHA — blocks automated bots from spamming registration -->
@@ -121,9 +123,10 @@
           errors.push('Full Name is required.');
         } else if (!nameRule.test(value)) {
           errors.push('Full Name may only contain alphabetic characters (no numbers).');
-                } else if (value.length > 50) {
-                  errors.push('Full Name cannot exceed 50 characters.');
-                }
+                } else if (value.length > 100) {
+                          errors.push('Full Name cannot exceed 100 characters.');
+                        }
+
       }
 
       const phoneInput = form.querySelector('input[name="phone"]');

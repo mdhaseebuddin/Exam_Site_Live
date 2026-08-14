@@ -26,6 +26,8 @@
     <!-- Feedback alerts -->
     {% if request.args.get('msg') == 'submissions_cleared' %}
       <div class="alert alert-success">✅ All student submissions and exam sessions have been cleared. Your question bank is untouched.</div>
+    {% elif request.args.get('msg') == 'exam_deleted' %}
+      <div class="alert alert-success">🗑️ The exam and all of its attempts have been deleted.</div>
     {% elif error %}
       <div class="alert alert-warning">{{ error }}</div>
     {% elif request.args.get('error') == 'session_not_found' %}
@@ -148,9 +150,9 @@
               {% for q in questions %}
                 {% set qtype = q.get('type', 'mcq') %}
                 <div class="border rounded-3 p-3 mb-2">
-                  <div class="d-flex align-items-center justify-content-between gap-3">
+                  <div class="d-flex align-items-center justify-content-between gap-3 question-item">
                     <div class="flex-grow-1">
-                      <strong class="mb-1 d-block">
+                      <strong class="mb-1 d-block question-text">
                       {{ q.text }}
                         <span class="badge text-bg-light border align-middle ms-1">
                         {{ qtype | upper }}
@@ -166,12 +168,13 @@
                     <div class="small text-muted mb-0">✍️ Free-text {{ qtype }} answer — manually reviewed.</div>
                   {% endif %}
                 </div>
-                    <div class="flex-shrink-0">
+                                        <div class="flex-shrink-0 btn-stack-mobile">
                       <form method="POST" action="{{ url_for('delete_question', qid=q.id) }}" class="mb-0">
               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <button class="btn btn-sm btn-outline-danger text-nowpx">Delete</button>
+                        <button class="btn btn-sm btn-outline-danger">Delete</button>
             </form>
           </div>
+
         </div>
             </div>
                     {% endfor %}
@@ -227,11 +230,11 @@
               <div id="fieldManagerRows" class="mb-2"></div>
 
               <div class="input-group mb-3 w-100">
-                <input type="text" class="form-control" id="newFieldName" maxlength="50"
+                <input type="text" class="form-control" id="newFieldName" maxlength="35"
                        placeholder="e.g. Hobbies">
                 <button type="button" class="btn btn-outline-secondary" id="addFieldBtn">+ Add Field</button>
               </div>
-              <div class="form-text mb-2 text-muted">(Max 200 characters allowed)</div>
+              <div class="form-text mb-2 text-muted">(Max 35 characters allowed)</div>
               <div class="form-check form-check-inline mb-3 ms-1">
                 <input class="form-check-input" type="checkbox" id="newFieldRequired">
                 <label class="form-check-label small" for="newFieldRequired">Required?</label>
@@ -255,21 +258,22 @@
 <!-- Generated exams (universal entry points) -->
         <div class="card">
                     <div class="card-header fw-semibold d-flex flex-column flex-sm-row justify-content-between align-items-sm-center gap-2">
-            <span>🔗 Generated Exams ({{ exams | length }})</span>
-            <div class="d-flex flex-wrap gap-2">
-              <form method="POST" action="{{ url_for('clear_submissions') }}"
-                    onsubmit="return confirm('⚠️ WARNING: Are you sure you want to delete ALL student submissions and exam sessions? Your question bank will be preserved.');">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                <button type="submit" class="btn btn-sm btn-danger w-100 w-sm-auto">🗑️ Reset Exam Data</button>
-              </form>
-              <a class="btn btn-sm btn-success w-100 w-sm-auto" href="{{ url_for('download_all_zip') }}">⬇️ Download All (.zip)</a>
-            </div>
-          </div>
+                      <span>🔗 Generated Exams ({{ exams | length }})</span>
+                      <div class="btn-group-wrap btn-stack-mobile">
+                        <form method="POST" action="{{ url_for('clear_submissions') }}"
+                              onsubmit="return confirm('⚠️ WARNING: Are you sure you want to delete ALL student submissions and exam sessions? Your question bank will be preserved.');">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                          <button type="submit" class="btn btn-sm btn-danger w-100">🗑️ Reset Exam Data</button>
+                        </form>
+                        <a class="btn btn-sm btn-success w-100" href="{{ url_for('download_all_zip') }}">⬇️ Download All (.zip)</a>
+                      </div>
+                    </div>
+
 
           <div class="card-body p-0">
             {% if exams %}
-              <div class="table-responsive">
-                <table class="table table-hover mb-0 align-middle">
+              <div class="table-responsive exams-table-wrap">
+                <table class="table table-hover mb-0 align-middle exams-table">
                   <thead>
                     <tr>
                       <th style="width: 32%;">Portal Link</th>
@@ -284,7 +288,7 @@
                   <tbody>
                     {% for ex in exams | reverse %}
                       <tr>
-                        <td>
+                        <td class="portal-cell">
                           <div class="d-flex flex-column gap-1">
                             <code class="small text-break">{{ request.host_url }}exam/register/{{ ex.exam_id }}</code>
                             <div class="d-flex gap-1">
@@ -294,7 +298,7 @@
                           </div>
                         </td>
 
-                        <td>{{ ex.exam_title or '(untitled)' }}</td>
+                        <td class="text-wrap title-cell">{{ ex.exam_title or '(untitled)' }}</td>
                         <td>{{ ex.time_limit_minutes }} min</td>
                         <td>{{ ex.questions | length }}</td>
                         <td>
@@ -303,8 +307,8 @@
                         <td>
                           <span class="badge {{ 'bg-success' if ex.completed_count else 'bg-light text-dark' }}">{{ ex.completed_count }}</span>
                         </td>
-                                                <td>
-                          <div class="d-flex flex-wrap gap-1">
+                                                                        <td>
+                          <div class="btn-group-wrap btn-stack-mobile">
                             <a class="btn btn-sm btn-outline-secondary text-nowrap" href="{{ url_for('host_exam_attempts', exam_id=ex.exam_id) }}">View Attempts</a>
                             <form method="POST" action="{{ url_for('delete_exam', exam_id=ex.exam_id) }}" class="d-inline">
                               <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -312,6 +316,7 @@
                             </form>
                           </div>
                         </td>
+
 
                       </tr>
                     {% endfor %}
@@ -429,7 +434,7 @@
       labelInput.className = 'form-control form-control-sm cf-name';
       labelInput.value = name || '';
       labelInput.placeholder = 'Field name';
-      labelInput.maxLength = 200;
+      labelInput.maxLength = 35;
       labelInput.required = true;
 
       const reqLabel = document.createElement('label');

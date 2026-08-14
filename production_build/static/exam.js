@@ -182,8 +182,21 @@ let currentIndex = 0;
         },
         body: JSON.stringify({ student: cfg.student, answers: answers })
       });
-      const data = await res.json();
-      if (!res.ok || data.error) throw new Error(data.error || "Submission failed");
+      // Parse the response as JSON, but NEVER let a malformed / non-JSON body
+      // (e.g. an HTML error page or a CSRF rejection) throw raw tokens back at
+      // the student. If the body isn't valid JSON we fall back to an empty
+      // object and rely on the HTTP status code for a friendly message.
+      let data = {};
+      try {
+        data = await res.json();
+      } catch (parseErr) {
+        data = {};
+      }
+
+      const serverMessage = data && data.error ? data.error : null;
+      if (!res.ok || serverMessage) {
+        throw new Error(serverMessage || "Submission failed (HTTP " + res.status + ")");
+      }
       showResult(data);
     } catch (err) {
       submitBtn.disabled = false;

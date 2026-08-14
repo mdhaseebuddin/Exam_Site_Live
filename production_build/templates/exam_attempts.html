@@ -11,10 +11,11 @@
 <body>
   <nav class="navbar navbar-dark bg-dark px-3">
     <span class="navbar-brand mb-0 h1">🎓 Exam Attempts</span>
-    <div>
+        <div class="btn-group-wrap">
       <a class="btn btn-outline-light btn-sm" href="/host">← Host Dashboard</a>
       <a class="btn btn-outline-primary btn-sm" href="/exam/register/{{ exam.exam_id }}" target="_blank" rel="noopener">Open Portal</a>
     </div>
+
   </nav>
 
   <div class="container my-4">
@@ -27,11 +28,12 @@
           <div class="col-md-3"><strong>Attempts:</strong> {{ exam.attempt_count }}</div>
           <div class="col-md-3"><strong>Completed:</strong> {{ exam.completed_count }}</div>
         </div>
-        <div class="mt-2">
+                <div class="mt-2 btn-group-wrap btn-stack-mobile">
           <strong>Shareable Portal Link:</strong>
           <code>{{ request.host_url }}exam/register/{{ exam.exam_id }}</code>
           <button class="btn btn-sm btn-outline-secondary copy-btn" data-link="{{ request.host_url }}exam/register/{{ exam.exam_id }}">Copy</button>
         </div>
+
       </div>
     </div>
 

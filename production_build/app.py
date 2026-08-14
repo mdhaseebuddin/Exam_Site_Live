@@ -59,7 +59,7 @@ from flask import (
 )
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from flask_wtf import CSRFProtect
+from flask_wtf.csrf import CSRFProtect, CSRFError
 from sqlalchemy import event, text
 from sqlalchemy.engine import Engine
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -671,6 +671,19 @@ def log_server_error(e):
     audit("http_500", status=500, path=request.path, method=request.method,
           ip=get_remote_address())
     return jsonify({"error": "Internal server error."}), 500
+
+
+@app.errorhandler(CSRFError)
+def handle_csrf_rejection(e):
+    # A CSRF failure (missing / expired / mismatched token) normally returns an
+    # HTML error page. The exam client submits via fetch() and expects JSON, so
+    # we echo the rejection back as JSON here — otherwise the client's
+    # res.json() would choke on raw HTML and show tokens in the alert.
+    audit("csrf_rejected", status=400, path=request.path, method=request.method,
+          message=str(e), ip=get_remote_address())
+    return jsonify({
+        "error": "Your session or security token has expired. Please reload the page and try submitting again."
+    }), 400
 
 
 # ---------------------------------------------------------------------------
@@ -1612,6 +1625,243 @@ audited server-side.
 
     # Redirect back to the dashboard with a visible success message.
     return redirect(url_for("host", msg="submissions_cleared"))
+
+
+@app.route("/host/download-all.zip")
+@login_required
+def download_all_zip():
+    """
+    Export ALL of this host's student submissions as a single .zip download.
+
+    Per-host isolation: only submissions belonging to the currently
+    authenticated host are collected (matching every other /host* route).
+
+    For every session that has a registered student, the archive contains:
+      * <n>_<student>_<exam>_<session_id>/details.pdf  — ReportLab details PDF
+      * <n>_<student>_<exam>_<session_id>/details.html — print-friendly HTML
+                                                         fallback (only when
+                                                         the PDF tooling is
+                                                         unavailable)
+      * <n>_<student>_<exam>_<session_id>/submission.json — full raw data
+
+    A top-level index.json (submission summary) and README.txt describe the
+    whole export. The archive is built in memory and streamed straight back
+    to the browser (nothing is written to disk), so it is safe under
+    multi-worker deployments.
+    """
+    import json as _json
+
+    host_email = _current_host_email()
+    if not host_email:
+        return redirect(url_for("host_login"))
+
+    # Only attempts that actually have a registered candidate count as a
+    # "submission". Pure pending sessions (no student yet) are excluded.
+    all_sessions = (
+        Session.query.filter_by(host_email=host_email)
+        .order_by(Session.created_at.asc())
+        .all()
+    )
+    sessions = [s for s in all_sessions if s.student is not None]
+
+    summary = []
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        for idx, s in enumerate(sessions, start=1):
+            data = session_to_dict(s)
+            exam_title = _safe_filename(data.get("exam_title") or "", "exam") or "exam"
+            student_name = (
+                _safe_filename((data.get("student") or {}).get("name") or "", "student")
+                or "student"
+            )
+            folder = f"{idx:03d}__{student_name}__{exam_title}__{s.id}"
+
+            # 1) Real details PDF (ReportLab) with an HTML fallback.
+            pdf_bytes = _pdf_bytes(
+                "details_pdf.html",
+                session=data,
+                custom_registration_fields=data.get("custom_registration_fields") or [],
+            )
+            if pdf_bytes is not None:
+                archive.writestr(f"{folder}/details.pdf", pdf_bytes)
+            else:
+                archive.writestr(
+                    f"{folder}/details.html",
+                    render_template(
+                        "details_pdf.html",
+                        session=data,
+                        custom_registration_fields=(
+                            data.get("custom_registration_fields") or []
+                        ),
+                    ),
+                )
+
+            # 2) Raw JSON export of the full submission.
+            archive.writestr(
+                f"{folder}/submission.json",
+                _json.dumps(data, indent=2, default=str),
+            )
+
+            summary.append(
+                {
+                    "session_id": s.id,
+                    "exam_title": data.get("exam_title", ""),
+                    "status": data.get("status", ""),
+                    "student": data.get("student"),
+                    "score": data.get("score"),
+                    "total_selected": data.get("total_selected"),
+                    "completed_at": data.get("completed_at"),
+                    "folder": folder,
+                }
+            )
+
+        archive.writestr(
+            "index.json",
+            _json.dumps(
+                {
+                    "exported_at": datetime.now(timezone.utc).isoformat(),
+                    "host_email": host_email,
+                    "submission_count": len(summary),
+                    "submissions": summary,
+                },
+                indent=2,
+                default=str,
+            ),
+        )
+        archive.writestr(
+            "README.txt",
+            (
+                "Exam Platform submission export\n"
+                "================================\n"
+                f"Host: {host_email}\n"
+                f"Export time (UTC): {datetime.now(timezone.utc).isoformat()}\n"
+                f"Submissions: {len(summary)}\n\n"
+                "Each folder contains:\n"
+                "  details.pdf       - session details PDF\n"
+                "  details.html      - print-friendly HTML fallback\n"
+                "  submission.json   - raw submission data\n\n"
+                "index.json summarises every submission in the archive.\n"
+            ),
+        )
+
+    zip_buf.seek(0)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    username = host_email.split("@", 1)[0]
+    filename = f"exam_submissions_{username}_{stamp}.zip"
+    audit(
+        "download_all_zip",
+        host_email=host_email,
+        submissions=len(summary),
+        ip=get_remote_address(),
+    )
+    return send_file(
+        zip_buf,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+@app.route("/host/exam/<exam_id>/attempts")
+@login_required
+def host_exam_attempts(exam_id):
+    """
+    Per-exam attempts view — lists every student that registered for an Exam.
+
+    Per-host isolation: a host can only see attempts for an Exam they own. The
+    page is rendered from exam_attempts.html, which shows each candidate and
+    links to the per-session details page.
+    """
+    host_email = _current_host_email()
+    ex = db.session.get(Exam, exam_id)
+    if ex is None or (ex.host_email and ex.host_email != host_email):
+        return redirect(url_for("host", error="session_not_found"))
+
+    cfg = ex.config or {}
+    sessions = (
+        Session.query.filter_by(exam_id=exam_id)
+        .order_by(Session.created_at.asc())
+        .all()
+    )
+    attempts = [session_to_dict(s) for s in sessions]
+
+    return render_template(
+        "exam_attempts.html",
+        exam=exam_to_dict(ex),
+        attempts=attempts,
+        custom_registration_fields=cfg.get("custom_registration_fields") or [],
+    )
+
+
+@app.route("/host/session/<session_id>")
+@login_required
+def session_details(session_id):
+    """
+    Host view of a single session's details (submitted answers, score, student).
+
+    Per-host isolation: only the owner of the session's Exam may view it.
+    Rendered from details.html.
+    """
+    host_email = _current_host_email()
+    s = db.session.get(Session, session_id)
+    if s is None or (s.host_email and s.host_email != host_email):
+        return redirect(url_for("host", error="session_not_found"))
+
+    data = session_to_dict(s)
+    cfg = s.config or {}
+    return render_template(
+        "details.html",
+        session=data,
+        custom_registration_fields=cfg.get("custom_registration_fields") or [],
+    )
+
+
+@app.route("/host/session/<session_id>/details.pdf")
+@login_required
+def session_details_pdf(session_id):
+    """
+    Download the per-session DETAILS PDF (host-facing, mirrors details.html).
+
+    Uses the shared ReportLab pipeline (pdf_response) with a graceful HTML
+    fallback when PDF tooling is unavailable.
+    """
+    host_email = _current_host_email()
+    s = db.session.get(Session, session_id)
+    if s is None or (s.host_email and s.host_email != host_email):
+        return redirect(url_for("host", error="session_not_found"))
+
+    data = session_to_dict(s)
+    cfg = s.config or {}
+    return pdf_response(
+        "details_pdf.html",
+        f"session_{session_id}.pdf",
+        session=data,
+        custom_registration_fields=cfg.get("custom_registration_fields") or [],
+    )
+
+
+@app.route("/host/exam/<exam_id>/delete", methods=["POST"])
+@login_required
+def delete_exam(exam_id):
+    """
+    Permanently delete an Exam (and everything under it).
+
+    This is destructive and irreversible. Deleting the Exam cascades to every
+    Session (and their Students, questions, answers) plus the ExamQuestion
+    snapshot. Ownership-guarded: only the host who created the Exam may delete
+    it. The host is prompted for confirmation client-side before this runs.
+    """
+    host_email = _current_host_email()
+    ex = db.session.get(Exam, exam_id)
+    if ex is not None and (ex.host_email is None or ex.host_email == host_email):
+        db.session.delete(ex)
+        db.session.commit()
+        audit("exam_deleted", exam_id=exam_id, ip=get_remote_address())
+        if host_email:
+            write_tests_conducted(host_email)
+    return redirect(url_for("host", msg="exam_deleted"))
+
+
 @app.route("/host/generate", methods=["POST"])
 @limiter.limit("10000 per minute", methods=["POST"])
 @login_required
@@ -1808,8 +2058,8 @@ def exam_register(exam_id):
             value = request.form.get(field, "").strip()
             if not value:
                 missing.append(REG_FIELD_LABELS.get(field, field))
-            if field == "name" and len(value) > 35:
-                err = "Full Name cannot exceed 35 characters."
+                if field == "name" and len(value) > 100:
+                    err = "Full Name cannot exceed 100 characters."
                 return render_template("register.html", error=err, form=request.form, captcha=captcha_payload(), **template_vars), 400
             student_data[field] = value
 
@@ -1819,10 +2069,11 @@ def exam_register(exam_id):
             value = request.form.get(slug, "").strip()
             if cf.get("required") and not value:
                 missing.append(cf.get("name", slug))
-            if len(value) > 200:
-                err = f"{cf.get('name', slug)} cannot exceed 200 characters."
+            if len(value) > 35:
+                err = f"{cf.get('name', slug)} cannot exceed 35 characters."
                 return render_template("register.html", error=err, form=request.form, captcha=captcha_payload(), **template_vars), 400
             student_data[slug] = value
+
 
         if missing:
             error = f"Missing required field(s): {', '.join(missing)}"
@@ -2366,9 +2617,7 @@ def register(session_id):
         "register.html", error=None, form={}, captcha=captcha_payload(), **template_vars
     )
 
-@app.route("/exam/<session_id>/submit", methods=["POST"])
-@limiter.limit("10000 per minute", methods=["POST"])
-def submit_exam(session_id):
+def _submit_exam(session_id):
     """
     Save + grade a finished exam.
 
@@ -2502,355 +2751,110 @@ def submit_exam(session_id):
 
     score = 0
     auto_graded_only = True
+    total = len(session_questions)
 
-    # Delete any existing answers for this session (shouldn't exist, but safe)
-    Answer.query.filter_by(session_id=session_id).delete()
-    for idx, q in enumerate(session_questions):
+    # ---- GRADE & PERSIST THE SUBMISSION ------------------------------------
+    # For each dealt question, save the submitted answer and auto-grade MCQ.
+    # Essay / coding answers are saved verbatim for manual review by the host.
+    for pos, q in enumerate(session_questions):
         qtype = q.type or "mcq"
-        selected = answers.get(str(idx))
+        raw = answers.get(str(pos))
+        response = raw
+        correct = None
+        correct_index = None
+
         if qtype == "mcq":
+            correct_index = q.correct_index
             try:
-                selected = int(selected) if selected is not None else None
+                selected = int(raw) if raw not in (None, "") else None
             except (TypeError, ValueError):
                 selected = None
-            is_correct = selected is not None and selected == q.correct_index
-            score += int(is_correct)
-            answer = Answer(
-                session_id=session_id,
-                position=idx,
-                question_id=q.question_id,
-                type=qtype,
-                response=selected,
-                correct=is_correct,
-                correct_index=q.correct_index,
-            )
-        else:
-
-
-
-
-
-            # essay / coding: store the raw text for manual review.
-            auto_graded_only = False
-            if isinstance(selected, str):
-                selected = selected.strip()
+            response = selected
+            if selected is not None and correct_index is not None:
+                correct = selected == correct_index
+                if correct:
+                    score += 1
             else:
-                selected = None
-            answer = Answer(
+                correct = False
+        else:
+            # Essay / coding -> saved verbatim, reviewed manually by the host.
+            auto_graded_only = False
+            response = "" if raw is None else str(raw)
+
+        db.session.add(
+            Answer(
                 session_id=session_id,
-                position=idx,
+                position=pos,
                 question_id=q.question_id,
                 type=qtype,
-                response=selected,
-                correct=None,
-                correct_index=None,
+                response=response,
+                correct=correct,
+                correct_index=correct_index,
             )
-        db.session.add(answer)
+        )
 
-    s.score = score if auto_graded_only else None
-    s.total_selected = len(session_questions)
     s.completed_at = datetime.now(timezone.utc).isoformat()
-    db.session.commit()
 
     if auto_graded_only:
-        percent = round((score / len(session_questions)) * 100) if session_questions else 0
+        # Fully auto-graded (all MCQ): persist a numeric score.
+        s.score = score
+        s.total_selected = total
+        percent = round((score / total) * 100) if total else 0
+        manual_review = False
     else:
+        # Contains essay/coding answers -> await manual review by the host.
+        s.score = None
+        s.total_selected = None
+        percent = None
+        manual_review = True
 
-        percent = None  # essay/coding answers require manual review
-
+    db.session.commit()
+    audit(
+        "exam_submitted",
+        session_id=session_id,
+        score=s.score,
+        total=s.total_selected,
+        auto_graded_only=auto_graded_only,
+        ip=get_remote_address(),
+    )
     if s.host_email:
         write_tests_conducted(s.host_email)
 
     return jsonify(
         {
+            "ok": True,
             "score": s.score,
-            "total": len(session_questions),
+            "total": s.total_selected,
             "percent": percent,
-            "manual_review": not auto_graded_only,
+            "manual_review": manual_review,
+            "session_id": session_id,
         }
     )
 
-@app.route("/exam/<session_id>/result.pdf")
-def result_pdf(session_id):
+
+@app.route("/exam/<session_id>/submit", methods=["POST"])
+@limiter.limit("10000 per minute", methods=["POST"])
+def submit_exam(session_id):
     """
-    Download the candidate's graded result as a PDF.
+    Route wrapper for POST /exam/<session_id>/submit.
+
+    Delegates to _submit_exam() inside a try/except so an unexpected error can
+    NEVER escape as an HTML error page — the JavaScript client always receives
+    a JSON response that JSON.parse() can handle, for both success and failure.
     """
-    s = db.session.get(Session, session_id)
-
-    if s is None or s.status != "completed":
-        return redirect(url_for("host", error="session_not_found"))
-
-    return pdf_response(
-        "result_pdf.html",
-        f"result_{session_id}.pdf",
-        session=session_to_dict(s),
-    )
-
-@app.route("/host/session/<session_id>/details.pdf")
-@login_required
-def details_pdf(session_id):
-    """
-    Download the host's session-details view as a PDF.
-
-    Ownership-guarded: only the host who created this session may download
-    its details PDF. Any other host is redirected away.
-    """
-    s = db.session.get(Session, session_id)
-
-    if s is None or s.host_email != _current_host_email():
-        return redirect(url_for("host", error="session_not_found"))
-
-    cfg = s.config or {}
-    return pdf_response(
-        "details_pdf.html",
-        f"details_{session_id}.pdf",
-        session=session_to_dict(s),
-        custom_registration_fields=cfg.get("custom_registration_fields") or [],
-    )
-
-@app.route("/host/session/<session_id>/details")
-@login_required
-def session_details(session_id):
-    """
-    Host 'View Details' page — shows the registered student's name, phone,
-    and ID, plus every submitted answer for that session. Also passes the
-    session's custom registration fields (from the Dynamic Form Builder) so
-    the template can render arbitrary student fields by display name.
-
-    Ownership-guarded: only the host who created this session may view its
-    details. Any other host is redirected away.
-    """
-    s = db.session.get(Session, session_id)
-
-    if s is None or s.host_email != _current_host_email():
-        return redirect(url_for("host", error="session_not_found"))
-
-    cfg = s.config or {}
-    return render_template(
-        "details.html",
-        session=session_to_dict(s),
-        custom_registration_fields=cfg.get("custom_registration_fields") or [],
-    )
-
-
-@app.route("/host/session/<session_id>/delete", methods=["POST"])
-@login_required
-def delete_session(session_id):
-    """Remove a generated session from the dashboard.
-
-    Ownership-guarded: only the host who created this session may delete it.
-    """
-    s = db.session.get(Session, session_id)
-    if s and s.host_email == _current_host_email():
-        db.session.delete(s)
-        db.session.commit()
-    return redirect(url_for("host"))
-
-@app.route("/host/exam/<exam_id>/delete", methods=["POST"])
-@login_required
-def delete_exam(exam_id):
-    """
-    Delete a generated Exam (universal portal) AND all of its per-student
-    attempts (sessions), answers, session_questions, and student records.
-
-    Ownership-guarded: only the host who created this exam may delete it.
-    """
-    ex = db.session.get(Exam, exam_id)
-    if ex and ex.host_email == _current_host_email():
-        db.session.delete(ex)
-        db.session.commit()
-        audit("exam_deleted", exam_id=exam_id, ip=get_remote_address())
-    return redirect(url_for("host"))
-
-@app.route("/host/exam/<exam_id>/attempts")
-@login_required
-def host_exam_attempts(exam_id):
-    """
-    Host 'View Attempts' page — lists every student who registered for a
-    shared Exam along with their individual attempt status and score.
-
-    Ownership-guarded: only the host who created this exam may view it.
-    """
-    ex = db.session.get(Exam, exam_id)
-
-    if ex is None or ex.host_email != _current_host_email():
-        return redirect(url_for("host", error="session_not_found"))
-
-    cfg = ex.config or {}
-    custom_fields = cfg.get("custom_registration_fields") or []
-
-    # All attempts (sessions) for this exam, newest first.
-    attempts = (
-        Session.query.filter_by(exam_id=exam_id)
-        .order_by(Session.created_at.desc())
-        .all()
-    )
-
-    return render_template(
-        "exam_attempts.html",
-        exam=exam_to_dict(ex),
-        attempts=[session_to_dict(s) for s in attempts],
-        custom_registration_fields=custom_fields,
-        field_labels=REG_FIELD_LABELS,
-    )
-
-@app.route("/host/download-all-zip")
-@login_required
-def download_all_zip():
-    """
-    Download ALL student submissions as a single .zip archive.
-
-    Each registered student becomes one readable text ".txt" report inside
-    the archive, containing their registration details plus every submitted
-    answer (MCQ selection, coding answer, and essay Q&A). The archive is
-    built entirely in memory with the stdlib `zipfile` + `io` modules, so no
-    temporary files are written to disk.
-
-    Returns a .zip attachment via send_file, or a friendly message if there
-    are no submissions yet.
-    """
-    import re as _re
-
-    host_email = _current_host_email()
-
-    # Per-host isolation: only zip THIS host's students (via their sessions).
-    my_session_ids = [
-        s.id for s in Session.query.filter_by(host_email=host_email).all()
-    ]
-    if my_session_ids:
-        students = (
-            Student.query.filter(Student.session_id.in_(my_session_ids))
-            .order_by(Student.registered_at)
-            .all()
+    try:
+        return _submit_exam(session_id)
+    except Exception as exc:  # noqa: BLE001 - the client expects JSON, always.
+        db.session.rollback()
+        traceback.print_exc()
+        audit(
+            "submit_exception",
+            session_id=session_id,
+            error=str(exc),
+            ip=get_remote_address(),
         )
-    else:
-        students = []
-
-    if not students:
-        # Re-render the dashboard in its current form (uses `exams`).
-        exams = (
-            Exam.query.filter_by(host_email=host_email)
-            .order_by(Exam.created_at.desc())
-            .all()
-        )
-        questions = (
-            Question.query.filter_by(host_email=host_email)
-            .order_by(Question.created_at.desc())
-            .all()
-        )
-        return (
-            render_template(
-                "host.html",
-                questions=[bank_question_to_dict(q) for q in questions],
-                exams=[exam_to_dict(x) for x in exams],
-                field_labels=REG_FIELD_LABELS,
-                error="No student submissions to download yet.",
-            ),
-            200,
-        )
-
-    memory_file = io.BytesIO()
-
-    with zipfile.ZipFile(memory_file, "w", zipfile.ZIP_DEFLATED) as zf:
-        for st in students:
-            # Build a safe, unique filename for this student's report.
-            safe_name = _re.sub(r"[^A-Za-z0-9]+", "_", st.name or "student").strip("_")
-            safe_name = safe_name or "student"
-            filename = f"{safe_name}_{st.session_id}.txt"
-
-            report = _build_student_report(st)
-            zf.writestr(filename, report.encode("utf-8"))
-
-    memory_file.seek(0)
-
-    audit("download_all_zip", student_count=len(students), ip=get_remote_address())
-
-    return send_file(
-        memory_file,
-        mimetype="application/zip",
-        as_attachment=True,
-        download_name="all_submissions.zip",
-    )
-
-def _build_student_report(st: Student) -> str:
-    """
-    Compile a single student's registration + answers into a readable text
-    report. Handles MCQ (shows the selected option), essay and coding (shows
-    the free-text answer verbatim), using the session's question snapshot so
-    the text lines up with what the student actually saw.
-    """
-    lines = []
-    lines.append("=" * 60)
-    lines.append("EXAM SUBMISSION REPORT")
-    lines.append("=" * 60)
-    lines.append(f"Student : {st.name}")
-    lines.append(f"Phone   : {st.phone or '-'}")
-    lines.append(f"Session : {st.session_id}")
-    lines.append(f"Time    : {st.registered_at or '-'}")
-
-    # Custom registration fields (address, department, ...) stored as JSON.
-    custom = st.custom_fields or {}
-    if custom:
-        lines.append("")
-        lines.append("--- Registration Details ---")
-        for key, value in custom.items():
-            if value:
-                lines.append(f"{key.replace('_', ' ').title()}: {value}")
-
-    # The 1:1 session gives us both the dealt questions and the answers.
-    session = st.session
-    if session is None:
-        lines.append("")
-        lines.append("(No session data found for this student.)")
-        return "\n".join(lines) + "\n"
-
-    answers_by_position = {a.position: a for a in (session.answers or [])}
-
-    lines.append("")
-    lines.append("--- Submitted Answers ---")
-
-    if not session.questions:
-        lines.append("(No questions in this session.)")
-    else:
-        for q in session.questions:
-            lines.append("")
-            lines.append(f"Q{q.position + 1} [{q.type or 'mcq'.upper()}]")
-            lines.append(f"  {q.text}")
-
-            answer = answers_by_position.get(q.position)
-            qtype = (q.type or "mcq").lower()
-
-            if qtype == "mcq":
-                opts = q.options or []
-                selected = answer.response if answer else None
-                if selected is not None and isinstance(selected, int) and 0 <= selected < len(opts):
-                    lines.append(f"  Selected: ({selected}) {opts[selected]}")
-                elif selected is not None and str(selected).isdigit() and 0 <= int(selected) < len(opts):
-                    sel = int(selected)
-                    lines.append(f"  Selected: ({sel}) {opts[sel]}")
-                else:
-                    lines.append("  Selected: (no answer)")
-                # Correct answer for host reference.
-                ci = q.correct_index
-                if ci is not None and 0 <= ci < len(opts):
-                    lines.append(f"  Correct : ({ci}) {opts[ci]}")
-            else:
-                # essay / coding -> free-text
-                response = answer.response if answer else None
-                lines.append("  Answer:")
-                if response:
-                    for rline in str(response).splitlines():
-                        lines.append(f"    {rline}")
-                else:
-                    lines.append("    (no answer)")
-
-    lines.append("")
-    lines.append("=" * 60)
-    return "\n".join(lines)
+        return jsonify({"error": "An unexpected error occurred. Please try again."}), 500
 
 if __name__ == "__main__":
-    init_db()
-    app.run(host="127.0.0.1", port=5000, debug=True)
-
-
+    app.run(debug=True, port=5000)
 
