@@ -1,0 +1,36 @@
+=============================
+LINKEDIN ANNOUNCEMENT POST
+=============================
+
+🚀 Excited to announce that my full-stack web application is now LIVE on the internet!
+
+After weeks of designing, building, and hardening, I'm thrilled to share my Online Exam & Proctoring / Management System — a complete platform that lets educators create exams, share secure links with candidates, and manage everything from a powerful dashboard.
+
+Here's what makes it stand out:
+
+✅ Flask Backend — A robust Python-powered backend that handles registration, exam generation, grading, and reporting with clean, scalable architecture.
+
+✅ Secure Authentication — Password hashing with per-user salts, hardened session cookies (HttpOnly, SameSite=Strict, Secure), CSRF protection on every request, and CAPTCHA on login & registration to block bots.
+
+✅ Email-Based OTP Verification — A cryptographically random 6-digit OTP is delivered to your inbox for secure password resets, with single-use tokens and a 10-minute expiry.
+
+✅ Smart Database Management — SQLite + SQLAlchemy with a relational schema, WAL mode for concurrent reads, anti-duplicate registration constraints, per-host data isolation, and atomic, race-safe grading.
+
+✅ Automated PDF Reporting — Instantly generate polished, downloadable PDFs for candidate results and full session details using pure-Python ReportLab (no system binary dependencies, so it deploys cleanly on any cloud host), plus a downloadable ZIP archive of all submissions.
+
+✅ Exam Randomization & Proctoring — Each candidate gets a randomized subset of questions with shuffled options, MCQ auto-grading, essay/coding support, server-side timers that survive refreshes, and a mandatory policy-consent gate.
+
+🛠️ Tech Stack:
+Python • Flask • SQLite • SQLAlchemy • Bootstrap • Jinja2 • Marshmallow • Flask-WTF • Flask-Limiter • ReportLab • Gunicorn • Waitress • SMTP
+
+Live & production-ready, with security-first engineering throughout. This project taught me so much about building and shipping real-world full-stack applications — from concurrency control to deployment.
+
+#Python #Flask #WebDevelopment #FullStack #OnlineExams #EdTech #SQLAlchemy #SQLite #Bootstrap #CyberSecurity #Developer #Coding #SoftwareEngineering #Launch #WebApp
+
+=============================
+PINNED COMMENT (with link)
+=============================
+
+🎯 Try it out for yourself! Check out the live platform here 👉 [Insert Live Link Here]
+
+Create an account, generate your own exam, share the link, and watch the results roll in — complete with automated PDF reports. If you're an educator, trainer, or recruiter, I'd love your feedback. Drop a comment below or send me a message — let's connect! 🚀

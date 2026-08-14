@@ -17,6 +17,13 @@ let currentIndex = 0;
   let deadlineUnix = cfg.deadlineUnix;
   let serverNowUnix = cfg.serverNowUnix;
   const answers = {}; // { question_index: selected_option_index }
+  // Submission guards: prevent a duplicate auto-submit (timer tick or server
+  // sync re-triggering submitExam) from sending a second POST once time runs
+  // out. The backend rejects the second as "already submitted", which would
+  // otherwise surface a spurious "Submission failed" alert even though the
+  // exam was saved.
+  let submitting = false;
+  let submitted = false;
 
   const timerEl = document.getElementById("timer");
   const questionText = document.getElementById("questionText");
@@ -162,13 +169,17 @@ let currentIndex = 0;
 
   // ---------------------------- Submit ---------------------------
   async function submitExam(auto) {
+    // Never submit more than once (manual + auto, or repeated auto triggers).
+    if (submitted || submitting) return;
     if (!auto) {
       const ok = window.confirm("Are you sure you want to submit your test?");
       if (!ok) return;
     }
     clearInterval(timerInterval);
+    timerInterval = null;
     submitBtn.disabled = true;
     submitBtn.textContent = "Submitting...";
+    submitting = true;
 
     try {
 // Send the student's registration info AND their answers together.
@@ -197,11 +208,19 @@ let currentIndex = 0;
       if (!res.ok || serverMessage) {
         throw new Error(serverMessage || "Submission failed (HTTP " + res.status + ")");
       }
+      submitted = true;
       showResult(data);
     } catch (err) {
       submitBtn.disabled = false;
       submitBtn.textContent = "Finish";
-      window.alert("Submission failed: " + err.message);
+      // Only surface a failure alert if the exam has NOT already been saved.
+      // If a transient network error happens during auto-submit, the next
+      // server sync re-triggers the auto-submit automatically.
+      if (!submitted) {
+        window.alert("Submission failed: " + err.message);
+      }
+    } finally {
+      submitting = false;
     }
   }
 

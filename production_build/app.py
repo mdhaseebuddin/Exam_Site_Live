@@ -568,6 +568,72 @@ def verify_otp(email: str, code: str, purpose="reset") -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Session-based OTP (login / registration) — 2-minute expiry
+# ---------------------------------------------------------------------------
+OTP_SESSION_LIFETIME_MINUTES = 2
+
+
+def _set_session_otp(storage_key: str, code: str) -> None:
+    """Record a freshly-issued OTP (its hash + UTC generation time) in the
+    session. Storing the generation timestamp (datetime.utcnow()) lets
+    verification enforce a strict N-minute window regardless of DB tokens.
+    """
+    session[storage_key] = {
+        "code_hash": hash_password(code),
+        "generated_at": datetime.utcnow(),
+    }
+
+
+def _issue_session_otp(storage_key: str, target: str, is_email: bool = True) -> str:
+    """Generate, deliver and record a brand-new session OTP for the given
+    target (email for hosts, phone for students). Returns the plaintext code
+    so the caller can log it for local testing / SMS integration.
+    """
+    code = _generate_otp()
+    _set_session_otp(storage_key, code)
+    if is_email:
+        _send_otp_email(target, code)
+    else:
+        # Phone target — log to console (a real SMS hook would go here).
+        print(f"\n[OTP DEBUG] Target: {target} | Code: {code}\n")
+    return code
+
+
+def verify_session_otp(storage_key: str, submitted: str) -> str | None:
+    """Validate a submitted code against the stored session OTP.
+
+    Returns None when the code is valid, otherwise an error message. If the
+    OTP has expired it is cleared from the session, matching the required
+    "OTP has expired. Please request a new one." behaviour.
+    """
+    data = session.get(storage_key)
+    if not data or not isinstance(data, dict):
+        return "Invalid or expired verification code."
+
+    generated_at = data.get("generated_at")
+    if not isinstance(generated_at, datetime):
+        session.pop(storage_key, None)
+        return "Invalid or expired verification code."
+
+    # Normalize to naive UTC before comparing. `datetime.utcnow()` returns a
+    # naive datetime, while the value read back from the session cookie can be
+    # either naive or offset-aware depending on how Flask's serializer handled
+    # it — comparing naive vs aware would raise a TypeError. Making both naive
+    # UTC guarantees a safe comparison.
+    if generated_at.tzinfo is not None:
+        generated_at = generated_at.astimezone(timezone.utc).replace(tzinfo=None)
+
+    if datetime.utcnow() > generated_at + timedelta(minutes=OTP_SESSION_LIFETIME_MINUTES):
+        session.pop(storage_key, None)  # clear the expired OTP
+        return "OTP has expired. Please request a new one."
+
+    if not verify_password(submitted, data.get("code_hash", "")):
+        return "Invalid verification code. Please try again."
+
+    return None  # valid
+
+
+# ---------------------------------------------------------------------------
 # Maximum-capacity helpers
 # ---------------------------------------------------------------------------
 def completed_submissions_count(host_email: str | None = None) -> int:
@@ -1151,10 +1217,10 @@ def favicon():
 
 @app.route("/")
 def index():
-    """Root — if logged in, go to the dashboard; otherwise the login page."""
+    """Root — if logged in, go to the dashboard; otherwise the welcome page."""
     if current_host() is not None:
         return redirect(url_for("host"))
-    return redirect(url_for("host_login"))
+    return render_template("welcome.html")
 
 
 @app.route("/privacy")
@@ -1203,7 +1269,7 @@ def host_register():
                     "password_hash": hash_password(password)
                 }
                 # Issue OTP
-                issue_otp(email)
+                _issue_session_otp("reg_otp", email)
                 session["reg_step"] = "verify"
                 return redirect(url_for("host_register"))
 
@@ -1217,12 +1283,13 @@ def host_register():
                 return redirect(url_for("host_register"))
 
             if action == "resend":
-                issue_otp(pending["email"])
+                _issue_session_otp("reg_otp", pending["email"])
                 flash("A new verification code has been sent.")
                 return redirect(url_for("host_register"))
             
             code = request.form.get("otp", "").strip()
-            if verify_otp(pending["email"], code):
+            otp_err = verify_session_otp("reg_otp", code)
+            if otp_err is None:
                 # Success: Create the host
                 host = HostUser(
                     email=pending["email"],
@@ -1240,7 +1307,7 @@ def host_register():
                 session[SESSION_HOST_EMAIL] = email
                 return redirect(url_for("host"))
             else:
-                error = "Invalid or expired verification code."
+                error = otp_err
 
     # Render based on current step
     if step == "verify":
@@ -1289,7 +1356,7 @@ def host_login():
                 error = "You must accept the Terms & Privacy Policy to log in."
             else:
                 session["login_pending"] = host.email
-                issue_otp(host.email, purpose="login")
+                _issue_session_otp("login_otp", host.email)
                 session["login_step"] = "verify"
                 return redirect(url_for("host_login"))
 
@@ -1302,12 +1369,13 @@ def host_login():
                 return redirect(url_for("host_login"))
 
             if action == "resend":
-                issue_otp(email, purpose="login")
+                _issue_session_otp("login_otp", email)
                 flash("A new verification code has been sent.")
                 return redirect(url_for("host_login"))
 
             code = request.form.get("otp", "").strip()
-            if verify_otp(email, code, purpose="login"):
+            otp_err = verify_session_otp("login_otp", code)
+            if otp_err is None:
                 session[SESSION_HOST_EMAIL] = email
                 session.pop("login_step", None)
                 session.pop("login_pending", None)
@@ -1322,7 +1390,7 @@ def host_login():
                     return redirect(next_url)
                 return redirect(url_for("host"))
             else:
-                error = "Invalid or expired verification code."
+                error = otp_err
 
     if step == "verify":
         email = session.get("login_pending")
@@ -1637,12 +1705,15 @@ def download_all_zip():
     authenticated host are collected (matching every other /host* route).
 
     For every session that has a registered student, the archive contains:
-      * <n>_<student>_<exam>_<session_id>/details.pdf  — ReportLab details PDF
-      * <n>_<student>_<exam>_<session_id>/details.html — print-friendly HTML
-                                                         fallback (only when
-                                                         the PDF tooling is
-                                                         unavailable)
-      * <n>_<student>_<exam>_<session_id>/submission.json — full raw data
+      * <student_name>/details.pdf            — ReportLab details PDF
+      * <student_name>/details.html           — print-friendly HTML
+                                                 fallback (only when the PDF
+                                                 tooling is unavailable)
+      * <student_name>/submission.json        — full raw data
+
+    Folders are named directly after each student's name (sanitized for safe
+    folder naming). If two students share the same name, a small numeric
+    suffix is appended so every entry stays unique inside the archive.
 
     A top-level index.json (submission summary) and README.txt describe the
     whole export. The archive is built in memory and streamed straight back
@@ -1666,15 +1737,26 @@ def download_all_zip():
 
     summary = []
     zip_buf = io.BytesIO()
+    used_folders = set()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as archive:
-        for idx, s in enumerate(sessions, start=1):
+        for s in sessions:
             data = session_to_dict(s)
-            exam_title = _safe_filename(data.get("exam_title") or "", "exam") or "exam"
             student_name = (
                 _safe_filename((data.get("student") or {}).get("name") or "", "student")
                 or "student"
             )
-            folder = f"{idx:03d}__{student_name}__{exam_title}__{s.id}"
+            # Name the folder directly after the student (sanitized, no numeric
+            # prefix). If two students share the same name, append a small
+            # suffix so every entry stays unique inside the archive.
+            folder = student_name
+            if folder in used_folders:
+                dup = 2
+                candidate = f"{folder}_{dup}"
+                while candidate in used_folders:
+                    dup += 1
+                    candidate = f"{folder}_{dup}"
+                folder = candidate
+            used_folders.add(folder)
 
             # 1) Real details PDF (ReportLab) with an HTML fallback.
             pdf_bytes = _pdf_bytes(
@@ -2135,8 +2217,11 @@ def exam_register(exam_id):
             if slug in student_data:
                 custom_vals[slug] = student_data[slug]
 
-                # Generate OTP code for the student's phone verification step
+                # Generate OTP code for the student's phone verification step and
+        # record it (with its UTC generation time) for the 2-minute expiry
+        # check performed during verification.
         otp_code = _generate_otp()
+        _set_session_otp("student_otp", otp_code)
         
         # Store pending registration details in the session
         session["student_pending"] = {
@@ -2144,8 +2229,6 @@ def exam_register(exam_id):
             "name": student_data.get("name", ""),
             "phone": phone_val,
             "custom_fields": custom_vals,
-            "otp_code_hash": hash_password(otp_code),
-            "otp_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
         }
         
         # Log/Print the OTP (in a real scenario this would send an SMS)
@@ -2181,21 +2264,15 @@ def exam_verify(exam_id):
         action = request.form.get("action", "verify")
 
         if action == "resend":
-            otp_code = _generate_otp()
+            otp_code = _issue_session_otp("student_otp", pending["phone"], is_email=False)
             print(f"\n[STUDENT OTP RESEND DEBUG] Phone: {pending['phone']} | Code: {otp_code}\n")
-            pending["otp_code_hash"] = hash_password(otp_code)
-            pending["otp_expires_at"] = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-            session["student_pending"] = pending
             flash("A new verification code has been sent.")
             return redirect(url_for("exam_verify", exam_id=exam_id))
 
         submitted_code = request.form.get("otp", "").strip()
-        expires_at = datetime.fromisoformat(pending.get("otp_expires_at", datetime.now(timezone.utc).isoformat()))
-
-        if datetime.now(timezone.utc) > expires_at:
-            error = "Verification code has expired. Please request a new one."
-        elif not verify_password(submitted_code, pending.get("otp_code_hash", "")):
-            error = "Invalid verification code. Please try again."
+        otp_err = verify_session_otp("student_otp", submitted_code)
+        if otp_err is not None:
+            error = otp_err
         else:
             # Code is valid! Create the student's isolated Session and Student record.
             session_id = uuid.uuid4().hex[:16]
@@ -2271,6 +2348,7 @@ def exam_verify(exam_id):
 
             # Clear pending session and store authorized session_id
             session.pop("student_pending", None)
+            session.pop("student_otp", None)
             session[f"auth_{session_id}"] = True
 
             return redirect(url_for("exam", session_id=session_id))

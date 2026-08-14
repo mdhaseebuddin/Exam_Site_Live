@@ -506,3 +506,62 @@ code, .question-text, .cf-label, .student-info-value, a, .card-text {
   }
 }
 
+/* ===== Registered Students (attempts) table — fully responsive on mobile =====
+   Give each column a readable minimum width and wrap at word boundaries so
+   names, phones and custom field labels (e.g. "parents name") never stack one
+   letter per line. On narrow screens the table exceeds the viewport and the
+   .table-responsive wrapper scrolls horizontally. */
+.attempts-table-wrap {
+  width: 100%;
+  max-width: 100%;
+}
+.attempts-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.attempts-table th,
+.attempts-table td {
+  vertical-align: middle;
+  overflow-wrap: anywhere;
+  word-break: normal;              /* wrap at spaces, never mid-letter */
+}
+.attempts-table .student-cell {
+  min-width: 170px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+.attempts-table .student-cell .student-phone {
+  white-space: nowrap;             /* keep the 10-digit phone on one line */
+}
+.attempts-table td.cf-cell {
+  min-width: 110px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+@media (max-width: 767.98px) {
+  .attempts-table-wrap {
+    overflow-x: auto;              /* horizontal scroll on narrow screens */
+    -webkit-overflow-scrolling: touch;
+  }
+  /* Let the table exceed the viewport so the wrapper scrolls instead of the
+     columns being crushed together. */
+  .attempts-table {
+    min-width: 720px;
+  }
+  .attempts-table th,
+  .attempts-table td {
+    white-space: normal !important;   /* undo the global mobile nowrap */
+    word-break: normal !important;    /* undo letter-by-letter breaking */
+    overflow-wrap: anywhere;
+  }
+  .attempts-table .student-cell {
+    min-width: 170px;
+  }
+  .attempts-table td.cf-cell {
+    min-width: 110px;
+  }
+}
+

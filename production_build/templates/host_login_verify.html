@@ -14,6 +14,7 @@
       <div class="card-body p-4">
         <h1 class="h3 mb-3 text-center">Verify Login</h1>
         <p class="text-muted small text-center">A 6-digit code has been sent to {{ email }}. Check your email or the terminal logs.</p>
+        <p class="text-muted small text-center mb-3">Your code expires in 2 minutes.</p>
         
         {% if error %}
           <div class="alert alert-danger py-2 small">{{ error }}</div>

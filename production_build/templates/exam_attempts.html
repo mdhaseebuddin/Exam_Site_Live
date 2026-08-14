@@ -41,8 +41,8 @@
       <div class="card-header fw-semibold">👥 Registered Students ({{ attempts | length }})</div>
       <div class="card-body p-0">
         {% if attempts %}
-          <div class="table-responsive">
-            <table class="table table-hover mb-0 align-middle">
+          <div class="table-responsive attempts-table-wrap">
+            <table class="table table-hover mb-0 align-middle attempts-table">
               <thead>
                 <tr>
                   <th>Student</th>
@@ -57,12 +57,12 @@
               <tbody>
                 {% for a in attempts %}
                   <tr>
-                    <td class="nowrap-off">
+                    <td class="nowrap-off student-cell">
                       {{ (a.student or {}).get('name', '—') }}
-                      <div class="small text-muted">{{ (a.student or {}).get('phone', '') }}</div>
+                      <div class="small text-muted student-phone">{{ (a.student or {}).get('phone', '') }}</div>
                     </td>
                     {% for cf in custom_registration_fields %}
-                      <td>{{ (a.student or {}).get(cf.slug, '—') }}</td>
+                      <td class="cf-cell">{{ (a.student or {}).get(cf.slug, '—') }}</td>
                     {% endfor %}
                     <td>
                       {% if a.status == 'completed' %}
