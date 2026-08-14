@@ -1,7 +1,7 @@
 # Exam Platform — Production Build
 
-This folder is a clean, self-contained production copy of the Exam Platform.
-It contains only the files needed to run the application in production.
+This folder is a clean, self-contained production copy of the Exam Platform. It
+contains only the files needed to run the application in production.
 
 ## Contents
 
