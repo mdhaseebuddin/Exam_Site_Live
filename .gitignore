@@ -1,0 +1,50 @@
+# =============================================================================
+# Exam Platform — repository-root .gitignore
+# Protects the WHOLE repo so local/runtime artifacts are never committed or
+# bundled into a deployment package. (production_build/.gitignore covers the
+# same files inside the subfolder; this root file backs it up.)
+# =============================================================================
+
+# --- Secrets (NEVER commit) ---
+.env
+.env.*
+!.env.example
+*.env
+
+# --- Local SQLite databases & runtime data ---
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+instance/
+
+# --- Runtime-generated private/log folders ---
+logs/
+log/
+user_logins/
+tests_conducted/
+data/
+
+# --- Local dev binaries / tunneling tools (not part of the app) ---
+ngrok.exe
+*.exe
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/

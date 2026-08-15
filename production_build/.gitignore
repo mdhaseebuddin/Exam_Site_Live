@@ -35,3 +35,7 @@ __pycache__/
 Thumbs.db
 *.swp
 
+# Local dev binaries / tunneling tools (not part of the app)
+ngrok.exe
+*.exe
+

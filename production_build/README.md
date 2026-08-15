@@ -39,8 +39,8 @@ production_build/
    pip install -r requirements.txt
    ```
 
-   > **Note:** `gunicorn` is installed only on Linux/macOS; `waitress` is used
-   > as the Windows fallback (already handled in `requirements.txt`).
+   > **Note:** `gunicorn` runs only on Linux/macOS; `waitress` is the Windows
+   > fallback. Both are declared in `requirements.txt`.
 
 2. **Configure environment variables:**
 
@@ -68,6 +68,30 @@ production_build/
 
 The database tables are created automatically on startup by `wsgi.py`
 (`init_db()`).
+
+## Deploying to the cloud (Render / Koyeb)
+
+This folder is a self-contained package, but deployment is driven from the
+**repository root** by the `Procfile` (see the root `README.md`):
+
+```
+web: gunicorn --chdir production_build wsgi:app
+```
+
+1. Push the **whole repository** to GitHub/GitLab and connect it to your host.
+2. **Build command:** `pip install -r production_build/requirements.txt`
+3. **Start command:** leave this empty so the host runs the `Procfile` `web:`
+   line, i.e. `gunicorn --chdir production_build wsgi:app`.
+4. **Environment:** add the variables from `.env.example` in the host dashboard
+   (the app reads them via `load_dotenv()`; no `.env` file is needed on a host).
+
+> **Why `--chdir production_build` and not `production_build.wsgi:app`?**
+> The modules here use plain absolute imports (`from app import app`,
+> `from models import ...`, `from schemas import ...`), so gunicorn must run
+> with `production_build` as its working directory. The dotted module form
+> fails with `ModuleNotFoundError: No module named 'app'`. The app resolves
+> its own paths (`DB_PATH`, `LOGS_DIR`) from `__file__`, not the working
+> directory, so `--chdir` is safe.
 
 ## Security notes
 

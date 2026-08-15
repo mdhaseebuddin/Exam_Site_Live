@@ -1,18 +1,24 @@
-flask
-pdfkit
-reportlab
-flask-limiter
-python-dotenv
-flask-sqlalchemy
-flask-wtf
-marshmallow
+# =============================================================================
+# Exam Platform — Production dependencies
+# =============================================================================
+# Versions below are pinned to the set verified working with this codebase.
+# gunicorn is Linux/macOS-only and is what the cloud host installs; waitress
+# is the Windows/local-development fallback referenced in README.md.
+#
+# Install with:  pip install -r requirements.txt
+# =============================================================================
 
-# Production WSGI servers
-#   gunicorn  = Linux/macOS (multi-worker, recommended for production)
-#   waitress  = Windows fallback (gunicorn does not run natively on Windows)
-gunicorn; sys_platform != 'win32'
-waitress; sys_platform == 'win32'
+Flask==3.1.3
+Flask-SQLAlchemy==3.1.1
+Flask-WTF==1.3.0
+Flask-Limiter==4.1.1
+marshmallow==4.3.1
+python-dotenv==1.2.2
 
-# Load testing (install separately when you need it):
-#   pip install locust
+# PDF generation — pure-Python ReportLab (no system binary like wkhtmltopdf
+# is required; pdfkit has intentionally been removed).
+reportlab==5.0.0
 
+# WSGI servers
+gunicorn            # production server (Linux/macOS; used on the cloud host)
+waitress==3.0.2     # Windows / local dev fallback
