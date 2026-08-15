@@ -15,6 +15,9 @@ Flask-Limiter==4.1.1
 marshmallow==4.3.1
 python-dotenv==1.2.2
 
+# Brevo (formerly Sendinblue) — transactional email API for OTP/verification emails.
+sib-api-v3-sdk==7.6.0
+
 # PDF generation — pure-Python ReportLab (no system binary like wkhtmltopdf
 # is required; pdfkit has intentionally been removed).
 reportlab==5.0.0

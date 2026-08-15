@@ -35,15 +35,14 @@ import random
 import re
 import secrets
 import shutil
-import smtplib
 import traceback
 import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 from functools import wraps
 from pathlib import Path
 
+import sib_api_v3_sdk
 from dotenv import load_dotenv
 from flask import (
     Flask,
@@ -134,6 +133,13 @@ app.config["SESSION_COOKIE_SECURE"] = (
 app.config["MAX_CONTENT_LENGTH"] = int(
     os.environ.get("MAX_CONTENT_LENGTH", 1 * 1024 * 1024)
 )  # 1 MiB request cap by default
+
+# --- Email delivery (Brevo transactional email) ---
+# Sender address for OTP/verification emails. Overridable via the
+# MAIL_DEFAULT_SENDER environment variable.
+app.config["MAIL_DEFAULT_SENDER"] = os.environ.get(
+    "MAIL_DEFAULT_SENDER", "mdhaseebuddin77@gmail.com"
+)
 
 # --- Global CSRF protection (Flask-WTF) ---
 # Enforces a valid CSRF token on EVERY unsafe method (POST/PUT/PATCH/DELETE),
@@ -468,48 +474,48 @@ def _generate_otp() -> str:
 
 def _send_otp_email(email: str, code: str) -> bool:
     """
-    Deliver the OTP code to the host's email address.
+    Deliver the OTP code to the host's email address via the Brevo
+    (formerly Sendinblue) Transactional Email API.
 
-    If SMTP credentials are configured via environment variables the code is
-    emailed. Otherwise (e.g. local development) the code is logged to the
-    server console/log so the flow works out-of-the-box.
+    Requires a BREVO_API_KEY environment variable. The sender address comes
+    from MAIL_DEFAULT_SENDER (defaults to mdhaseebuddin77@gmail.com). If the
+    API key is missing, or delivery fails, the code is logged to the server
+    console/audit log so the flow works out-of-the-box.
     """
-    smtp_host = os.environ.get("SMTP_HOST", "")
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-    smtp_user = os.environ.get("SMTP_USER", "")
-    smtp_pass = os.environ.get("SMTP_PASS", "")
-    smtp_from = os.environ.get("SMTP_FROM", smtp_user)
+    api_key = os.environ.get("BREVO_API_KEY", "").strip()
+    sender_email = app.config["MAIL_DEFAULT_SENDER"]
 
     # Debug: Always log the OTP to the console for local testing/ngrok.
     print(f"\n[OTP DEBUG] Target: {email} | Code: {code}\n")
 
-    if smtp_host and smtp_user:
-        try:
-            msg = EmailMessage()
-            msg["Subject"] = "Your Exam Platform password reset code"
-            msg["From"] = smtp_from
-            msg["To"] = email
-            msg.set_content(
+    if not api_key:
+        print("[OTP] BREVO_API_KEY not configured. OTP printed to console only.")
+        audit("otp_generated", email=email, code=code, ip=get_remote_address())
+        return False
+
+    try:
+        configuration = sib_api_v3_sdk.Configuration()
+        configuration.api_key["api-key"] = api_key
+        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(
+            sib_api_v3_sdk.ApiClient(configuration)
+        )
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            sender={"email": sender_email},
+            to=[{"email": email}],
+            subject="Your Exam Platform password reset code",
+            text_content=(
                 "Your Exam Platform password reset code is: "
                 f"{code}\n\nThis code expires in {OTP_LIFETIME_MINUTES} minutes."
-            )
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
-                server.ehlo()
-                if int(os.environ.get("SMTP_STARTTLS", "1")) == 1:
-                    server.starttls()
-                    server.ehlo()
-                server.login(smtp_user, smtp_pass)
-                server.send_message(msg)
-            return True
-        except Exception as exc:  # pragma: no cover - network dependent
-            print(f"[OTP ERROR] SMTP Failure: {exc}")
-            traceback.print_exc()
-            audit("otp_email_failed", email=email, error=str(exc), ip=get_remote_address())
-            # fall through to console logging so the user can still get the code
-    else:
-        print("[OTP] SMTP not configured. OTP printed to console only.")
+            ),
+        )
+        api_instance.send_transac_email(send_smtp_email)
+        return True
+    except Exception as exc:  # pragma: no cover - network/API dependent
+        print(f"[OTP ERROR] Brevo API Failure: {exc}")
+        traceback.print_exc()
+        audit("otp_email_failed", email=email, error=str(exc), ip=get_remote_address())
 
-    # No SMTP configured, or delivery failed -> log the code (dev-friendly).
+    # Delivery failed -> log the code (dev-friendly).
     audit("otp_generated", email=email, code=code, ip=get_remote_address())
     return False
 
