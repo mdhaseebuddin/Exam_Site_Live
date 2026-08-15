@@ -2223,147 +2223,94 @@ def exam_register(exam_id):
             if slug in student_data:
                 custom_vals[slug] = student_data[slug]
 
-                # Generate OTP code for the student's phone verification step and
-        # record it (with its UTC generation time) for the 2-minute expiry
-        # check performed during verification.
-        otp_code = _generate_otp()
-        _set_session_otp("student_otp", otp_code)
-        
-        # Store pending registration details in the session
-        session["student_pending"] = {
-            "exam_id": exam_id,
-            "name": student_data.get("name", ""),
-            "phone": phone_val,
-            "custom_fields": custom_vals,
-        }
-        
-        # Log/Print the OTP (in a real scenario this would send an SMS)
-        print(f"\n[STUDENT OTP DEBUG] Phone: {phone_val} | Code: {otp_code}\n")
+        # --- Create the student's isolated Session and Student record ---
+        # No phone OTP step: the checks above (duplicate phone, required
+        # fields, server-side validation, CAPTCHA, policy agreement) are the
+        # only gate, so a valid, unique phone number lets the student go
+        # straight into the exam.
+        session_id = uuid.uuid4().hex[:16]
+        now = datetime.now(timezone.utc)
+        s = Session(
+            id=session_id,
+            exam_id=exam_id,
+            host_email=ex.host_email,
+            status="registered",
+            config={
+                "exam_title": cfg.get("exam_title", ""),
+                "time_limit_minutes": time_limit,
+                "ratio": ratio,
+                "max_capacity": max_cap,
+                "custom_registration_fields": cfg.get("custom_registration_fields", []),
+                "required_fields": cfg.get("required_fields", DEFAULT_REQUIRED_FIELDS),
+            },
+            created_at=now.isoformat(),
+        )
+        db.session.add(s)
 
-        return redirect(url_for("exam_verify", exam_id=exam_id))
-    return render_template(
-        "register.html", error=None, form={}, captcha=captcha_payload(), **template_vars
-    )
+        exam_snapshot = list(ex.exam_questions)
+        if exam_snapshot:
+            bank_dicts = [
+                {
+                    "id": eq.question_id or f"pos_{eq.position}",
+                    "type": eq.type or "mcq",
+                    "text": eq.text,
+                    "options": eq.options,
+                    "correct_index": eq.correct_index,
+                }
+                for eq in exam_snapshot
+            ]
+            randomized = randomize_questions(bank_dicts, ratio)
+            for pos, q in enumerate(randomized):
+                sq = SessionQuestion(
+                    session_id=session_id,
+                    position=pos,
+                    question_id=q.get("id"),
+                    type=q.get("type", "mcq"),
+                    text=q["text"],
+                    options=q.get("options"),
+                    correct_index=q.get("correct_index"),
+                )
+                db.session.add(sq)
 
-@app.route("/exam/verify/<exam_id>", methods=["GET", "POST"])
-@limiter.limit("20 per hour", methods=["POST"])
-def exam_verify(exam_id):
-    """
-    OTP Verification page for student phone number.
-    """
-    from sqlalchemy.exc import IntegrityError
+        student = Student(
+            session_id=session_id,
+            name=student_data.get("name", ""),
+            phone=phone_val,
+            custom_fields=custom_vals,
+            registered_at=now.isoformat(),
+            agreed_to_policy=True,
+            agreed_at=now.isoformat(),
+        )
+        db.session.add(student)
 
-    pending = session.get("student_pending")
-    if not pending or pending.get("exam_id") != exam_id:
-        return redirect(url_for("exam_register", exam_id=exam_id))
-    ex = db.session.get(Exam, exam_id)
-    if ex is None:
-        return redirect(url_for("host", error="session_not_found"))
-
-    cfg = ex.config or {}
-    time_limit = int(cfg.get("time_limit_minutes", 30) or 30)
-    ratio = int(cfg.get("ratio", 0) or 0)
-    max_cap = MAX_SUBMISSIONS
-
-    error = None
-    if request.method == "POST":
-        action = request.form.get("action", "verify")
-
-        if action == "resend":
-            otp_code = _issue_session_otp("student_otp", pending["phone"], is_email=False)
-            print(f"\n[STUDENT OTP RESEND DEBUG] Phone: {pending['phone']} | Code: {otp_code}\n")
-            flash("A new verification code has been sent.")
-            return redirect(url_for("exam_verify", exam_id=exam_id))
-
-        submitted_code = request.form.get("otp", "").strip()
-        otp_err = verify_session_otp("student_otp", submitted_code)
-        if otp_err is not None:
-            error = otp_err
-        else:
-            # Code is valid! Create the student's isolated Session and Student record.
-            session_id = uuid.uuid4().hex[:16]
-            now = datetime.now(timezone.utc)
-            s = Session(
-                id=session_id,
-                exam_id=exam_id,
-                host_email=ex.host_email,
-                status="registered",
-                config={
-                    "exam_title": cfg.get("exam_title", ""),
-                    "time_limit_minutes": time_limit,
-                    "ratio": ratio,
-                    "max_capacity": max_cap,
-                    "custom_registration_fields": cfg.get("custom_registration_fields", []),
-                    "required_fields": cfg.get("required_fields", DEFAULT_REQUIRED_FIELDS),
-                },
-                created_at=now.isoformat(),
-            )
-            db.session.add(s)
-
-            exam_snapshot = list(ex.exam_questions)
-            if exam_snapshot:
-                bank_dicts = [
-                    {
-                        "id": eq.question_id or f"pos_{eq.position}",
-                        "type": eq.type or "mcq",
-                        "text": eq.text,
-                        "options": eq.options,
-                        "correct_index": eq.correct_index,
-                    }
-                    for eq in exam_snapshot
-                ]
-                randomized = randomize_questions(bank_dicts, ratio)
-                for pos, q in enumerate(randomized):
-                    sq = SessionQuestion(
-                        session_id=session_id,
-                        position=pos,
-                        question_id=q.get("id"),
-                        type=q.get("type", "mcq"),
-                        text=q["text"],
-                        options=q.get("options"),
-                        correct_index=q.get("correct_index"),
-                    )
-                    db.session.add(sq)
-
-            student = Student(
-                session_id=session_id,
-                name=pending.get("name"),
-                phone=pending.get("phone"),
-                custom_fields=pending.get("custom_fields", {}),
-                registered_at=now.isoformat(),
-                agreed_to_policy=True,
-                agreed_at=now.isoformat(),
-            )
-            db.session.add(student)
-
-            try:
-                db.session.commit()
-            except IntegrityError:
-                db.session.rollback()
-                audit("registration_race_lost", exam_id=exam_id, session_id=session_id, ip=get_remote_address())
-                return redirect(url_for("exam_register", exam_id=exam_id))
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
             audit(
-                "registration_success",
+                "registration_race_lost",
                 exam_id=exam_id,
                 session_id=session_id,
-                name=pending.get("name"),
                 ip=get_remote_address(),
             )
-            if s.host_email:
-                write_tests_conducted(s.host_email)
+            return redirect(url_for("exam_register", exam_id=exam_id))
+        audit(
+            "registration_success",
+            exam_id=exam_id,
+            session_id=session_id,
+            name=student_data.get("name", ""),
+            ip=get_remote_address(),
+        )
+        if s.host_email:
+            write_tests_conducted(s.host_email)
 
-            # Clear pending session and store authorized session_id
-            session.pop("student_pending", None)
-            session.pop("student_otp", None)
-            session[f"auth_{session_id}"] = True
+        # Authorize this browser so the exam page opens directly afterwards.
+        session[f"auth_{session_id}"] = True
 
-            return redirect(url_for("exam", session_id=session_id))
+        return redirect(url_for("exam", session_id=session_id))
 
     return render_template(
-        "exam_verify.html",
-        exam_id=exam_id,
-        phone=pending.get("phone"),
-        error=error
+        "register.html", error=None, form={}, captcha=captcha_payload(), **template_vars
     )
 
 @app.route("/exam/<session_id>")

@@ -45,7 +45,7 @@
                        value="{{ form.get(field, '') }}"
                        placeholder="e.g. 03001234567"
                        data-rule="phone">
-                <div class="form-text">Exactly 10 digits (numbers only). Note: A live OTP verification code will be sent to this number.</div>
+                <div class="form-text">Exactly 10 digits (numbers only). No OTP verification is required.</div>
               {% elif field == 'name' %}
                 <input class="form-control" id="f_{{ field }}" type="text"
                        name="{{ field }}" required autocomplete="name"
