@@ -187,6 +187,7 @@ class Student(db.Model):
         nullable=False,
     )
     name = db.Column(db.String(200), nullable=False, default="")
+    email = db.Column(db.String(255), nullable=False, default="", index=True)
     phone = db.Column(db.String(20), nullable=False, default="")
     custom_fields = db.Column(db.JSON, nullable=False, default=dict)
     registered_at = db.Column(db.String(64), nullable=True)

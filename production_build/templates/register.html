@@ -45,7 +45,15 @@
                        value="{{ form.get(field, '') }}"
                        placeholder="e.g. 03001234567"
                        data-rule="phone">
-                <div class="form-text">Exactly 10 digits (numbers only). No OTP verification is required.</div>
+                <div class="form-text">Exactly 10 digits (numbers only).</div>
+              {% elif field == 'email' %}
+                <input class="form-control" id="f_{{ field }}" type="email"
+                       name="{{ field }}" required autocomplete="email" maxlength="255"
+                       inputmode="email"
+                       value="{{ form.get(field, '') }}"
+                       placeholder="e.g. student@example.com"
+                       data-rule="email">
+                <div class="form-text">A 6-digit verification code will be emailed to this address.</div>
               {% elif field == 'name' %}
                 <input class="form-control" id="f_{{ field }}" type="text"
                        name="{{ field }}" required autocomplete="name"
@@ -136,6 +144,18 @@
           errors.push('Phone Number is required.');
         } else if (!phoneRule.test(value)) {
           errors.push('Phone Number must be exactly 10 digits.');
+        }
+      }
+
+      const emailInput = form.querySelector('input[name="email"]');
+      if (emailInput) {
+        const value = emailInput.value.trim();
+        if (!value) {
+          errors.push('Email Address is required.');
+        } else if (!/\S+@\S+\.\S+/.test(value)) {
+          errors.push('Please enter a valid email address.');
+        } else if (value.length > 255) {
+          errors.push('Email Address cannot exceed 255 characters.');
         }
       }
 

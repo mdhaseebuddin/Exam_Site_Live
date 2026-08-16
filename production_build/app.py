@@ -327,6 +327,10 @@ def init_db() -> None:
             db.session.execute(text("ALTER TABLE students ADD COLUMN agreed_to_policy BOOLEAN NOT NULL DEFAULT 0"))
         if "agreed_at" not in stu_cols:
             db.session.execute(text("ALTER TABLE students ADD COLUMN agreed_at VARCHAR(64)"))
+        # Student.email (email verification OTP for student registration)
+        stu_cols = [c["name"] for c in insp.get_columns("students")]
+        if "email" not in stu_cols:
+            db.session.execute(text("ALTER TABLE students ADD COLUMN email VARCHAR(255) NOT NULL DEFAULT ''"))
         db.session.commit()
 
 # ---------------------------------------------------------------------------
@@ -477,19 +481,20 @@ def _send_otp_email(email: str, code: str) -> bool:
     Deliver the OTP code to the host's email address via the Brevo
     (formerly Sendinblue) Transactional Email API.
 
-    Requires a BREVO_API_KEY environment variable. The sender address comes
-    from MAIL_DEFAULT_SENDER (defaults to mdhaseebuddin77@gmail.com). If the
-    API key is missing, or delivery fails, the code is logged to the server
-    console/audit log so the flow works out-of-the-box.
+    Requires a BREVO_API_KEY (or BREVO_HOST_API_KEY) environment variable. The
+    sender address comes from MAIL_DEFAULT_SENDER (defaults to
+    mdhaseebuddin77@gmail.com). If the API key is missing, or delivery fails,
+    the code is logged to the server console/audit log so the flow works
+    out-of-the-box.
     """
-    api_key = os.environ.get("BREVO_API_KEY", "").strip()
+    api_key = os.environ.get('BREVO_HOST_API_KEY') or os.environ.get('BREVO_API_KEY')
     sender_email = app.config["MAIL_DEFAULT_SENDER"]
 
     # Debug: Always log the OTP to the console for local testing/ngrok.
     print(f"\n[OTP DEBUG] Target: {email} | Code: {code}\n")
 
     if not api_key:
-        print("[OTP] BREVO_API_KEY not configured. OTP printed to console only.")
+        print("[OTP] Neither BREVO_HOST_API_KEY nor BREVO_API_KEY configured. OTP printed to console only.")
         audit("otp_generated", email=email, code=code, ip=get_remote_address())
         return False
 
@@ -516,6 +521,75 @@ def _send_otp_email(email: str, code: str) -> bool:
         audit("otp_email_failed", email=email, error=str(exc), ip=get_remote_address())
 
     # Delivery failed -> log the code (dev-friendly).
+    audit("otp_generated", email=email, code=code, ip=get_remote_address())
+    return False
+
+
+def _send_student_otp(email: str, code: str) -> bool:
+    """
+    Deliver the OTP code to the STUDENT's email address via the Brevo
+    (formerly Sendinblue) Transactional Email API.
+
+    This is the STUDENT channel and is fully isolated from the host channel.
+    It tries BREVO_STUDENT_API_KEY_1 first and, if delivery fails, falls back
+    to BREVO_STUDENT_API_KEY_2. The sender address comes from
+    MAIL_DEFAULT_SENDER. If no student key is configured, or every key fails,
+    the code is logged to the console/audit log so the flow works
+    out-of-the-box.
+    """
+    sender_email = app.config["MAIL_DEFAULT_SENDER"]
+
+    # Debug: Always log the OTP to the console for local testing/ngrok.
+    print(f"\n[OTP DEBUG] Target: {email} | Code: {code}\n")
+
+    keys = [
+        os.environ.get("BREVO_STUDENT_API_KEY_1", "").strip(),
+        os.environ.get("BREVO_STUDENT_API_KEY_2", "").strip(),
+    ]
+    keys = [k for k in keys if k]
+
+    if not keys:
+        print(
+            "[OTP] No BREVO_STUDENT_API_KEY_1/_2 configured. "
+            "OTP printed to console only."
+        )
+        audit("otp_generated", email=email, code=code, ip=get_remote_address())
+        return False
+
+    last_error = None
+    for index, api_key in enumerate(keys, start=1):
+        try:
+            configuration = sib_api_v3_sdk.Configuration()
+            configuration.api_key["api-key"] = api_key
+            api_instance = sib_api_v3_sdk.TransactionalEmailsApi(
+                sib_api_v3_sdk.ApiClient(configuration)
+            )
+            send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+                sender={"email": sender_email},
+                to=[{"email": email}],
+                subject="Your Exam Platform email verification code",
+                text_content=(
+                    "Your Exam Platform email verification code is: "
+                    f"{code}\n\n"
+                    f"This code expires in {OTP_SESSION_LIFETIME_MINUTES} minutes."
+                ),
+            )
+            api_instance.send_transac_email(send_smtp_email)
+            print(f"[OTP] Sent student OTP via BREVO_STUDENT_API_KEY_{index}.")
+            return True
+        except Exception as exc:  # pragma: no cover - network/API dependent
+            print(f"[OTP ERROR] Brevo API Failure (key {index}): {exc}")
+            last_error = exc
+            audit(
+                "otp_email_failed",
+                email=email,
+                key=f"BREVO_STUDENT_API_KEY_{index}",
+                error=str(exc),
+                ip=get_remote_address(),
+            )
+
+    # All keys failed -> log the code (dev-friendly).
+    print(f"[OTP ERROR] All student Brevo keys failed: {last_error}")
     audit("otp_generated", email=email, code=code, ip=get_remote_address())
     return False
 
@@ -590,15 +664,26 @@ def _set_session_otp(storage_key: str, code: str) -> None:
     }
 
 
-def _issue_session_otp(storage_key: str, target: str, is_email: bool = True) -> str:
+def _issue_session_otp(
+    storage_key: str, target: str, is_email: bool = True, channel: str = "host"
+) -> str:
     """Generate, deliver and record a brand-new session OTP for the given
-    target (email for hosts, phone for students). Returns the plaintext code
-    so the caller can log it for local testing / SMS integration.
+    target (email for hosts/students, phone for students). Returns the
+    plaintext code so the caller can log it for local testing / SMS
+    integration.
+
+    ``channel`` selects the Brevo sender used for email delivery:
+      * "host"    -> _send_otp_email (BREVO_API_KEY / host channel)
+      * "student" -> _send_student_otp (BREVO_STUDENT_API_KEY_1/_2)
+    The two channels are intentionally isolated on separate API keys.
     """
     code = _generate_otp()
     _set_session_otp(storage_key, code)
     if is_email:
-        _send_otp_email(target, code)
+        if channel == "student":
+            _send_student_otp(target, code)
+        else:
+            _send_otp_email(target, code)
     else:
         # Phone target — log to console (a real SMS hook would go here).
         print(f"\n[OTP DEBUG] Target: {target} | Code: {code}\n")
@@ -1103,11 +1188,15 @@ def pdf_response(template_name: str, download_name: str, **ctx):
 # ---------------------------------------------------------------------------
 REG_FIELD_LABELS = {
     "name": "Full Name",
+    "email": "Email Address",
     "phone": "Phone Number",
     "address": "Address",
     "department": "Department",
 }
-DEFAULT_REQUIRED_FIELDS = ["name", "phone"]
+# email + phone are PERMANENT registration requirements: even if a host
+# configures only some fields, we always collect (and verify) both.
+PERMANENT_REQUIRED_FIELDS = ["email", "phone"]
+DEFAULT_REQUIRED_FIELDS = ["name", "email", "phone"]
 
 # Strict server-side validation (enforced even if the frontend is bypassed).
 #   * name  -> alphabetic characters only (no numbers anywhere)
@@ -1137,6 +1226,10 @@ def validate_registration_fields(fields: dict) -> str | None:
     name = fields.get("name", "")
     if name and not NAME_RE.match(name):
         return "Name may only contain alphabetic characters (no numbers)."
+
+    email = fields.get("email", "")
+    if email and not EMAIL_RE.match(email):
+        return "Please enter a valid email address."
 
     phone = fields.get("phone", "")
     if phone and not PHONE_RE.match(phone):
@@ -2095,11 +2188,16 @@ def exam_register(exam_id):
         return redirect(url_for("host", error="session_not_found"))
 
     cfg = ex.config or {}
+    base_required = cfg.get("required_fields") or DEFAULT_REQUIRED_FIELDS
     required_fields = [
         f
-        for f in (cfg.get("required_fields") or DEFAULT_REQUIRED_FIELDS)
+        for f in base_required
         if f in REG_FIELD_LABELS
     ]
+    # email + phone are PERMANENT requirements — always collected & verified.
+    for perm in PERMANENT_REQUIRED_FIELDS:
+        if perm not in required_fields:
+            required_fields.append(perm)
     custom_fields = cfg.get("custom_registration_fields") or []
     time_limit = int(cfg.get("time_limit_minutes", 30) or 30)
     ratio = int(cfg.get("ratio", 0) or 0)
@@ -2122,24 +2220,155 @@ def exam_register(exam_id):
             return jsonify({"error": err_msg}), 400
         return (render_template("register.html", error=err_msg, form={}, captcha=captcha_payload(), **template_vars), 400 if request.method == "POST" else 200)
 
+    step = session.get("stu_reg_step", "input")  # 'input' | 'verify'
+
     if request.method == "POST":
+        # ---- OTP verify step: resend or confirm the emailed code ------
+        # This branch ALWAYS returns, so the input-step handler below only
+        # ever runs for a fresh registration (step == 'input').
+        if step == "verify":
+            action = request.form.get("action", "verify")
+            pending = session.get("stu_reg_pending")
+            if not pending or pending.get("exam_id") != exam_id:
+                session.pop("stu_reg_step", None)
+                session.pop("stu_reg_pending", None)
+                session.pop("stu_reg_otp", None)
+                return redirect(url_for("exam_register", exam_id=exam_id))
+
+            ex = db.session.get(Exam, exam_id)
+            if ex is None:
+                session.pop("stu_reg_step", None)
+                session.pop("stu_reg_pending", None)
+                session.pop("stu_reg_otp", None)
+                return redirect(url_for("host", error="session_not_found"))
+
+            if action == "resend":
+                _issue_session_otp("stu_reg_otp", pending["email"], is_email=True, channel="student")
+                flash("A new verification code has been sent to your email.")
+                return redirect(url_for("exam_register", exam_id=exam_id))
+
+            code = request.form.get("otp", "").strip()
+            otp_err = verify_session_otp("stu_reg_otp", code)
+            if otp_err is not None:
+                return render_template(
+                    "register_verify.html", email=pending["email"], exam_id=exam_id, error=otp_err
+                )
+
+            # ---- OTP verified: finalize the registration --------------
+            email_val = pending.get("email", "")
+            phone_val = pending.get("phone", "")
+            custom_vals = pending.get("custom_vals") or {}
+            time_limit = int(pending.get("time_limit", 30) or 30)
+            ratio = int(pending.get("ratio", 0) or 0)
+            max_cap = int(pending.get("max_cap") or MAX_SUBMISSIONS)
+
+            session_id = uuid.uuid4().hex[:16]
+            now = datetime.now(timezone.utc)
+            s = Session(
+                id=session_id,
+                exam_id=exam_id,
+                host_email=ex.host_email,
+                status="registered",
+                config={
+                    "exam_title": cfg.get("exam_title", ""),
+                    "time_limit_minutes": time_limit,
+                    "ratio": ratio,
+                    "max_capacity": max_cap,
+                    "custom_registration_fields": cfg.get("custom_registration_fields", []),
+                    "required_fields": cfg.get("required_fields", DEFAULT_REQUIRED_FIELDS),
+                },
+                created_at=now.isoformat(),
+            )
+            db.session.add(s)
+
+            exam_snapshot = list(ex.exam_questions)
+            if exam_snapshot:
+                bank_dicts = [
+                    {
+                        "id": eq.question_id or f"pos_{eq.position}",
+                        "type": eq.type or "mcq",
+                        "text": eq.text,
+                        "options": eq.options,
+                        "correct_index": eq.correct_index,
+                    }
+                    for eq in exam_snapshot
+                ]
+                randomized = randomize_questions(bank_dicts, ratio)
+                for pos, q in enumerate(randomized):
+                    sq = SessionQuestion(
+                        session_id=session_id,
+                        position=pos,
+                        question_id=q.get("id"),
+                        type=q.get("type", "mcq"),
+                        text=q["text"],
+                        options=q.get("options"),
+                        correct_index=q.get("correct_index"),
+                    )
+                    db.session.add(sq)
+
+            student = Student(
+                session_id=session_id,
+                name=pending.get("name", ""),
+                email=email_val,
+                phone=phone_val,
+                custom_fields=custom_vals,
+                registered_at=now.isoformat(),
+                agreed_to_policy=True,
+                agreed_at=now.isoformat(),
+            )
+            db.session.add(student)
+
+            try:
+                db.session.commit()
+            except IntegrityError:
+                db.session.rollback()
+                audit("registration_race_lost", exam_id=exam_id, session_id=session_id, ip=get_remote_address())
+                session.pop("stu_reg_step", None)
+                session.pop("stu_reg_pending", None)
+                session.pop("stu_reg_otp", None)
+                return redirect(url_for("exam_register", exam_id=exam_id))
+
+            audit("registration_success", exam_id=exam_id, session_id=session_id, name=pending.get("name", ""), email=email_val, ip=get_remote_address())
+            if s.host_email:
+                write_tests_conducted(s.host_email)
+
+            # Authorize this browser so the exam page opens directly afterwards.
+            session[f"auth_{session_id}"] = True
+
+            # Clear the pending OTP registration data.
+            session.pop("stu_reg_step", None)
+            session.pop("stu_reg_pending", None)
+            session.pop("stu_reg_otp", None)
+
+            return redirect(url_for("exam", session_id=session_id))
+
+        # ---- Input step: process a fresh registration form ------------
         student_data = {}
         missing = []
 
-        # 1. Check for duplicate phone number for THIS specific exam
+        # --- Duplicate check: email OR phone must not already be registered --
         phone_val = request.form.get("phone", "").strip()
-        if phone_val:
-            existing = (
-                Student.query.join(Session)
-                .filter(Session.exam_id == exam_id, Student.phone == phone_val)
-                .first()
-            )
-            if existing:
-                err = "You have already registered or completed this exam."
-                audit("registration_failed", exam_id=exam_id, phone=phone_val, reason="duplicate_phone", ip=get_remote_address())
-                if request.is_json:
-                    return jsonify({"error": err}), 400
-                return render_template("register.html", error=err, form=request.form, captcha=captcha_payload(), **template_vars), 400
+        email_val = request.form.get("email", "").strip().lower()
+        dup = None
+        if email_val and phone_val:
+            dup = Student.query.filter(
+                (Student.email == email_val) | (Student.phone == phone_val)
+            ).first()
+        elif email_val:
+            dup = Student.query.filter(Student.email == email_val).first()
+        elif phone_val:
+            dup = Student.query.filter(Student.phone == phone_val).first()
+        if dup:
+            if email_val and dup.email == email_val and phone_val and dup.phone == phone_val:
+                err = "This email address and phone number are already registered."
+            elif email_val and dup.email == email_val:
+                err = "This email address is already registered. Please use a different one."
+            else:
+                err = "This phone number is already registered. Please use a different one."
+            audit("registration_failed", exam_id=exam_id, email=email_val, phone=phone_val, reason="duplicate_student", ip=get_remote_address())
+            if request.is_json:
+                return jsonify({"error": err}), 400
+            return render_template("register.html", error=err, form=request.form, captcha=captcha_payload(), **template_vars), 400
 
         # --- core fields (name / phone) ---------------------------------
         for field in required_fields:
@@ -2223,91 +2452,33 @@ def exam_register(exam_id):
             if slug in student_data:
                 custom_vals[slug] = student_data[slug]
 
-        # --- Create the student's isolated Session and Student record ---
-        # No phone OTP step: the checks above (duplicate phone, required
-        # fields, server-side validation, CAPTCHA, policy agreement) are the
-        # only gate, so a valid, unique phone number lets the student go
-        # straight into the exam.
-        session_id = uuid.uuid4().hex[:16]
-        now = datetime.now(timezone.utc)
-        s = Session(
-            id=session_id,
-            exam_id=exam_id,
-            host_email=ex.host_email,
-            status="registered",
-            config={
-                "exam_title": cfg.get("exam_title", ""),
-                "time_limit_minutes": time_limit,
-                "ratio": ratio,
-                "max_capacity": max_cap,
-                "custom_registration_fields": cfg.get("custom_registration_fields", []),
-                "required_fields": cfg.get("required_fields", DEFAULT_REQUIRED_FIELDS),
-            },
-            created_at=now.isoformat(),
-        )
-        db.session.add(s)
+        # --- Store pending data and email the verification OTP ----------
+        # Email + phone were already validated and de-duplicated above.
+        session["stu_reg_pending"] = {
+            "exam_id": exam_id,
+            "name": student_data.get("name", ""),
+            "email": email_val,
+            "phone": phone_val,
+            "custom_vals": custom_vals,
+            "time_limit": time_limit,
+            "ratio": ratio,
+            "max_cap": max_cap,
+        }
+        _issue_session_otp("stu_reg_otp", email_val, is_email=True, channel="student")
+        session["stu_reg_step"] = "verify"
+        return redirect(url_for("exam_register", exam_id=exam_id))
 
-        exam_snapshot = list(ex.exam_questions)
-        if exam_snapshot:
-            bank_dicts = [
-                {
-                    "id": eq.question_id or f"pos_{eq.position}",
-                    "type": eq.type or "mcq",
-                    "text": eq.text,
-                    "options": eq.options,
-                    "correct_index": eq.correct_index,
-                }
-                for eq in exam_snapshot
-            ]
-            randomized = randomize_questions(bank_dicts, ratio)
-            for pos, q in enumerate(randomized):
-                sq = SessionQuestion(
-                    session_id=session_id,
-                    position=pos,
-                    question_id=q.get("id"),
-                    type=q.get("type", "mcq"),
-                    text=q["text"],
-                    options=q.get("options"),
-                    correct_index=q.get("correct_index"),
-                )
-                db.session.add(sq)
-
-        student = Student(
-            session_id=session_id,
-            name=student_data.get("name", ""),
-            phone=phone_val,
-            custom_fields=custom_vals,
-            registered_at=now.isoformat(),
-            agreed_to_policy=True,
-            agreed_at=now.isoformat(),
-        )
-        db.session.add(student)
-
-        try:
-            db.session.commit()
-        except IntegrityError:
-            db.session.rollback()
-            audit(
-                "registration_race_lost",
-                exam_id=exam_id,
-                session_id=session_id,
-                ip=get_remote_address(),
-            )
+    # --- GET / render based on current step ---
+    if step == "verify":
+        pending = session.get("stu_reg_pending")
+        if not pending or pending.get("exam_id") != exam_id:
+            session.pop("stu_reg_step", None)
+            session.pop("stu_reg_pending", None)
+            session.pop("stu_reg_otp", None)
             return redirect(url_for("exam_register", exam_id=exam_id))
-        audit(
-            "registration_success",
-            exam_id=exam_id,
-            session_id=session_id,
-            name=student_data.get("name", ""),
-            ip=get_remote_address(),
+        return render_template(
+            "register_verify.html", email=pending["email"], exam_id=exam_id, error=None
         )
-        if s.host_email:
-            write_tests_conducted(s.host_email)
-
-        # Authorize this browser so the exam page opens directly afterwards.
-        session[f"auth_{session_id}"] = True
-
-        return redirect(url_for("exam", session_id=session_id))
 
     return render_template(
         "register.html", error=None, form={}, captcha=captcha_payload(), **template_vars
@@ -2468,11 +2639,16 @@ def register(session_id):
 
     # Fields this session collects (set by the host when generating the link).
     cfg = s.config or {}
+    base_required = cfg.get("required_fields") or DEFAULT_REQUIRED_FIELDS
     required_fields = [
         f
-        for f in (cfg.get("required_fields") or DEFAULT_REQUIRED_FIELDS)
+        for f in base_required
         if f in REG_FIELD_LABELS
     ]
+    # email + phone are PERMANENT requirements — always collected & verified.
+    for perm in PERMANENT_REQUIRED_FIELDS:
+        if perm not in required_fields:
+            required_fields.append(perm)
     custom_fields = cfg.get("custom_registration_fields") or []
 
     template_vars = {
@@ -2504,7 +2680,68 @@ def register(session_id):
             400 if request.method == "POST" else 200,
         )
 
+    step = session.get("stu_reg_step", "input")  # 'input' | 'verify'
+
     if request.method == "POST":
+        # ---- OTP verify step: resend or confirm the emailed code ------
+        # This branch ALWAYS returns, so the input-step handler below only
+        # ever runs for a fresh registration (step == 'input').
+        if step == "verify":
+            action = request.form.get("action", "verify")
+            pending = session.get("stu_reg_pending")
+            if not pending or pending.get("session_id") != session_id:
+                session.pop("stu_reg_step", None)
+                session.pop("stu_reg_pending", None)
+                session.pop("stu_reg_otp", None)
+                return redirect(url_for("register", session_id=session_id))
+
+            if action == "resend":
+                _issue_session_otp("stu_reg_otp", pending["email"], is_email=True, channel="student")
+                flash("A new verification code has been sent to your email.")
+                return redirect(url_for("register", session_id=session_id))
+
+            code = request.form.get("otp", "").strip()
+            otp_err = verify_session_otp("stu_reg_otp", code)
+            if otp_err is not None:
+                return render_template(
+                    "register_verify.html", email=pending["email"], session_id=session_id, error=otp_err
+                )
+
+            # ---- OTP verified: finalize the registration --------------
+            email_val = pending.get("email", "")
+            phone_val = pending.get("phone", "")
+            custom_vals = pending.get("custom_vals") or {}
+            student = Student(
+                session_id=session_id,
+                name=pending.get("name", ""),
+                email=email_val,
+                phone=phone_val,
+                custom_fields=custom_vals,
+                registered_at=datetime.now(timezone.utc).isoformat(),
+                agreed_to_policy=True,
+                agreed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            db.session.add(student)
+            if s.status == "pending":
+                s.status = "registered"
+
+            try:
+                db.session.commit()
+            except IntegrityError:
+                db.session.rollback()
+                audit("registration_race_lost", session_id=session_id, ip=get_remote_address())
+                session.pop("stu_reg_step", None)
+                session.pop("stu_reg_pending", None)
+                session.pop("stu_reg_otp", None)
+                return redirect(url_for("exam", session_id=session_id))
+
+            audit("registration_success", session_id=session_id, name=pending.get("name", ""), email=email_val, ip=get_remote_address())
+            session.pop("stu_reg_step", None)
+            session.pop("stu_reg_pending", None)
+            session.pop("stu_reg_otp", None)
+            return redirect(url_for("exam", session_id=session_id))
+
+        # ---- Input step: process a fresh registration form ------------
         student_data = {}
         missing = []
 
@@ -2523,6 +2760,29 @@ def register(session_id):
                 missing.append(cf.get("name", slug))
             student_data[slug] = value
 
+
+        # --- Duplicate check: email OR phone must not already be used ---------
+        email_val = student_data.get("email", "").strip().lower()
+        phone_val = student_data.get("phone", "")
+        student_data["email"] = email_val
+        dup = None
+        if email_val and phone_val:
+            dup = Student.query.filter((Student.email == email_val) | (Student.phone == phone_val)).first()
+        elif email_val:
+            dup = Student.query.filter(Student.email == email_val).first()
+        elif phone_val:
+            dup = Student.query.filter(Student.phone == phone_val).first()
+        if dup:
+            if email_val and dup.email == email_val and phone_val and dup.phone == phone_val:
+                err = "This email address and phone number are already registered."
+            elif email_val and dup.email == email_val:
+                err = "This email address is already registered. Please use a different one."
+            else:
+                err = "This phone number is already registered. Please use a different one."
+            audit("registration_failed", session_id=session_id, email=email_val, phone=phone_val, reason="duplicate_student", ip=get_remote_address())
+            if request.is_json:
+                return jsonify({"error": err}), 400
+            return render_template("register.html", error=err, form=request.form, captcha=captcha_payload(), **template_vars), 400
 
         if missing:
             error = f"Missing required field(s): {', '.join(missing)}"
@@ -2602,47 +2862,37 @@ def register(session_id):
             )
 
         # --- Build the custom_fields JSON blob ---
-        # Everything except name/phone/registered_at goes into custom_fields
+        # Everything except name/email/phone/registered_at goes into custom_fields
         custom_vals = {}
         for cf in custom_fields:
             slug = cf.get("slug") or slugify(cf.get("name", ""))
             if slug in student_data:
                 custom_vals[slug] = student_data[slug]
 
-        student = Student(
-            session_id=session_id,
-            name=student_data.get("name", ""),
-            phone=student_data.get("phone", ""),
-            custom_fields=custom_vals,
-            registered_at=datetime.now(timezone.utc).isoformat(),
-            agreed_to_policy=True,
-            agreed_at=datetime.now(timezone.utc).isoformat(),
+        # --- Store pending data and email the verification OTP ----------
+        # Email + phone were already validated and de-duplicated above.
+        session["stu_reg_pending"] = {
+            "session_id": session_id,
+            "name": student_data.get("name", ""),
+            "email": email_val,
+            "phone": phone_val,
+            "custom_vals": custom_vals,
+        }
+        _issue_session_otp("stu_reg_otp", email_val, is_email=True, channel="student")
+        session["stu_reg_step"] = "verify"
+        return redirect(url_for("register", session_id=session_id))
+
+    # --- GET / render based on current step ---
+    if step == "verify":
+        pending = session.get("stu_reg_pending")
+        if not pending or pending.get("session_id") != session_id:
+            session.pop("stu_reg_step", None)
+            session.pop("stu_reg_pending", None)
+            session.pop("stu_reg_otp", None)
+            return redirect(url_for("register", session_id=session_id))
+        return render_template(
+            "register_verify.html", email=pending["email"], session_id=session_id, error=None
         )
-        db.session.add(student)
-
-        # Update session status
-        if s.status == "pending":
-            s.status = "registered"
-
-        try:
-            db.session.commit()
-        except IntegrityError:
-            db.session.rollback()
-            # Another concurrent registration won — this is fine.
-            audit(
-                "registration_race_lost",
-                session_id=session_id,
-                ip=get_remote_address(),
-            )
-            return redirect(url_for("exam", session_id=session_id))
-
-        audit(
-            "registration_success",
-            session_id=session_id,
-            name=student_data.get("name", ""),
-            ip=get_remote_address(),
-        )
-        return redirect(url_for("exam", session_id=session_id))
 
     return render_template(
         "register.html", error=None, form={}, captcha=captcha_payload(), **template_vars

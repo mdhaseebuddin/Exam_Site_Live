@@ -1,0 +1,11 @@
+UNIT_OK: no-keys fallback -> console; failover KEY_1->KEY_2 works; code emailed to student
+UNIT_OK: BREVO_STUDENT_API_KEY_1 used when healthy
+STEP1_OK: form renders name/email/phone
+STEP2_OK: duplicate email (existing DB student) rejected
+STEP3_OK: duplicate phone (existing DB student) rejected
+STEP4_OK: student OTP emailed to alice@example.com (channel=student, not host)
+STEP5_OK: wrong OTP rejected
+STEP6_OK: correct OTP -> student persisted with email+phone
+STEP7_OK: duplicate email blocked (across DB, past OTP)
+STEP8_OK: duplicate phone blocked (across DB, past OTP)
+ALL_TESTS_PASSED
