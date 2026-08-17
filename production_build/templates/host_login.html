@@ -23,6 +23,13 @@
         {% if error %}
           <div class="alert alert-danger py-2">{{ error }}</div>
         {% endif %}
+        {% with messages = get_flashed_messages() %}
+          {% if messages %}
+            {% for message in messages %}
+              <div class="alert alert-warning py-2">{{ message }}</div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
 
         <form method="POST" action="{{ url_for('host_login') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

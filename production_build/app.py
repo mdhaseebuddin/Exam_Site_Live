@@ -99,6 +99,20 @@ DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "instance", "exam.db"
 MAX_SUBMISSIONS = int(os.environ.get("MAX_SUBMISSIONS", "500"))
 
 # ---------------------------------------------------------------------------
+# Daily per-host registration limit — the STRICT cap on how many STUDENT
+# registrations a single host may collect in any rolling 24-hour window,
+# summed across ALL of that host's exam links combined (regardless of how many
+# individual exam codes / links the host generates). This is enforced in
+# addition to (and is typically far stricter than) the permanent
+# MAX_SUBMISSIONS lifetime cap. Once a host hits DAILY_REGISTRATION_LIMIT,
+# any further student registration on ANY of their links is blocked with a
+# clear message until registrations age out of the 24-hour window — that is
+# the automatic 24-hour cooldown/reset.
+# ---------------------------------------------------------------------------
+DAILY_REGISTRATION_LIMIT = int(os.environ.get("DAILY_REGISTRATION_LIMIT", "70"))
+DAILY_REGISTRATION_WINDOW_HOURS = int(os.environ.get("DAILY_REGISTRATION_WINDOW_HOURS", "24"))
+
+# ---------------------------------------------------------------------------
 # Secrets & configuration — loaded from .env (never from the code itself)
 # ---------------------------------------------------------------------------
 load_dotenv()  # reads SECRET_KEY, FLASK_ENV, SESSION_COOKIE_SECURE, ...
@@ -135,10 +149,20 @@ app.config["MAX_CONTENT_LENGTH"] = int(
 )  # 1 MiB request cap by default
 
 # --- Email delivery (Brevo transactional email) ---
-# Sender address for OTP/verification emails. Overridable via the
-# MAIL_DEFAULT_SENDER environment variable.
+# Sender address for HOST OTP/verification emails (password reset, host
+# login). Overridable via the MAIL_DEFAULT_SENDER environment variable.
 app.config["MAIL_DEFAULT_SENDER"] = os.environ.get(
     "MAIL_DEFAULT_SENDER", "mdhaseebuddin77@gmail.com"
+)
+
+# Sender address for STUDENT OTP/verification emails. Kept SEPARATE from
+# MAIL_DEFAULT_SENDER because the student Brevo keys
+# (BREVO_STUDENT_API_KEY_1/_2) are verified against a DIFFERENT sender
+# address (e.g. velotest2026@gmail.com). Passing the host's sender to those
+# keys makes Brevo reject/drop the email (unverified sender or freemail-domain
+# block). Overridable via the MAIL_STUDENT_SENDER environment variable.
+app.config["MAIL_STUDENT_SENDER"] = os.environ.get(
+    "MAIL_STUDENT_SENDER", "velotest2026@gmail.com"
 )
 
 # --- Global CSRF protection (Flask-WTF) ---
@@ -400,10 +424,20 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def find_host(email: str) -> HostUser | None:
-    """Look up a host account by (lowercased) email."""
+    """Look up a host account by (lowercased) email.
+
+    When multiple rows exist for the same email (e.g. legacy duplicates created
+    before duplicate registration was prevented), the most recently created
+    account wins so an old/stale row can never shadow the active account and
+    reject its valid password.
+    """
     if not email:
         return None
-    return HostUser.query.filter_by(email=email.strip().lower()).first()
+    return (
+        HostUser.query.filter_by(email=email.strip().lower())
+        .order_by(HostUser.id.desc())
+        .first()
+    )
 
 
 def current_host() -> HostUser | None:
@@ -533,11 +567,24 @@ def _send_student_otp(email: str, code: str) -> bool:
     This is the STUDENT channel and is fully isolated from the host channel.
     It tries BREVO_STUDENT_API_KEY_1 first and, if delivery fails, falls back
     to BREVO_STUDENT_API_KEY_2. The sender address comes from
-    MAIL_DEFAULT_SENDER. If no student key is configured, or every key fails,
+    MAIL_STUDENT_SENDER (defaults to velotest2026@gmail.com) — NEVER the
+    host's MAIL_DEFAULT_SENDER, because the student keys are verified against
+    a different sender. If no student key is configured, or every key fails,
     the code is logged to the console/audit log so the flow works
     out-of-the-box.
     """
-    sender_email = app.config["MAIL_DEFAULT_SENDER"]
+    # STUDENT channel uses its own verified sender (MAIL_STUDENT_SENDER), not
+    # the host's MAIL_DEFAULT_SENDER. Passing the host sender to the student
+    # Brevo keys makes Brevo drop the email (unverified sender / freemail
+    # domain block), which is exactly the bug being fixed here.
+    sender_email = app.config.get("MAIL_STUDENT_SENDER")
+    if not sender_email:
+        # Runtime fallback: re-read the env var (useful when it is set only in
+        # the live environment after startup) and finally fall back to the
+        # default verified student sender.
+        sender_email = os.environ.get(
+            "MAIL_STUDENT_SENDER", "velotest2026@gmail.com"
+        )
 
     # Debug: Always log the OTP to the console for local testing/ngrok.
     print(f"\n[OTP DEBUG] Target: {email} | Code: {code}\n")
@@ -756,6 +803,59 @@ def capacity_error(max_cap: int) -> str:
     return f"Exam capacity reached. Maximum {max_cap} submissions allowed."
 
 
+def daily_student_registrations_count(
+    host_email: str | None = None, now=None
+) -> int:
+    """
+    Number of STUDENT registrations a host has collected in the trailing
+    ``DAILY_REGISTRATION_WINDOW_HOURS`` (24-hour) window, summed across ALL of
+    the host's exam links combined.
+
+    ``host_email`` is the per-host key, so the total is global to the host and
+    independent of how many individual exams/links they generated. Registration
+    time is the moment a Student record is created; legacy rows without a
+    ``registered_at`` fall back to their Session's ``created_at``. A rolling
+    window is used so each host is capped at DAILY_REGISTRATION_LIMIT
+    registrations per 24 hours; the cap naturally resets (frees slots) as
+    registrations age out of the window.
+    """
+    if not host_email:
+        return 0
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=DAILY_REGISTRATION_WINDOW_HOURS)).isoformat()
+    reg_time = db.func.coalesce(Student.registered_at, Session.created_at)
+    return (
+        Student.query.join(Session, Student.session_id == Session.id)
+        .filter(Session.host_email == host_email)
+        .filter(reg_time >= cutoff)
+        .count()
+    )
+
+
+def daily_registration_blocked(
+    host_email: str | None = None, now=None
+) -> bool:
+    """True when a host has already hit the rolling 24-hour registration cap."""
+    if not host_email:
+        return False
+    return (
+        daily_student_registrations_count(host_email, now=now)
+        >= DAILY_REGISTRATION_LIMIT
+    )
+
+
+def daily_limit_error() -> str:
+    """Human-readable, user-facing message when a host's daily cap is hit."""
+    return (
+        "The daily registration limit has been reached. This host has collected "
+        "the maximum of "
+        f"{DAILY_REGISTRATION_LIMIT} student registrations in the last "
+        f"{DAILY_REGISTRATION_WINDOW_HOURS} hours (across all of their exam "
+        "links). No more students can register until the limit resets. Please "
+        "try again later."
+    )
+
+
 @app.context_processor
 def inject_capacity_context():
     """
@@ -771,6 +871,11 @@ def inject_capacity_context():
             _current_host_email()
         ),
         "max_capacity": MAX_SUBMISSIONS,
+        "daily_student_registrations": daily_student_registrations_count(
+            _current_host_email()
+        ),
+        "daily_registration_limit": DAILY_REGISTRATION_LIMIT,
+        "daily_registration_window_hours": DAILY_REGISTRATION_WINDOW_HOURS,
     }
 
 
@@ -1355,7 +1460,11 @@ def host_register():
             elif password != confirm:
                 error = "Passwords do not match."
             elif find_host(email) is not None:
-                error = "An account with that email already exists."
+                # Duplicate account — never allow a second account for the
+                # same email. Ask the host to log in instead.
+                audit("host_registration_duplicate", email=email, step="input", ip=get_remote_address())
+                flash("Account already exists. Please log in.")
+                return redirect(url_for("host_login"))
             elif not verify_captcha(captcha):
                 error = "Incorrect CAPTCHA answer. Please try again."
             elif request.form.get("agree") != "1":
@@ -1389,14 +1498,41 @@ def host_register():
             code = request.form.get("otp", "").strip()
             otp_err = verify_session_otp("reg_otp", code)
             if otp_err is None:
+                # ---- Authoritative duplicate check (finalize step) ----
+                # The account is actually created HERE (not at the input
+                # step), so the email must be re-checked against the database
+                # to prevent a duplicate record being created — e.g. the
+                # account was created after this browser submitted the input
+                # form, or a stale pending registration is being finalized.
+                if find_host(pending["email"]) is not None:
+                    audit("host_registration_duplicate", email=pending["email"], step="verify", ip=get_remote_address())
+                    session.pop("reg_step", None)
+                    session.pop("reg_pending", None)
+                    session.pop("reg_otp", None)
+                    flash("Account already exists. Please log in.")
+                    return redirect(url_for("host_login"))
+
+                from sqlalchemy.exc import IntegrityError
+
                 # Success: Create the host
                 host = HostUser(
                     email=pending["email"],
                     name=pending["name"],
                     password_hash=pending["password_hash"],
                 )
-                db.session.add(host)
-                db.session.commit()
+                try:
+                    db.session.add(host)
+                    db.session.commit()
+                except IntegrityError:
+                    # Lost a concurrent registration race — a row for this
+                    # email already exists. Never allow a duplicate account.
+                    db.session.rollback()
+                    audit("host_registration_duplicate", email=pending["email"], step="verify", reason="integrity_error", ip=get_remote_address())
+                    session.pop("reg_step", None)
+                    session.pop("reg_pending", None)
+                    session.pop("reg_otp", None)
+                    flash("Account already exists. Please log in.")
+                    return redirect(url_for("host_login"))
                 
                 audit("host_registered", email=pending["email"], name=pending["name"], ip=get_remote_address())
                 log_user_login(host, "REGISTER")
@@ -1446,7 +1582,25 @@ def host_login():
             captcha = request.form.get("captcha", "")
             host = find_host(email)
 
-            if host is None or not verify_password(password, host.password_hash):
+            # Password lookup + verification. The canonical host record
+            # (find_host) is tried first; if it does not match, every account
+            # row for this email is also tried so that valid credentials always
+            # succeed even if legacy/duplicate rows exist — and the matched
+            # account becomes the one we log in.
+            auth_host = None
+            if host is not None and host.password_hash and verify_password(password, host.password_hash):
+                auth_host = host
+            if auth_host is None and host is not None:
+                for candidate in (
+                    HostUser.query.filter_by(email=email)
+                    .order_by(HostUser.id.desc())
+                    .all()
+                ):
+                    if candidate.password_hash and verify_password(password, candidate.password_hash):
+                        auth_host = candidate
+                        break
+
+            if auth_host is None:
                 error = "Invalid email or password."
                 audit("host_login_failed", email=email, ip=get_remote_address())
             elif not verify_captcha(captcha):
@@ -1454,8 +1608,8 @@ def host_login():
             elif request.form.get("agree") != "1":
                 error = "You must accept the Terms & Privacy Policy to log in."
             else:
-                session["login_pending"] = host.email
-                _issue_session_otp("login_otp", host.email)
+                session["login_pending"] = auth_host.email
+                _issue_session_otp("login_otp", auth_host.email)
                 session["login_step"] = "verify"
                 return redirect(url_for("host_login"))
 
@@ -2210,12 +2364,24 @@ def exam_register(exam_id):
         "custom_registration_fields": custom_fields,
     }
 
-    # --- Capacity gate ---
+    # --- Capacity gates ---
     max_cap = MAX_SUBMISSIONS
     if completed_submissions_count(ex.host_email) >= max_cap:
         # ... existing capacity logic ...
         err_msg = capacity_error(max_cap)
         audit("capacity_reached", exam_id=exam_id, step="register", reason="max_submissions", max_capacity=max_cap, ip=get_remote_address())
+        if request.method == "POST" and request.is_json:
+            return jsonify({"error": err_msg}), 400
+        return (render_template("register.html", error=err_msg, form={}, captcha=captcha_payload(), **template_vars), 400 if request.method == "POST" else 200)
+
+    # --- Daily per-host registration cap (strict, across ALL links) ---
+    # A host may collect at most DAILY_REGISTRATION_LIMIT student
+    # registrations in any rolling 24-hour window, summed across every exam
+    # link they generated. Checked here early for a clean user-facing message
+    # and re-enforced atomically again at finalization (see below).
+    if daily_registration_blocked(ex.host_email):
+        err_msg = daily_limit_error()
+        audit("daily_registration_limit_reached", exam_id=exam_id, step="register", host_email=ex.host_email, daily_limit=DAILY_REGISTRATION_LIMIT, window_hours=DAILY_REGISTRATION_WINDOW_HOURS, ip=get_remote_address())
         if request.method == "POST" and request.is_json:
             return jsonify({"error": err_msg}), 400
         return (render_template("register.html", error=err_msg, form={}, captcha=captcha_payload(), **template_vars), 400 if request.method == "POST" else 200)
@@ -2317,6 +2483,22 @@ def exam_register(exam_id):
                 agreed_at=now.isoformat(),
             )
             db.session.add(student)
+
+            # --- Authoritative daily-cap gate (re-checked at commit time) ---
+            # Even if this browser started registering before the limit was hit,
+            # we must NOT create a new student once the host has reached their
+            # 24-hour cap (closes the check-then-insert race as tightly as the
+            # synchronous app allows).
+            if daily_registration_blocked(ex.host_email):
+                db.session.rollback()
+                audit("daily_registration_limit_reached", exam_id=exam_id, step="verify", host_email=ex.host_email, daily_limit=DAILY_REGISTRATION_LIMIT, window_hours=DAILY_REGISTRATION_WINDOW_HOURS, ip=get_remote_address())
+                session.pop("stu_reg_step", None)
+                session.pop("stu_reg_pending", None)
+                session.pop("stu_reg_otp", None)
+                err_msg = daily_limit_error()
+                if request.is_json:
+                    return jsonify({"error": err_msg}), 400
+                return render_template("register.html", error=err_msg, form={}, captcha=captcha_payload(), **template_vars), 400
 
             try:
                 db.session.commit()
@@ -2680,6 +2862,31 @@ def register(session_id):
             400 if request.method == "POST" else 200,
         )
 
+    # --- Daily per-host registration cap (strict, across ALL links) ---
+    # A host may collect at most DAILY_REGISTRATION_LIMIT student
+    # registrations in any rolling 24-hour window, summed across every exam
+    # link they generated. Checked early for a clean message and re-enforced
+    # atomically again at finalization (see below).
+    if daily_registration_blocked(s.host_email):
+        err_msg = daily_limit_error()
+        audit(
+            "daily_registration_limit_reached",
+            session_id=session_id,
+            step="register",
+            host_email=s.host_email,
+            daily_limit=DAILY_REGISTRATION_LIMIT,
+            window_hours=DAILY_REGISTRATION_WINDOW_HOURS,
+            ip=get_remote_address(),
+        )
+        if request.method == "POST" and request.is_json:
+            return jsonify({"error": err_msg}), 400
+        return (
+            render_template(
+                "register.html", error=err_msg, form={}, captcha=captcha_payload(), **template_vars
+            ),
+            400 if request.method == "POST" else 200,
+        )
+
     step = session.get("stu_reg_step", "input")  # 'input' | 'verify'
 
     if request.method == "POST":
@@ -2724,6 +2931,29 @@ def register(session_id):
             db.session.add(student)
             if s.status == "pending":
                 s.status = "registered"
+
+            # --- Authoritative daily-cap gate (re-checked at commit time) ---
+            # Even if this browser started registering before the limit was hit,
+            # we must NOT create a new student once the host has reached their
+            # 24-hour cap.
+            if daily_registration_blocked(s.host_email):
+                db.session.rollback()
+                audit(
+                    "daily_registration_limit_reached",
+                    session_id=session_id,
+                    step="verify",
+                    host_email=s.host_email,
+                    daily_limit=DAILY_REGISTRATION_LIMIT,
+                    window_hours=DAILY_REGISTRATION_WINDOW_HOURS,
+                    ip=get_remote_address(),
+                )
+                session.pop("stu_reg_step", None)
+                session.pop("stu_reg_pending", None)
+                session.pop("stu_reg_otp", None)
+                err_msg = daily_limit_error()
+                if request.is_json:
+                    return jsonify({"error": err_msg}), 400
+                return render_template("register.html", error=err_msg, form={}, captcha=captcha_payload(), **template_vars), 400
 
             try:
                 db.session.commit()

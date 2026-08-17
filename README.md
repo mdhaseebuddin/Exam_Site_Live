@@ -43,6 +43,11 @@ production are:
 | `SMTP_USER`   | Gmail address used for OTP emails                      |
 | `SMTP_PASS`   | Gmail **App Password** (not your normal password)      |
 | `SMTP_FROM`   | From-address for OTP emails                            |
+| `MAIL_DEFAULT_SENDER` | Host OTP sender (verified on the host Brevo key)    |
+| `MAIL_STUDENT_SENDER` | Student OTP sender (verified on the student Brevo keys) |
+| `MAX_SUBMISSIONS` | Lifetime cap on completed submissions (default 500)           |
+| `DAILY_REGISTRATION_LIMIT` | Strict per-host cap on student registrations per 24h (default 70) |
+| `DAILY_REGISTRATION_WINDOW_HOURS` | Rolling window (hours) defining a host's "day" (default 24) |
 
 ## Deploying to a cloud host (Render / Koyeb)
 

@@ -1,0 +1,6 @@
+STEP1_OK: host registration creates account; password hash verifies
+STEP2_OK: valid host credentials log in (no more 'invalid email or password')
+STEP3_OK: duplicate registration -> flash exact message + redirect to login
+STEP4_OK: verify-step duplicate check prevents a second account; no 500
+STEP5_OK: wrong password still rejected with 'Invalid email or password.'
+ALL_HOST_AUTH_TESTS_PASSED

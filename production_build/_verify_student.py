@@ -50,7 +50,12 @@ def student_send_handler(api, smtp):
     to = (smtp.to or [{}])[0].get("email", "?")
     body = smtp.kw.get("text_content", "") or ""
     m = re.search(r"(\d{6})", body)
-    emails_sent.append({"to": to, "code": m.group(1) if m else None, "key": api.api_key})
+    emails_sent.append({
+        "to": to,
+        "code": m.group(1) if m else None,
+        "key": api.api_key,
+        "sender": (smtp.sender or {}).get("email"),
+    })
 
 def fail_key1_succeed_key2(api, smtp):
     student_send_handler(api, smtp)
@@ -87,6 +92,65 @@ with A.app.test_request_context():
     rc = A._send_student_otp("firstkey@test.com", "111111")
 assert rc is True and emails_sent and emails_sent[-1]["key"] == "KEY_1", emails_sent
 log("UNIT_OK: BREVO_STUDENT_API_KEY_1 used when healthy")
+
+# (d) STUDENT sender isolation (regression test): student OTPs must be sent
+#     from MAIL_STUDENT_SENDER, NEVER the host's MAIL_DEFAULT_SENDER.
+emails_sent.clear()
+host_sender = A.app.config["MAIL_DEFAULT_SENDER"]
+student_sender = A.app.config.get("MAIL_STUDENT_SENDER") or os.environ.get(
+    "MAIL_STUDENT_SENDER", "velotest2026@gmail.com"
+)
+assert student_sender and host_sender, (host_sender, student_sender)
+assert student_sender != host_sender, "student and host senders must differ"
+with A.app.test_request_context():
+    rc = A._send_student_otp("sender@test.com", "222222")
+assert rc is True and emails_sent, emails_sent
+assert emails_sent[-1]["sender"] == student_sender, emails_sent
+assert emails_sent[-1]["sender"] != host_sender, emails_sent
+log(f"UNIT_OK: student sender isolated from host sender ({student_sender} != {host_sender})")
+
+# (e) runtime env fallback for the student sender (config key removed)
+A.app.config.pop("MAIL_STUDENT_SENDER", None)
+os.environ["MAIL_STUDENT_SENDER"] = "fallback-student-sender@example.com"
+emails_sent.clear()
+with A.app.test_request_context():
+    rc = A._send_student_otp("fallback@test.com", "333333")
+assert rc is True and emails_sent, emails_sent
+assert emails_sent[-1]["sender"] == "fallback-student-sender@example.com", emails_sent
+log("UNIT_OK: student sender env fallback respected at runtime")
+A.app.config["MAIL_STUDENT_SENDER"] = student_sender
+del os.environ["MAIL_STUDENT_SENDER"]
+
+### UNIT: daily per-host registration cap (rolling 24h window, across all links) ###
+with A.app.app_context():
+    limit_backup = A.DAILY_REGISTRATION_LIMIT
+    A.DAILY_REGISTRATION_LIMIT = 2
+    dailyhost = "daily@example.com"
+    now = A.datetime.now(A.timezone.utc)
+    A.db.session.add(A.Exam(id="DAILYEXAM", host_email=dailyhost, config={}))
+    A.db.session.commit()
+
+    def _mk_reg(sid, when):
+        A.db.session.add(A.Session(id=sid, exam_id="DAILYEXAM", host_email=dailyhost,
+                                   status="registered", config={}, created_at=when))
+        A.db.session.flush()
+        A.db.session.add(A.Student(session_id=sid, name="U", email=f"{sid}@t.com",
+                                   phone="5550000000", registered_at=when, agreed_to_policy=True))
+        A.db.session.commit()
+
+    # stale (outside 24h window) registration must NOT count
+    _mk_reg("dail0000000001", (now - A.timedelta(hours=48)).isoformat())
+    assert A.daily_student_registrations_count(dailyhost) == 0, A.daily_student_registrations_count(dailyhost)
+    # two in-window registrations fill the (lowered) cap
+    _mk_reg("dail0000000002", (now - A.timedelta(minutes=10)).isoformat())
+    _mk_reg("dail0000000003", (now - A.timedelta(minutes=5)).isoformat())
+    assert A.daily_student_registrations_count(dailyhost) == 2, A.daily_student_registrations_count(dailyhost)
+    assert A.daily_registration_blocked(dailyhost) is True, "daily cap should block at limit"
+    assert "registration limit" in A.daily_limit_error().lower()
+    # isolation: other hosts are unaffected by this host's usage
+    assert A.daily_registration_blocked("other@example.com") is False
+    log("UNIT_OK: daily per-host cap counts rolling 24h window, ignores stale rows, blocks at limit, isolated per host")
+    A.DAILY_REGISTRATION_LIMIT = limit_backup
 
 # Keep student keys set so the real OTP sender runs during the E2E flow.
 
@@ -185,6 +249,19 @@ r = client.post("/exam/register/TESTEXAM001", data={
 })
 assert r.status_code == 400, (r.status_code, r.get_data(as_text=True)[:300])
 log("STEP8_OK: duplicate phone blocked (across DB, past OTP)")
+
+# 9) Daily per-host cap blocks a new student once the host has hit the cap
+limit_backup = A.DAILY_REGISTRATION_LIMIT
+A.DAILY_REGISTRATION_LIMIT = 1
+client.get("/exam/register/TESTEXAM001")
+r = client.post("/exam/register/TESTEXAM001", data={
+    "name": "Zoe", "email": "zoe@example.com", "phone": "4444444444",
+    "captcha": get_captcha(), "agree": "1",
+})
+assert r.status_code == 400, (r.status_code, r.get_data(as_text=True)[:200])
+assert "registration limit" in r.get_data(as_text=True).lower(), r.get_data(as_text=True)[:200]
+log("UNIT_OK: route blocks a new student when the host's daily cap is reached")
+A.DAILY_REGISTRATION_LIMIT = limit_backup
 
 log("ALL_TESTS_PASSED")
 print("ALL_TESTS_PASSED")
