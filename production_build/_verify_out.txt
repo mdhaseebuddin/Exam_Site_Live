@@ -2,6 +2,25 @@ UNIT_OK: no-keys fallback -> console; failover KEY_1->KEY_2 works; code emailed 
 UNIT_OK: BREVO_STUDENT_API_KEY_1 used when healthy
 UNIT_OK: student sender isolated from host sender (velotest2026@gmail.com != mdhaseebuddin77@gmail.com)
 UNIT_OK: student sender env fallback respected at runtime
+UNIT_OK: Brevo response without messageId is treated as failure and fails over
+UNIT_OK: Brevo ApiException status/body is caught, logged, and fails over
+UNIT_OK: daily per-host cap counts rolling 24h window, ignores stale rows, blocks at limit, isolated per host
+STEP1_OK: form renders name/email/phone
+STEP2_OK: duplicate email (existing DB student) rejected
+STEP3_OK: duplicate phone (existing DB student) rejected
+STEP4_OK: student OTP emailed to alice@example.com (channel=student, not host)
+STEP5_OK: wrong OTP rejected
+STEP6_OK: correct OTP -> student persisted with email+phone
+STEP7_OK: duplicate email blocked (across DB, past OTP)
+STEP8_OK: duplicate phone blocked (across DB, past OTP)
+UNIT_OK: route blocks a new student when the host's daily cap is reached
+ALL_TESTS_PASSED
+UNIT_OK: no-keys fallback -> console; failover KEY_1->KEY_2 works; code emailed to student
+UNIT_OK: BREVO_STUDENT_API_KEY_1 used when healthy
+UNIT_OK: student sender isolated from host sender (velotest2026@gmail.com != mdhaseebuddin77@gmail.com)
+UNIT_OK: student sender env fallback respected at runtime
+UNIT_OK: Brevo response without messageId is treated as failure and fails over
+UNIT_OK: Brevo ApiException status/body is caught, logged, and fails over
 UNIT_OK: daily per-host cap counts rolling 24h window, ignores stale rows, blocks at limit, isolated per host
 STEP1_OK: form renders name/email/phone
 STEP2_OK: duplicate email (existing DB student) rejected

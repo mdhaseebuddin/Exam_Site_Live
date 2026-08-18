@@ -292,6 +292,29 @@ class Answer(db.Model):
     correct_index = db.Column(db.Integer, nullable=True)
 
 
+class DailyRegistration(db.Model):
+    """
+    Durable per-host daily-registration LEDGER.
+
+    One row is written — inside the SAME transaction that creates the Student
+    record — every time a student registration is finalized. These rows are
+    NEVER removed by the "Delete Exam" / "Reset Exam Data" actions, so a
+    host's rolling 24-hour daily registration count stays tied to their actual
+    historical registrations even after an individual exam link is deleted or
+    reset.
+
+    * host_email   -> the host who owns the exam the student registered on
+    * registered_at -> ISO-8601 moment the registration was finalized (matches
+                       the Student row's registered_at)
+    """
+
+    __tablename__ = "daily_registrations"
+
+    id = db.Column(db.Integer, primary_key=True)
+    host_email = db.Column(db.String(255), nullable=False, index=True)
+    registered_at = db.Column(db.String(64), nullable=False)
+
+
 # ---------------------------------------------------------------------------
 # Serializers — preserve the EXACT dict shape the templates already consume,
 # so the front-end (host.html, exam.html, result.html, details.html + PDFs)

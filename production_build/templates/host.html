@@ -44,10 +44,13 @@
 
     <!-- ================= Host-Only Informational Notice ================= -->
     <div class="card mb-4 border-info">
-      <div class="card-header fw-semibold bg-info text-white">ℹ️ Important Notice — Exam Capacity</div>
+      <div class="card-header fw-semibold bg-info text-white">ℹ️ Important Notice — Daily Exam Capacity</div>
       <div class="card-body">
         <p class="mb-2">
-          Only <strong>500 applicants/examinees</strong> can take this exam.
+          Only <strong>{{ daily_registration_limit }} applicants/examinees</strong> can
+          register for your exams within any rolling
+          {{ daily_registration_window_hours }}-hour period. Once that many students
+          register, further registrations are blocked until the window rolls over.
           If you require more slots, please contact:
         </p>
         <ul class="mb-0">
@@ -57,27 +60,27 @@
       </div>
     </div>
 
-    <!-- ================= Submission Capacity Counter ================= -->
+    <!-- ================= Daily Registration Capacity Counter ================= -->
     <div class="card mb-4">
       <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
-        <span>📊 Submission Capacity</span>
-        <span class="badge {{ 'bg-danger' if completed_submissions >= max_capacity else 'bg-success' }}">
-          {{ completed_submissions }} / {{ max_capacity }}
+        <span>📊 Daily Registration Capacity (rolling {{ daily_registration_window_hours }}h)</span>
+        <span class="badge {{ 'bg-danger' if daily_student_registrations >= daily_registration_limit else 'bg-success' }}">
+          {{ daily_student_registrations }} / {{ daily_registration_limit }}
         </span>
       </div>
       <div class="card-body">
+        {% set remaining = daily_registration_limit - daily_student_registrations %}
         <div class="mb-2">
-          <span class="fw-semibold">Submissions: {{ completed_submissions }} / {{ max_capacity }}</span>
+          <span class="fw-semibold">Daily Registrations: {{ daily_student_registrations }} / {{ daily_registration_limit }}</span>
           <span class="text-muted small ms-2">
-            {% set remaining = max_capacity - completed_submissions %}
-            {{ remaining }} slot(s) remaining
+            {{ remaining }} slot(s) remaining in the rolling {{ daily_registration_window_hours }}-hour window
           </span>
         </div>
-        <div class="progress" id="capacityProgress" role="progressbar" aria-valuenow="{{ completed_submissions }}" aria-valuemin="0" aria-valuemax="{{ max_capacity }}">
-          <div id="capacityProgressBar" class="progress-bar {{ 'bg-danger' if completed_submissions >= max_capacity else (('bg-warning' if remaining <= 50 else 'bg-success')) }}"></div>
+        <div class="progress" id="capacityProgress" role="progressbar" aria-valuenow="{{ daily_student_registrations }}" aria-valuemin="0" aria-valuemax="{{ daily_registration_limit }}">
+          <div id="capacityProgressBar" class="progress-bar {{ 'bg-danger' if daily_student_registrations >= daily_registration_limit else (('bg-warning' if remaining <= 10 else 'bg-success')) }}"></div>
         </div>
-        {% if completed_submissions >= max_capacity %}
-          <div class="alert alert-danger mb-0 mt-2 py-2">⚠️ Capacity reached — no more submissions will be accepted.</div>
+        {% if daily_student_registrations >= daily_registration_limit %}
+          <div class="alert alert-danger mb-0 mt-2 py-2">⚠️ Daily registration limit reached — no more students can register until the rolling {{ daily_registration_window_hours }}-hour window frees up slots.</div>
         {% endif %}
       </div>
     </div>

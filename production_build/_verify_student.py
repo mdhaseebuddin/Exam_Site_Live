@@ -16,14 +16,19 @@ class Configuration:
 class ApiClient:
     def __init__(self, conf):
         self.configuration = conf
+class Response:                       # mimics CreateSmtpEmail (messageId)
+    def __init__(self, message_id="test-message-id"):
+        self.message_id = message_id
 class TransactionalEmailsApi:
-    send_handler = None  # test installs a handler
+    send_handler = None  # test installs a handler; may return a Response
     def __init__(self, client):
         self.client = client
         self.api_key = client.configuration.api_key.get("api-key")
     def send_transac_email(self, smtp):
+        resp = None
         if TransactionalEmailsApi.send_handler is not None:
-            TransactionalEmailsApi.send_handler(self, smtp)
+            resp = TransactionalEmailsApi.send_handler(self, smtp)
+        return resp if resp is not None else Response()
 class SendSmtpEmail:
     def __init__(self, **kw):
         self.kw = kw
@@ -121,6 +126,48 @@ log("UNIT_OK: student sender env fallback respected at runtime")
 A.app.config["MAIL_STUDENT_SENDER"] = student_sender
 del os.environ["MAIL_STUDENT_SENDER"]
 
+### UNIT: Brevo response inspection (no messageId / ApiException) ###
+os.environ["BREVO_STUDENT_API_KEY_1"] = "KEY_1"
+os.environ["BREVO_STUDENT_API_KEY_2"] = "KEY_2"
+
+# (f) 2xx response WITHOUT a messageId -> treated as failure, fails over
+def no_messageid_then_ok(api, smtp):
+    student_send_handler(api, smtp)
+    if api.api_key == "KEY_1":
+        return sib_api_v3_sdk.Response(message_id=None)
+    return sib_api_v3_sdk.Response(message_id="mid-key2")
+
+sib_api_v3_sdk.TransactionalEmailsApi.send_handler = no_messageid_then_ok
+emails_sent.clear()
+with A.app.test_request_context():
+    rc = A._send_student_otp("nomsg@test.com", "444444")
+assert rc is True and emails_sent and emails_sent[-1]["key"] == "KEY_2", emails_sent
+log("UNIT_OK: Brevo response without messageId is treated as failure and fails over")
+
+# (g) ApiException with status/body (e.g. Sender not verified) -> caught + failover
+class _BrevoApiError(Exception):
+    def __init__(self, status, reason, body):
+        super().__init__(f"{status} {reason}")
+        self.status = status
+        self.reason = reason
+        self.body = body
+
+def api_error_then_ok(api, smtp):
+    if api.api_key == "KEY_1":
+        raise _BrevoApiError(400, "Bad Request", '{"message":"Sender not verified"}')
+    student_send_handler(api, smtp)
+    return sib_api_v3_sdk.Response(message_id="mid-key2b")
+
+sib_api_v3_sdk.TransactionalEmailsApi.send_handler = api_error_then_ok
+emails_sent.clear()
+with A.app.test_request_context():
+    rc = A._send_student_otp("apierr@test.com", "555555")
+assert rc is True and emails_sent and emails_sent[-1]["key"] == "KEY_2", emails_sent
+log("UNIT_OK: Brevo ApiException status/body is caught, logged, and fails over")
+
+# Restore the plain handler so the E2E flow uses KEY_1 exactly as before.
+sib_api_v3_sdk.TransactionalEmailsApi.send_handler = student_send_handler
+
 ### UNIT: daily per-host registration cap (rolling 24h window, across all links) ###
 with A.app.app_context():
     limit_backup = A.DAILY_REGISTRATION_LIMIT
@@ -136,6 +183,8 @@ with A.app.app_context():
         A.db.session.flush()
         A.db.session.add(A.Student(session_id=sid, name="U", email=f"{sid}@t.com",
                                    phone="5550000000", registered_at=when, agreed_to_policy=True))
+        # The durable daily ledger (same transaction) is what the counter reads.
+        A.db.session.add(A.DailyRegistration(host_email=dailyhost, registered_at=when))
         A.db.session.commit()
 
     # stale (outside 24h window) registration must NOT count

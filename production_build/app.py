@@ -65,6 +65,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from models import (
     Answer,
+    DailyRegistration,
     Exam,
     ExamQuestion,
     HostUser,
@@ -357,6 +358,43 @@ def init_db() -> None:
             db.session.execute(text("ALTER TABLE students ADD COLUMN email VARCHAR(255) NOT NULL DEFAULT ''"))
         db.session.commit()
 
+        # --- Back-fill the durable daily-registration LEDGER from existing
+        #     Student rows, so pre-existing hosts keep their rolling 24-hour
+        #     counts when switching to ledger-based counting. Idempotent: only
+        #     inserts (host_email, registered_at) pairs that are not already
+        #     recorded. Runs inside a try/except so it can never block startup.
+        try:
+            known = {
+                (r.host_email, r.registered_at)
+                for r in db.session.query(
+                    DailyRegistration.host_email,
+                    DailyRegistration.registered_at,
+                ).all()
+            }
+            source_rows = (
+                db.session.query(
+                    Session.host_email,
+                    db.func.coalesce(
+                        Student.registered_at, Session.created_at
+                    ).label("reg_time"),
+                )
+                .join(Student, Student.session_id == Session.id)
+                .filter(Session.host_email.isnot(None))
+                .all()
+            )
+            added = 0
+            for host_email, reg_time in source_rows:
+                if host_email and reg_time and (host_email, reg_time) not in known:
+                    db.session.add(
+                        DailyRegistration(host_email=host_email, registered_at=reg_time)
+                    )
+                    known.add((host_email, reg_time))
+                    added += 1
+            if added:
+                db.session.commit()
+        except Exception:  # pragma: no cover - never block startup on backfill
+            db.session.rollback()
+
 # ---------------------------------------------------------------------------
 # Logging & auditing
 # ---------------------------------------------------------------------------
@@ -572,6 +610,12 @@ def _send_student_otp(email: str, code: str) -> bool:
     a different sender. If no student key is configured, or every key fails,
     the code is logged to the console/audit log so the flow works
     out-of-the-box.
+
+    Success is ONLY reported when Brevo actually accepts the message for
+    delivery: the API returns a CreateSmtpEmail whose message_id proves the
+    message was queued. A successful HTTP call that returns NO messageId, or
+    an ApiException carrying a rejection status/body, is logged in full and
+    treated as a failure (triggering failover to the next student key).
     """
     # STUDENT channel uses its own verified sender (MAIL_STUDENT_SENDER), not
     # the host's MAIL_DEFAULT_SENDER. Passing the host sender to the student
@@ -585,9 +629,22 @@ def _send_student_otp(email: str, code: str) -> bool:
         sender_email = os.environ.get(
             "MAIL_STUDENT_SENDER", "velotest2026@gmail.com"
         )
+    sender_email = (sender_email or "").strip()
+    email = (email or "").strip()
 
     # Debug: Always log the OTP to the console for local testing/ngrok.
     print(f"\n[OTP DEBUG] Target: {email} | Code: {code}\n")
+
+    # Local payload sanity checks — Brevo rejects these payloads anyway, so
+    # fail fast with a clear, logged reason instead of a bare API call.
+    if not email:
+        print("[OTP ERROR] Student recipient email is empty; OTP cannot be sent.")
+        audit("otp_email_failed", email=email, error="empty_recipient", ip=get_remote_address(), channel="student")
+        return False
+    if not sender_email:
+        print("[OTP ERROR] MAIL_STUDENT_SENDER is empty; student OTP cannot be sent.")
+        audit("otp_email_failed", email=email, error="missing_sender", ip=get_remote_address(), channel="student")
+        return False
 
     keys = [
         os.environ.get("BREVO_STUDENT_API_KEY_1", "").strip(),
@@ -603,7 +660,7 @@ def _send_student_otp(email: str, code: str) -> bool:
         audit("otp_generated", email=email, code=code, ip=get_remote_address())
         return False
 
-    last_error = None
+    last_detail = None
     for index, api_key in enumerate(keys, start=1):
         try:
             configuration = sib_api_v3_sdk.Configuration()
@@ -621,22 +678,84 @@ def _send_student_otp(email: str, code: str) -> bool:
                     f"This code expires in {OTP_SESSION_LIFETIME_MINUTES} minutes."
                 ),
             )
-            api_instance.send_transac_email(send_smtp_email)
-            print(f"[OTP] Sent student OTP via BREVO_STUDENT_API_KEY_{index}.")
+            # Brevo returns a CreateSmtpEmail whose message_id proves the
+            # message was ACCEPTED for delivery. Never assume success: a
+            # missing/empty messageId means Brevo did not queue the email, so
+            # report a failure and fall through to the next student key.
+            response = api_instance.send_transac_email(send_smtp_email)
+            message_id = getattr(response, "message_id", None) if response else None
+
+            if not message_id:
+                detail = f"Brevo responded without a messageId (response={response!r})"
+                last_detail = f"key {index}: {detail}"
+                print(
+                    f"[OTP WARN] Brevo did not return a messageId for "
+                    f"BREVO_STUDENT_API_KEY_{index} — message NOT accepted: {detail}"
+                )
+                audit(
+                    "otp_email_failed",
+                    email=email,
+                    sender=sender_email,
+                    key=f"BREVO_STUDENT_API_KEY_{index}",
+                    reason="no_message_id",
+                    response=repr(response),
+                    ip=get_remote_address(),
+                    channel="student",
+                )
+                continue  # try the next student key
+
+            print(
+                f"[OTP] Sent student OTP via BREVO_STUDENT_API_KEY_{index} "
+                f"(messageId={message_id})."
+            )
+            audit(
+                "otp_email_sent",
+                email=email,
+                sender=sender_email,
+                key=f"BREVO_STUDENT_API_KEY_{index}",
+                message_id=message_id,
+                ip=get_remote_address(),
+                channel="student",
+            )
             return True
         except Exception as exc:  # pragma: no cover - network/API dependent
-            print(f"[OTP ERROR] Brevo API Failure (key {index}): {exc}")
-            last_error = exc
+            # Brevo's REST client raises ApiException carrying .status,
+            # .reason and .body (the raw HTTP response body with Brevo's error
+            # details, e.g. a JSON "Sender not verified" message). Extract them
+            # explicitly so the ACTUAL rejection reason is logged/audited
+            # instead of a generic message.
+            status = getattr(exc, "status", None)
+            reason = getattr(exc, "reason", None)
+            body = getattr(exc, "body", None)
+            if status is not None or body is not None:
+                detail = f"HTTP {status} {reason} body={body!r}"
+                print(
+                    f"[OTP ERROR] Brevo API rejected "
+                    f"BREVO_STUDENT_API_KEY_{index}: {detail}"
+                )
+            else:
+                detail = repr(exc)
+                print(
+                    f"[OTP ERROR] Brevo delivery exception via "
+                    f"BREVO_STUDENT_API_KEY_{index}: {detail}"
+                )
+                traceback.print_exc()
+            last_detail = f"key {index}: {detail}"
             audit(
                 "otp_email_failed",
                 email=email,
+                sender=sender_email,
                 key=f"BREVO_STUDENT_API_KEY_{index}",
-                error=str(exc),
+                status=status,
+                reason=reason,
+                body=repr(body) if body is not None else None,
+                error=detail,
                 ip=get_remote_address(),
+                channel="student",
             )
 
     # All keys failed -> log the code (dev-friendly).
-    print(f"[OTP ERROR] All student Brevo keys failed: {last_error}")
+    print(f"[OTP ERROR] All student Brevo keys failed: {last_detail}")
     audit("otp_generated", email=email, code=code, ip=get_remote_address())
     return False
 
@@ -803,6 +922,24 @@ def capacity_error(max_cap: int) -> str:
     return f"Exam capacity reached. Maximum {max_cap} submissions allowed."
 
 
+def _record_daily_registration(host_email: str | None, registered_at: str) -> None:
+    """
+    Write one durable daily-registration ledger row for this host.
+
+    Called in the SAME transaction that creates the Student, so the row commits
+    atomically with the registration (and rolls back together if the daily-cap
+    gate rejects the registration). The "Delete Exam" and "Reset Exam Data"
+    actions never touch this table, so a host's rolling 24-hour registration
+    count stays accurate even after an individual exam link is deleted or
+    reset.
+    """
+    if not host_email:
+        return
+    db.session.add(
+        DailyRegistration(host_email=host_email, registered_at=registered_at)
+    )
+
+
 def daily_student_registrations_count(
     host_email: str | None = None, now=None
 ) -> int:
@@ -812,22 +949,23 @@ def daily_student_registrations_count(
     the host's exam links combined.
 
     ``host_email`` is the per-host key, so the total is global to the host and
-    independent of how many individual exams/links they generated. Registration
-    time is the moment a Student record is created; legacy rows without a
-    ``registered_at`` fall back to their Session's ``created_at``. A rolling
-    window is used so each host is capped at DAILY_REGISTRATION_LIMIT
-    registrations per 24 hours; the cap naturally resets (frees slots) as
-    registrations age out of the window.
+    independent of how many individual exams/links they generated. The count is
+    taken from the durable ``DailyRegistration`` ledger (not the live Student
+    rows), so deleting or resetting an individual exam link NEVER resets the
+    host's daily progress back to zero — the rolling 24-hour cap stays tied to
+    the host's actual historical registrations. Registration time is the moment
+    the ledger row is written (identical to the Student row's
+    ``registered_at``). A rolling window is used so each host is capped at
+    DAILY_REGISTRATION_LIMIT registrations per 24 hours; the cap naturally
+    resets (frees slots) as registrations age out of the window.
     """
     if not host_email:
         return 0
     now = now or datetime.now(timezone.utc)
     cutoff = (now - timedelta(hours=DAILY_REGISTRATION_WINDOW_HOURS)).isoformat()
-    reg_time = db.func.coalesce(Student.registered_at, Session.created_at)
     return (
-        Student.query.join(Session, Student.session_id == Session.id)
-        .filter(Session.host_email == host_email)
-        .filter(reg_time >= cutoff)
+        DailyRegistration.query.filter_by(host_email=host_email)
+        .filter(DailyRegistration.registered_at >= cutoff)
         .count()
     )
 
@@ -859,12 +997,12 @@ def daily_limit_error() -> str:
 @app.context_processor
 def inject_capacity_context():
     """
-    Inject the current host's submission count and capacity into every
-    template. This powers the host dashboard counter (Submissions: X / 500)
-    without needing to pass it explicitly to every render call.
+    Inject the current host's capacity values into every template. This powers
+    the host dashboard daily-registration counter (Daily Registrations: X / 70)
+    without needing to pass them explicitly to every render call.
 
-    The count is scoped to the CURRENT logged-in host, so each host sees
-    their own independent capacity usage.
+    The daily count is scoped to the CURRENT logged-in host, so each host sees
+    their own independent rolling-24-hour usage.
     """
     return {
         "completed_submissions": completed_submissions_count(
@@ -981,14 +1119,23 @@ except Exception:  # pragma: no cover - ReportLab missing on the host
     _REPORTLAB_AVAILABLE = False
 
 
-def _pdf_fallback(template_name, **ctx):
+def _pdf_fallback(template_name, download_name=None, **ctx):
     """
     Render the print-friendly HTML template as the graceful fallback.
     The templates already contain print CSS so they can be saved to PDF from
     any browser, and this guarantees the app never crashes when PDF tooling
     is unavailable.
+
+    The response stays inline HTML but advertises the ``download_name`` (e.g.
+    "details.pdf") via Content-Disposition so a manual "Save as…" keeps the
+    .pdf extension instead of saving a bare, extension-less "details" file.
     """
-    return render_template(template_name, **ctx)
+    from flask import make_response
+
+    resp = make_response(render_template(template_name, **ctx))
+    if download_name:
+        resp.headers["Content-Disposition"] = f'inline; filename="{download_name}"'
+    return resp
 
 
 # --- ReportLab document builders -------------------------------------------
@@ -1272,18 +1419,33 @@ def pdf_response(template_name: str, download_name: str, **ctx):
     it works on ANY hosting provider. If ReportLab is unavailable or throws
     at render time, we gracefully fall back to the print-friendly HTML view —
     the app never crashes.
+
+    The real-PDF response ALWAYS carries an explicit ``Content-Type:
+    application/pdf`` and a quoted ``Content-Disposition: attachment;
+    filename="...pdf"`` header, so browsers and operating systems (Windows
+    included) recognize the download as a standard PDF file instead of a
+    generic/no-extension file.
     """
+    from flask import Response
+
+    # Hard guarantee: the suggested filename ALWAYS ends in ".pdf". If a
+    # caller passes e.g. "details" it becomes "details.pdf" — never a bare,
+    # extension-less filename like "details".
+    if not download_name.lower().endswith(".pdf"):
+        download_name = f"{download_name}.pdf"
+
     pdf_data = _pdf_bytes(template_name, **ctx)
     if pdf_data is None:
-        return _pdf_fallback(template_name, **ctx)
-
-    from flask import Response
+        # Graceful HTML fallback (inline, print-to-PDF friendly) — but it still
+        # advertises the ".pdf" filename so a manual "Save as…" on Windows
+        # keeps the correct name instead of a bare "details".
+        return _pdf_fallback(template_name, download_name=download_name, **ctx)
 
     return Response(
         pdf_data,
-        mimetype="application/pdf",
         headers={
-            "Content-Disposition": f"attachment; filename={download_name}",
+            "Content-Type": "application/pdf",
+            "Content-Disposition": f'attachment; filename="{download_name}"',
         },
     )
 
@@ -2484,6 +2646,10 @@ def exam_register(exam_id):
             )
             db.session.add(student)
 
+            # Durably record this registration for the host's rolling 24-hour
+            # cap (atomic with the Student insert, using the same timestamp).
+            _record_daily_registration(ex.host_email, now.isoformat())
+
             # --- Authoritative daily-cap gate (re-checked at commit time) ---
             # Even if this browser started registering before the limit was hit,
             # we must NOT create a new student once the host has reached their
@@ -2918,19 +3084,24 @@ def register(session_id):
             email_val = pending.get("email", "")
             phone_val = pending.get("phone", "")
             custom_vals = pending.get("custom_vals") or {}
+            reg_now = datetime.now(timezone.utc)
             student = Student(
                 session_id=session_id,
                 name=pending.get("name", ""),
                 email=email_val,
                 phone=phone_val,
                 custom_fields=custom_vals,
-                registered_at=datetime.now(timezone.utc).isoformat(),
+                registered_at=reg_now.isoformat(),
                 agreed_to_policy=True,
-                agreed_at=datetime.now(timezone.utc).isoformat(),
+                agreed_at=reg_now.isoformat(),
             )
             db.session.add(student)
             if s.status == "pending":
                 s.status = "registered"
+
+            # Durably record this registration for the host's rolling 24-hour
+            # cap (atomic with the Student insert, using the same timestamp).
+            _record_daily_registration(s.host_email, reg_now.isoformat())
 
             # --- Authoritative daily-cap gate (re-checked at commit time) ---
             # Even if this browser started registering before the limit was hit,
