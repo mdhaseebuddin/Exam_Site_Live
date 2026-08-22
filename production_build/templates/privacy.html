@@ -78,16 +78,94 @@
           <li>Use the service only for lawful purposes.</li>
         </ul>
 
-        <h5>6. Data Collection &amp; Privacy</h5>
+        <h5>6. Data We Collect</h5>
         <p>
-          The platform collects information you provide during registration (e.g.
-          name, phone, and any custom fields configured by the host). This data is
-          stored to administer exams and is accessible to the exam host. We do not
-          sell your personal information. Please contact the individual exam host
-          for details about how your specific data is used and retained.
+          We collect only the information necessary to operate the platform and
+          deliver the examination service. Specifically, this includes:
+        </p>
+        <ul>
+          <li>
+            <strong>Account details</strong> — your registered email address,
+            display name, and a securely hashed password used for host
+            authentication.
+          </li>
+          <li>
+            <strong>Host profile information</strong> — the details you provide
+            when creating and using your account, including your saved question
+            bank and the configuration of the exams you generate.
+          </li>
+          <li>
+            <strong>Examination &amp; test records</strong> — every exam you
+            create, candidate registrations (name, email, phone, and any custom
+            fields chosen by the host), session timestamps, submitted answers,
+            and computed results and scores.
+          </li>
+        </ul>
+
+        <h5>7. How Your Data Is Stored Securely</h5>
+        <p>
+          All platform data is stored in a structured, relational database and
+          is safeguarded with a range of technical and organizational controls,
+          including:
+        </p>
+        <ul>
+          <li>
+            <strong>Secure authentication</strong> — passwords are never stored
+            in plain text; they are saved as salted cryptographic hashes.
+            One-time verification codes are likewise stored only as hashes and
+            are single-use with a short expiry.
+          </li>
+          <li>
+            <strong>Hardened sessions</strong> — session cookies are protected
+            with HttpOnly and SameSite attributes, and every state-changing
+            request is validated with a CSRF token, reducing the risk of common
+            web-based attacks.
+          </li>
+          <li>
+            <strong>Controlled access</strong> — host dashboards, exam results,
+            and reports are gated by authentication, and all records are
+            isolated per host, so an account can only ever reach the data that
+            belongs to it.
+          </li>
+        </ul>
+
+        <h5>8. Data Retention &amp; Why We Keep It</h5>
+        <p>
+          We retain your data for as long as your account exists so that we can
+          provide the service. Specifically, your data is kept to:
+        </p>
+        <ul>
+          <li>
+            <strong>Maintain account persistence</strong> — your host profile,
+            saved question bank, and settings remain available every time you
+            sign in.
+          </li>
+          <li>
+            <strong>Support session management</strong> — keep exam attempts
+            functional, including timers, resumable sessions, and submissions
+            tied to each individual candidate.
+          </li>
+          <li>
+            <strong>Preserve exam history</strong> — retain past exams, results,
+            and server-side reports so you can review your history across
+            logins at any time.
+          </li>
+        </ul>
+
+        <h5>9. Data Confidentiality &amp; Third Parties</h5>
+        <p>
+          We treat your data as confidential. We do <strong>not</strong> sell,
+          rent, or trade your personal information, and we never disclose it to
+          unauthorized third parties. Access is limited to the platform operators
+          who administer the service and, where applicable, the specific exam
+          host who organizes the exam you register for. Where a third-party
+          provider is required to operate a core function (for example, email
+          delivery for verification and password-reset codes), only the minimum
+          information needed is shared, and always under appropriate security and
+          confidentiality terms.
         </p>
 
-        <h5>7. Changes to This Policy</h5>
+        <h5>10. Changes to This Policy</h5>
         <p>
           We may update this policy from time to time. Continued use of the
           platform after changes are posted constitutes acceptance of the revised

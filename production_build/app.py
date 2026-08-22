@@ -35,6 +35,7 @@ import random
 import re
 import secrets
 import shutil
+import sqlite3
 import traceback
 import uuid
 import zipfile
@@ -60,7 +61,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect, CSRFError
 from sqlalchemy import event, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from models import (
@@ -217,12 +218,25 @@ def _resolve_database_uri() -> str:
     return f"sqlite:///{sqlite_file}"
 
 
-app.config["SQLALCHEMY_DATABASE_URI"] = _resolve_database_uri()
+_DATABASE_URI = _resolve_database_uri()
+_is_sqlite = make_url(_DATABASE_URI).get_backend_name() == "sqlite"
+
+app.config["SQLALCHEMY_DATABASE_URI"] = _DATABASE_URI
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
-    "pool_pre_ping": True,
-    "connect_args": {"check_same_thread": False},
-}
+
+# ``check_same_thread`` is a SQLite-only DBAPI option and MUST NOT appear in
+# ``connect_args`` when DATABASE_URL points at PostgreSQL (or any other
+# non-SQLite dialect) -- psycopg2 rejects it with::
+#
+#     ProgrammingError: invalid connection option "check_same_thread"
+#
+# Therefore it is applied ONLY for SQLite URIs and left empty otherwise.
+_engine_options = {"pool_pre_ping": True}
+if _is_sqlite:
+    _engine_options["connect_args"] = {"check_same_thread": False}
+else:
+    _engine_options["connect_args"] = {}
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = _engine_options
 
 db.init_app(app)
 
@@ -232,8 +246,14 @@ db.init_app(app)
 # each worker has its own SQLite connection. WAL mode allows readers to
 # proceed without blocking on a writer, and busy_timeout prevents premature
 # "database is locked" errors under contention.
+#
+# The connect event fires for EVERY backend (including PostgreSQL when
+# DATABASE_URL is active), so these SQLite-only PRAGMAs are guarded by an
+# SQLite DBAPI check to avoid "syntax error at or near PRAGMA" on PG.
 @event.listens_for(Engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
+    if not isinstance(dbapi_connection, sqlite3.Connection):
+        return
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA busy_timeout=5000")
