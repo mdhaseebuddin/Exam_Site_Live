@@ -25,3 +25,5 @@ reportlab==5.0.0
 # WSGI servers
 gunicorn            # production server (Linux/macOS; used on the cloud host)
 waitress==3.0.2     # Windows / local dev fallback
+
+psycopg2-binary==2.9.9
