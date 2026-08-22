@@ -182,10 +182,42 @@ app.config["WTF_CSRF_TIME_LIMIT"] = int(
 # ---------------------------------------------------------------------------
 # SQLAlchemy (SQLite) configuration
 # ---------------------------------------------------------------------------
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
-    "DATABASE_URL", f"sqlite:///{DB_PATH}"
-)
+def _resolve_database_uri() -> str:
+    """Resolve the database URI with persistence-safe fallbacks.
+
+    Priority order:
+      1. DATABASE_URL — an explicit, operator-provided connection string
+         (e.g. a managed external database). Used verbatim.
+      2. DB_PATH       — an explicit absolute path to the SQLite file, pinned
+         by an operator (development, or when a specific volume is required).
+      3. RENDER_PERSISTENT_DISK_PATH — when deployed on Render with an attached
+         Persistent Disk, Render injects this variable pointing at the mount.
+         The instance / free-tier filesystem is EPHEMERAL and wiped on every
+         redeploy — which is exactly why host accounts "disappear" and force
+         re-registration. Routing the SQLite DB into the persistent disk keeps
+         host accounts and submissions across restarts and redeploys.
+      4. <BASE_DIR>/instance/exam.db — the portable local fallback for local
+         development and non-ephemeral single-instance hosts.
+    """
+    explicit_uri = os.environ.get("DATABASE_URL", "").strip()
+    if explicit_uri:
+        return explicit_uri
+
+    render_disk = os.environ.get("RENDER_PERSISTENT_DISK_PATH", "").strip()
+    # Only fall back to the Render persistent disk when the operator has not
+    # pinned DB_PATH explicitly — an explicit path always wins.
+    if render_disk and not os.environ.get("DB_PATH"):
+        sqlite_file = os.path.join(render_disk, "exam.db")
+    else:
+        sqlite_file = DB_PATH
+
+    # Ensure the parent directory exists (empty instance/ on a fresh clone, a
+    # just-attached persistent-disk mount, etc.) before SQLite opens the file.
+    os.makedirs(os.path.dirname(sqlite_file), exist_ok=True)
+    return f"sqlite:///{sqlite_file}"
+
+
+app.config["SQLALCHEMY_DATABASE_URI"] = _resolve_database_uri()
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_pre_ping": True,
@@ -2092,19 +2124,24 @@ audited server-side.
         ).delete(synchronize_session=False)
         n_students = Student.query.filter(Student.session_id.in_(my_sessions)).delete(synchronize_session=False)
         n_sessions = Session.query.filter(Session.id.in_(my_sessions)).delete(synchronize_session=False)
+        # Commit the bulk delete so the reset actually takes effect. Without an
+        # explicit commit here the ORM would silently roll back the deletions at
+        # request teardown, turning "Clear Exam Data" into a no-op.
+        db.session.commit()
     else:
         n_sessions = 0
         db.session.commit()
-        audit(
+
+    # The destructive action is audited server-side regardless of outcome.
+    audit(
         "submissions_cleared",
         host_email=host_email,
         answers=n_answers,
         session_questions=n_session_questions,
         students=n_students,
         sessions=n_sessions,
-                ip=get_remote_address(),
-            )
-
+        ip=get_remote_address(),
+    )
 
     # Redirect back to the dashboard with a visible success message.
     return redirect(url_for("host", msg="submissions_cleared"))
@@ -2918,6 +2955,35 @@ def exam(session_id):
         required_fields=required_fields,
         custom_registration_fields=custom_registration_fields,
         field_labels=REG_FIELD_LABELS,
+    )
+
+
+@app.route("/exam/<session_id>/result.pdf")
+def exam_result_pdf(session_id):
+    """
+    Download the student's RESULT PDF for a completed exam session.
+
+    Backs the "⬇️ Download Result PDF" button in result.html (a plain
+    <a href="/exam/<session_id>/result.pdf">). Uses the shared ReportLab
+    pipeline (pdf_response -> _build_result_pdf) with a graceful HTML
+    fallback, so the button returns a real PDF attachment instead of a 404.
+
+    Security: unknown/never-started sessions are bounced back to the host
+    dashboard (no PDF is ever produced for invalid ids), matching the exam
+    page's behavior.
+    """
+    s = db.session.get(Session, session_id)
+    if s is None:
+        return redirect(url_for("host", error="session_not_found"))
+    # Only a completed submission has a result to download. Anything else is
+    # bounced back to the exam/result flow rather than leaking a partial PDF.
+    if s.status != "completed":
+        return redirect(url_for("exam", session_id=session_id))
+
+    return pdf_response(
+        "result_pdf.html",
+        f"result_{session_id}.pdf",
+        session=session_to_dict(s),
     )
 
 

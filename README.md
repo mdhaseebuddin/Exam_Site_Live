@@ -85,7 +85,13 @@ waitress-serve --listen=0.0.0.0:8000 wsgi:app
 gunicorn --workers 4 --threads 2 --bind 0.0.0.0:8000 wsgi:app
 ```
 
-> **SQLite on cloud hosts:** on free-tier instances the filesystem is
-> ephemeral, so `instance/exam.db` resets on redeploy. This is fine for a
-> single running instance. `DATABASE_URL` is supported, but the app ships
-> SQLite/WAL-specific SQL — SQLite is the default and recommended engine.
+> **SQLite on cloud hosts (IMPORTANT):** on free-tier instances the filesystem
+> is **ephemeral and is wiped on every redeploy**, so a plain `instance/exam.db`
+> resets on each deploy — registered host accounts and student submissions
+> disappear and hosts must re-register. To keep data across restarts/redeploys:
+> attach a **Render Persistent Disk** and set
+> `RENDER_PERSISTENT_DISK_PATH=<mount path>` (the app then stores its SQLite DB
+> at `<disk>/exam.db`), or point `DB_PATH` at a persistent absolute location, or
+> set `DATABASE_URL` to a managed database. `DATABASE_URL` is fully supported,
+> but the app ships SQLite/WAL-specific SQL — SQLite is the default and
+> recommended engine.
