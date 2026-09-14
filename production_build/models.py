@@ -141,6 +141,20 @@ class Session(db.Model):
     completed_at = db.Column(db.String(64), nullable=True)
     score = db.Column(db.Integer, nullable=True)
     total_selected = db.Column(db.Integer, nullable=True)
+    # Anti-cheating: server-authoritative security-violation counter. The
+    # client reports incidents (tab switches, focus loss, blocked copy/paste,
+    # devtools attempts) to the server; the SERVER increments this counter so
+    # a page refresh can never reset a student's violation tally.
+    violation_count = db.Column(db.Integer, nullable=False, default=0)
+    # Once violation_count reaches the threshold, the attempt is flagged so the
+    # exam page force-submits even if the student re-opens it later (or never
+    # re-engaged with the tab that triggered the 3rd offense).
+    flagged = db.Column(db.Boolean, nullable=False, default=False)
+    # Marks a submission that was FORCED by the anti-cheating threshold (the
+    # student hit the maximum strike count and the exam was auto-submitted).
+    # Only sessions with flagged + auto_submitted (>= MAX_VIOLATIONS strikes)
+    # display the proctoring audit on the host's Session Details page.
+    auto_submitted = db.Column(db.Boolean, nullable=False, default=False)
     created_at = db.Column(
         db.String(64),
         nullable=False,
@@ -163,6 +177,12 @@ class Session(db.Model):
         "Answer",
         backref="session",
         order_by="Answer.position",
+        cascade="all, delete-orphan",
+    )
+    violations = db.relationship(
+        "ExamViolation",
+        backref="session",
+        order_by="ExamViolation.created_at",
         cascade="all, delete-orphan",
     )
 
@@ -315,6 +335,48 @@ class DailyRegistration(db.Model):
     registered_at = db.Column(db.String(64), nullable=False)
 
 
+class ExamViolation(db.Model):
+    """
+    A single anti-cheating / browser-lockdown security incident on an attempt.
+
+    Every time a student triggers a security flag — switching tabs, losing
+    focus, exiting fullscreen, attempting copy/paste, right-clicking to
+    inspect, or opening developer tools — the client reports it here. The
+    server records one row per incident so the host can audit exactly what
+    happened, when, and how many times, even if the client-side counter is
+    cleared by a page refresh.
+
+    * session_id      -> the attempt (Session) the incident belongs to
+    * violation_type  -> e.g. "tab_switch", "focus_loss", "fullscreen_exit",
+                         "copy_paste", "contextmenu", "devtools_shortcut"
+    * count           -> the 1-based ordinal of this incident for the session
+                         (1st, 2nd, 3rd, ...) as tracked server-side
+    * detail          -> short human-readable description
+    * created_at      -> ISO-8601 UTC moment the incident was reported
+    """
+
+    __tablename__ = "exam_violations"
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(
+        db.String(16), db.ForeignKey("sessions.id"), nullable=False, index=True
+    )
+    violation_type = db.Column(db.String(32), nullable=False)
+    count = db.Column(db.Integer, nullable=False, default=0)
+    detail = db.Column(db.String(255), nullable=True)
+    # Proctoring proof: a small JPEG captured client-side (webcam) at the exact
+    # moment the strike was recorded, stored as a base64 "data:image/jpeg;base64,"
+    # data-URL. Rendered as a thumbnail on the host's Session Details page ONLY
+    # for 3-strike auto-submitted attempts. Null when the browser denied the
+    # camera or no camera was available.
+    snapshot = db.Column(db.Text, nullable=True)
+    created_at = db.Column(
+        db.String(64),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc).isoformat(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Serializers — preserve the EXACT dict shape the templates already consume,
 # so the front-end (host.html, exam.html, result.html, details.html + PDFs)
@@ -394,6 +456,20 @@ def session_to_dict(s: Session) -> dict:
         "graded": [answer_to_graded_dict(a) for a in s.answers] or None,
         "score": s.score,
         "total_selected": s.total_selected,
+        # Anti-cheating metadata surfaced to the host's dashboard.
+        "violation_count": s.violation_count or 0,
+        "flagged": bool(s.flagged),
+        "auto_submitted": bool(s.auto_submitted),
+        "violations": [
+            {
+                "type": v.violation_type,
+                "count": v.count,
+                "detail": v.detail,
+                "snapshot": v.snapshot,
+                "created_at": v.created_at,
+            }
+            for v in s.violations
+        ],
         "created_at": s.created_at,
     }
 

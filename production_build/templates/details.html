@@ -81,6 +81,61 @@
             {% endif %}
           </div>
         </div>
+
+        <!-- ===== Proctoring audit =====
+             STRICT GATE: shown ONLY when the student reached the strike
+             threshold (default 3) AND the exam was auto-submitted as a
+             result. Students who completed normally with fewer strikes never
+             see this block, keeping the review page uncluttered. -->
+        {% if session.flagged and session.auto_submitted and session.violation_count >= (violation_threshold | default(3)) %}
+        <div class="card mt-4 border-danger">
+          <div class="card-header fw-semibold bg-danger text-white">🛡️ Proctoring Audit — Repeated Violations (Auto-Submitted)</div>
+          <div class="card-body">
+            <p class="small text-muted mb-3">
+              This attempt reached the maximum allowed security violations
+              (<strong>strike {{ session.violation_count }} of {{ violation_threshold | default(3) }}</strong>) and was
+              <strong>automatically submitted</strong> by the anti-cheating system.
+              Every strike is listed chronologically with its proof snapshot.
+            </p>
+            <div class="mb-3">
+              <span class="badge bg-danger">⚠️ Flagged — auto-submitted</span>
+              <span class="badge bg-secondary">Total strikes: {{ session.violation_count }}</span>
+              {% if session.completed_at %}
+                <span class="badge bg-secondary">Auto-submitted at: {{ session.completed_at }}</span>
+              {% endif %}
+            </div>
+            <ul class="list-unstyled mb-0">
+              {% for v in session.violations %}
+                <li class="border rounded-3 p-2 mb-2">
+                  <div class="d-flex justify-content-between align-items-start gap-2">
+                    <div>
+                      <span class="badge bg-danger">Strike #{{ v.count }}</span>
+                      <strong>{{ v.type | replace('_', ' ') | title }}</strong>
+                    </div>
+                    <span class="text-muted small">{{ v.created_at }}</span>
+                  </div>
+                  {% if v.detail %}
+                    <div class="text-muted small mt-1">{{ v.detail }}</div>
+                  {% endif %}
+                  <div class="mt-2">
+                    {% if v.snapshot %}
+                      <a href="{{ v.snapshot }}" target="_blank" rel="noopener" title="Open proof snapshot for strike #{{ v.count }}">
+                        <img src="{{ v.snapshot }}" alt="Proof snapshot of strike #{{ v.count }}"
+                             class="img-thumbnail bg-light"
+                             style="max-width: 170px; max-height: 128px; object-fit: cover;">
+                      </a>
+                    {% else %}
+                      <span class="badge bg-light text-muted border">📷 No snapshot captured (camera unavailable or denied)</span>
+                    {% endif %}
+                  </div>
+                </li>
+              {% else %}
+                <li class="text-muted small">No detailed violation rows recorded for this attempt.</li>
+              {% endfor %}
+            </ul>
+          </div>
+        </div>
+        {% endif %}
       </div>
 
       <!-- ===== Submitted answers ===== -->

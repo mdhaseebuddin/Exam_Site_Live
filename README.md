@@ -1,7 +1,10 @@
 # Exam Platform
 
 Flask + SQLAlchemy (SQLite) online examination platform with email-based OTP
-password reset, student session OTPs, math CAPTCHA, and server-side PDF reports.
+password reset, student session OTPs, math CAPTCHA, server-side PDF reports,
+and a production-grade **Anti-Cheating & Browser-Lockdown System** featuring
+webcam proctoring, a server-authoritative violation counter, and enforced
+fullscreen exam lockdown.
 
 ## Repository layout
 
@@ -27,6 +30,41 @@ password reset, student session OTPs, math CAPTCHA, and server-side PDF reports.
 to run lives inside it, and deployment is driven from the repo root via the
 `Procfile`.
 
+## Anti-Cheating & Browser-Lockdown System
+
+Every exam attempt runs inside a locked-down proctoring environment:
+
+- **Fullscreen enforcement with click recapture & `Esc` mitigation** — the exam
+  page requests browser fullscreen on load and re-enters it on **every** click
+  or keystroke (capture phase), so `Esc` / `F11` cannot keep the student out.
+  Exiting fullscreen is counted as a violation and a blocking "Enter
+  Fullscreen" overlay appears until the student clicks back in.
+- **Tab-switch, focus-loss, copy/paste & devtools restrictions** —
+  `visibilitychange` and `blur` detect tab switches, window minimizes, and
+  clicks into other applications; right-click (`contextmenu`), `Ctrl+C/X/V`,
+  `F12`, `Ctrl+Shift+I/J/C`, view-source (`Ctrl+U`), save/print (`Ctrl+S/P`),
+  and refresh (`F5` / `Ctrl+R`) are all blocked while the exam is active.
+- **Smart 3-strike face-absence webcam proctoring** — on every strike a
+  `getUserMedia` webcam frame is captured, compressed to a small base64 JPEG
+  via the HTML5 Canvas API, uploaded with the incident, and persisted
+  server-side on the `ExamViolation` record. The first two strikes show a
+  strict warning modal; the **3rd strike automatically submits the exam** and
+  redirects the student to the results page.
+- **Server-authoritative violation counter & deadline-tamper protection** —
+  every incident increments `session.violation_count` server-side in the same
+  transaction that writes the `exam_violations` row, so page refreshes and
+  tampered clients **cannot reset the tally**; the countdown and submit
+  deadline are anchored to absolute UTC server timestamps and enforced on the
+  server (any submission past the deadline is rejected).
+- **Conditional host session review** — the host's Session Details page renders
+  a dedicated **Proctoring Audit** card (strike count, chronological
+  timestamps, and thumbnail previews of the proof snapshots) **only** when the
+  attempt reached the 3-strike threshold and was auto-submitted. Normal
+  completions with 0, 1, or 2 warnings stay clean and uncluttered.
+
+The policy is tunable with environment variables: `MAX_VIOLATIONS` (default
+`3`) and `SNAPSHOT_MAX_BYTES` (default `480000`).
+
 ## Configuration
 
 All configuration comes from environment variables, loaded at startup with
@@ -48,6 +86,8 @@ production are:
 | `MAX_SUBMISSIONS` | Lifetime cap on completed submissions (default 500)           |
 | `DAILY_REGISTRATION_LIMIT` | Strict per-host cap on student registrations per 24h (default 70) |
 | `DAILY_REGISTRATION_WINDOW_HOURS` | Rolling window (hours) defining a host's "day" (default 24) |
+| `MAX_VIOLATIONS` | Security-strike threshold that force-submits a flagged attempt (default 3) |
+| `SNAPSHOT_MAX_BYTES` | Max base64 length accepted for a proctoring proof snapshot (default 480000) |
 
 ## Deploying to a cloud host (Render / Koyeb)
 
@@ -95,3 +135,9 @@ gunicorn --workers 4 --threads 2 --bind 0.0.0.0:8000 wsgi:app
 > set `DATABASE_URL` to a managed database. `DATABASE_URL` is fully supported,
 > but the app ships SQLite/WAL-specific SQL — SQLite is the default and
 > recommended engine.
+
+> **Webcam proctoring requires HTTPS:** `navigator.mediaDevices.getUserMedia`
+> only works in a *secure context* (HTTPS, or `http://localhost` during local
+> development). Deploy on HTTPS (Render/Koyeb default to it) or snapshot
+> capture is skipped gracefully — strikes and timestamps are still recorded,
+> and the host's Proctoring Audit shows the "no snapshot captured" placeholder.

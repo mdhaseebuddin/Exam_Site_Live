@@ -69,6 +69,7 @@ from models import (
     DailyRegistration,
     Exam,
     ExamQuestion,
+    ExamViolation,
     HostUser,
     OtpToken,
     Question,
@@ -113,6 +114,21 @@ MAX_SUBMISSIONS = int(os.environ.get("MAX_SUBMISSIONS", "500"))
 # ---------------------------------------------------------------------------
 DAILY_REGISTRATION_LIMIT = int(os.environ.get("DAILY_REGISTRATION_LIMIT", "70"))
 DAILY_REGISTRATION_WINDOW_HOURS = int(os.environ.get("DAILY_REGISTRATION_WINDOW_HOURS", "24"))
+
+# ---------------------------------------------------------------------------
+# Anti-cheating / browser-lockdown policy
+# ---------------------------------------------------------------------------
+# The number of security violations (tab switches, focus losses, blocked
+# copy/paste, devtools attempts, ...) a student may accrue before the exam is
+# FORCE-SUBMITTED and the attempt is flagged for the host. The first
+# (threshold - 1) incidents show a strict warning modal; the final one triggers
+# an automatic final submission + redirect to the results page.
+MAX_VIOLATIONS = int(os.environ.get("MAX_VIOLATIONS", "3"))
+
+# Maximum accepted size for a proctoring proof snapshot (base64 data-URL). The
+# client sends a small webcam JPEG (~20-90 KB), so ~480 KB is a generous cap
+# that still blocks abuse of the column as bulk storage.
+SNAPSHOT_MAX_BYTES = int(os.environ.get("SNAPSHOT_MAX_BYTES", "480000"))
 
 # ---------------------------------------------------------------------------
 # Secrets & configuration — loaded from .env (never from the code itself)
@@ -408,6 +424,25 @@ def init_db() -> None:
         stu_cols = [c["name"] for c in insp.get_columns("students")]
         if "email" not in stu_cols:
             db.session.execute(text("ALTER TABLE students ADD COLUMN email VARCHAR(255) NOT NULL DEFAULT ''"))
+        # Session.violation_count / flagged (anti-cheating browser-lockdown)
+        sess_cols = [c["name"] for c in insp.get_columns("sessions")]
+        if "violation_count" not in sess_cols:
+            db.session.execute(
+                text("ALTER TABLE sessions ADD COLUMN violation_count INTEGER NOT NULL DEFAULT 0")
+            )
+        if "flagged" not in sess_cols:
+            db.session.execute(
+                text("ALTER TABLE sessions ADD COLUMN flagged BOOLEAN NOT NULL DEFAULT 0")
+            )
+        # Session.auto_submitted (submission forced by the 3-strike threshold)
+        if "auto_submitted" not in sess_cols:
+            db.session.execute(
+                text("ALTER TABLE sessions ADD COLUMN auto_submitted BOOLEAN NOT NULL DEFAULT 0")
+            )
+        # ExamViolation.snapshot (proctoring proof image captured at strike time)
+        viol_cols = [c["name"] for c in insp.get_columns("exam_violations")]
+        if "snapshot" not in viol_cols:
+            db.session.execute(text("ALTER TABLE exam_violations ADD COLUMN snapshot TEXT"))
         db.session.commit()
 
         # --- Back-fill the durable daily-registration LEDGER from existing
@@ -2367,6 +2402,9 @@ def session_details(session_id):
         "details.html",
         session=data,
         custom_registration_fields=cfg.get("custom_registration_fields") or [],
+        # Anti-cheating: the strict proctoring-audit gate on the details page
+        # compares the session's strike count against this server threshold.
+        violation_threshold=MAX_VIOLATIONS,
     )
 
 
@@ -2975,6 +3013,12 @@ def exam(session_id):
         required_fields=required_fields,
         custom_registration_fields=custom_registration_fields,
         field_labels=REG_FIELD_LABELS,
+        # Anti-cheating: server-authoritative violation tally is passed to the
+        # client so a page refresh NEVER resets the student's violation count,
+        # and a flagged attempt force-submits immediately on load.
+        violation_threshold=MAX_VIOLATIONS,
+        violation_count=s.violation_count or 0,
+        flagged=bool(s.flagged),
     )
 
 
@@ -3036,8 +3080,101 @@ def exam_time(session_id):
         {
             "server_now_unix": int(now.timestamp()),
             "deadline_unix": int(deadline.timestamp()),
+            # Anti-cheating: if the attempt has been flagged for 3+ violations
+            # while the student was away, the client force-submits immediately
+            # on the next poll instead of letting them keep working.
+            "flagged": bool(s.flagged),
+            "violation_count": s.violation_count or 0,
+            "violation_threshold": MAX_VIOLATIONS,
         }
     )
+
+
+@app.route("/exam/<session_id>/violation", methods=["POST"])
+@limiter.limit("10000 per minute", methods=["POST"])
+def exam_violation(session_id):
+    """
+    Anti-cheating incident reporter (SERVER-AUTHORITATIVE).
+
+    The exam page's lockdown JS POSTs here every time a security flag fires:
+    tab switches / visibility loss, window blur (clicking to another app),
+    fullscreen exit, blocked copy/paste, right-click (context menu), or a
+    developer-tools shortcut attempt.
+
+    The server is the single source of truth for the violation tally:
+      * It appends one ExamViolation row per incident (type + timestamp).
+      * It increments the session's violation_count in the same transaction.
+      * When the count reaches MAX_VIOLATIONS the session is flagged; the
+        client receives `auto_submit: true` and triggers a forced final
+        submission, and any later return to the exam page force-submits too.
+
+    A page refresh or a tampered client that suppresses reporting can NEVER
+    reset the counter, because it lives here on the server.
+    """
+    s = db.session.get(Session, session_id)
+    if s is None or s.status != "started":
+        return jsonify({"error": "invalid session"}), 400
+
+    payload = request.get_json(silent=True) or {}
+    vtype = str(payload.get("type", "")).strip() or "unknown"
+    detail = str(payload.get("detail", "")).strip()
+    if len(vtype) > 32:
+        vtype = vtype[:32]
+    if len(detail) > 255:
+        detail = detail[:255]
+
+    # Proctoring proof snapshot (optional). Only accept a base64 data-URL JPEG
+    # within the size cap — anything else (arbitrary URLs, huge blobs) is
+    # dropped so this column can never be abused as general-purpose storage.
+    raw_snapshot = payload.get("snapshot")
+    snapshot = None
+    if (
+        isinstance(raw_snapshot, str)
+        and raw_snapshot.startswith("data:image/")
+        and len(raw_snapshot) <= SNAPSHOT_MAX_BYTES
+    ):
+        snapshot = raw_snapshot
+
+    s.violation_count = (s.violation_count or 0) + 1
+    count = s.violation_count
+    if count >= MAX_VIOLATIONS:
+        s.flagged = True
+    db.session.add(
+        ExamViolation(
+            session_id=session_id,
+            violation_type=vtype,
+            count=count,
+            detail=detail or None,
+            snapshot=snapshot,
+        )
+    )
+    db.session.commit()
+
+    audit(
+        "exam_violation",
+        session_id=session_id,
+        violation_type=vtype,
+        count=count,
+        detail=detail,
+        snapshot=(bool(snapshot)),
+        flagged=bool(s.flagged),
+        ip=get_remote_address(),
+    )
+
+    auto_submit = count >= MAX_VIOLATIONS
+    response = {
+        "ok": True,
+        "count": count,
+        "threshold": MAX_VIOLATIONS,
+        "auto_submit": auto_submit,
+        "flagged": auto_submit,
+    }
+    if auto_submit:
+        response["message"] = (
+            "Your exam has been flagged for repeated security violations and "
+            "will be submitted immediately."
+        )
+    return jsonify(response)
 
 @app.route("/exam/<session_id>/register", methods=["GET", "POST"])
 @app.route("/register/<session_id>", methods=["GET", "POST"])
@@ -3498,6 +3635,21 @@ def _submit_exam(session_id):
     # Reload the session — it's now "owned" by this worker.
     s = db.session.get(Session, session_id)
     answers = payload.get("answers", {})
+
+    # Anti-cheating: persist WHY this attempt was submitted when it was
+    # forced out early for repeated security violations, so the host can
+    # see it in the audit trail / exam_violations log AND on the Session
+    # Details page (the strict proctoring-audit gate requires this flag).
+    if s.flagged:
+        s.auto_submitted = True
+        audit(
+            "exam_submitted_flag",  # submitted because the attempt was flagged
+            session_id=session_id,
+            reason="security_violation_threshold",
+            violation_count=s.violation_count or 0,
+            auto_submitted=True,
+            ip=get_remote_address(),
+        )
     session_owner = s.host_email
 
     # Belt-and-braces: merge submitted student info with stored record.

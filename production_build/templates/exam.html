@@ -73,6 +73,54 @@
   <!-- Result is injected here after submission -->
   <div class="container" id="resultBox" style="display:none;"></div>
 
+  <!-- ===== Anti-cheating / browser-lockdown UI ===== -->
+  <!-- Strict warning modal: shown for the first (threshold - 1) violations. -->
+  <div id="violationModal" class="violation-overlay" style="display:none;" role="alertdialog" aria-modal="true" aria-labelledby="violationModalTitle">
+    <div class="violation-modal">
+      <div class="violation-modal-header">
+        <span class="violation-warning-icon">⚠️</span>
+        <span id="violationModalTitle">Security Warning</span>
+      </div>
+      <div class="violation-modal-body">
+        <p id="violationModalText">Warning: Leaving the exam tab is prohibited and will be reported.</p>
+        <p class="violation-modal-count" id="violationModalCount"></p>
+      </div>
+      <div class="violation-modal-footer">
+        <button id="violationAckBtn" type="button" class="btn btn-warning w-100">I Understand — Continue Exam</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fullscreen-blocking overlay: shown while the student is NOT in fullscreen. -->
+  <div id="fullscreenBlockOverlay" class="violation-overlay" style="display:none;" role="alert" aria-live="assertive">
+    <div class="violation-modal">
+      <div class="violation-modal-header">
+        <span class="violation-warning-icon">🔒</span>
+        <span>Fullscreen Required</span>
+      </div>
+      <div class="violation-modal-body">
+        <p>This exam must be taken in fullscreen mode. Please click the button below to continue.</p>
+      </div>
+      <div class="violation-modal-footer">
+        <button id="fullscreenRetryBtn" type="button" class="btn btn-warning w-100">Enter Fullscreen</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Final "force submitting" overlay shown during a forced auto-submit. -->
+  <div id="forceSubmitOverlay" class="violation-overlay force-submit" style="display:none;" role="alert" aria-live="assertive">
+    <div class="violation-modal">
+      <div class="violation-modal-header">
+        <span class="violation-warning-icon">🚫</span>
+        <span>Exam Submitted</span>
+      </div>
+      <div class="violation-modal-body">
+        <p id="forceSubmitText">Your exam has been flagged for repeated security violations and is being submitted now.</p>
+        <div class="spinner-border text-warning" role="status"><span class="visually-hidden">Submitting…</span></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Exam config is injected as pure JSON (no inline JS) and parsed in exam.js -->
 <script type="application/json" id="examConfig">
 {{ {
@@ -83,7 +131,10 @@
     "serverNowUnix": server_now_unix,
     "totalQuestions": questions | length,
     "student": student,
-    "csrfToken": csrf_token()
+    "csrfToken": csrf_token(),
+    "violationThreshold": violation_threshold,
+    "violationCount": violation_count,
+    "flagged": flagged
   } | tojson }}
   </script>
   <script src="{{ url_for('static', filename='exam.js') }}"></script>
