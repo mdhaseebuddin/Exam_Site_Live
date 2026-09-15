@@ -37,11 +37,15 @@
   // force-submitted and the student is redirected to the results page.
   let forcedSubmitRequested = false;
   let redirectScheduled = false;
-  // Debounce: a single physical "switch away" fires blur AND visibilitychange
-  // (and possibly a fullscreen-exit) at once — those must count as ONE
-  // incident, not three.
+  // Debounce / rate-limit for strikes: a single physical action — switching
+  // tabs, losing focus, exiting fullscreen — fires blur + visibilitychange +
+  // fullscreenchange almost simultaneously. The FIRST event claims a
+  // 5-second cooldown window; every other event arriving inside that window
+  // is ignored, so one action can never consume multiple strikes. Uses
+  // performance.now() (a monotonic clock) so changing the system clock can
+  // never bypass the cooldown.
   let lastViolationReportAt = 0;
-  const VIOLATION_COOLDOWN_MS = 1500;
+  const VIOLATION_COOLDOWN_MS = 5000;
   let focusLost = false;
 
   const timerEl = document.getElementById("timer");
@@ -383,6 +387,7 @@
     renderQuestion(0);
     startLockdown(); // enforce fullscreen + block re-entry to non-fullscreen mode
     startDevToolsDetection(); // monitor window-size / debugger probes for devtools
+    startFaceMonitor(); // continuous out-of-frame / face-absence monitoring
 
     // Anti-cheating: if this attempt was already flagged server-side (3rd
     // violation landed while the student was away, or after a page refresh),
@@ -412,6 +417,126 @@
     if (captureStream) {
       captureStream.getTracks().forEach(function (t) { t.stop(); });
       captureStream = null;
+    }
+  }
+
+  // -------------------------- Face-presence monitor -----------------------
+  // Continuous lightweight webcam analysis with NO external ML library: every
+  // second a small frame of the LIVE camera feed (the stream acquired at the
+  // camera gate is kept running for the whole exam) is analyzed for:
+  //   1. Skin-tone pixels in the central region (YCrCb heuristic that works
+  //      across skin tones), and
+  //   2. Inter-frame motion (pixel deltas between consecutive frames), so a
+  //      present-but-still student is never falsely flagged.
+  // When BOTH are absent for a sustained window (~5s), the student is treated
+  // as out-of-frame / lens covered. A `face_not_detected` strike is then
+  // reported through the SAME pipeline as tab-switching — server-authoritative
+  // count, the on-screen security warning modal, and a hard auto-submit once
+  // the threshold is reached.
+  const FACE_MONITOR_INTERVAL_MS = 1000;
+  const FACE_MONITOR_MISSES_TO_FLAG = 5;    // ~5s of sustained absence
+  const FACE_SKIN_THRESHOLD = 0.08;         // >= 8% of central pixels skin-toned
+  const FACE_MOTION_THRESHOLD = 0.012;      // avg normalized channel delta
+  let faceMonitorInterval = null;
+  let faceMonitorVideo = null;
+  let faceMonitorCanvas = null;
+  let faceMonitorCtx = null;
+  let faceMonitorStreak = 0;
+  let lastFaceFrameData = null;
+  // Lets a reporter (e.g. the face monitor) override the generic modal text so
+  // students see a specific warning ("Face not detected in camera view").
+  let proctorAlertMessage = "";
+
+  // Sends a face-absence strike through the standard violation pipeline.
+  function reportFaceAbsence() {
+    proctorAlertMessage =
+      "Security Warning: Face not detected in camera view. " +
+      "Please keep your face inside the camera frame at all times.";
+    reportViolation(
+      "face_not_detected",
+      "Face not detected in camera view (student out of frame / camera covered)"
+    );
+  }
+
+  // Starts the monitor when the exam actually begins (after the camera gate).
+  function startFaceMonitor() {
+    if (faceMonitorInterval) return;
+    if (!captureStream || !captureStream.active) return; // no live camera -> skip
+    faceMonitorVideo = document.createElement("video");
+    faceMonitorVideo.muted = true;
+    faceMonitorVideo.playsInline = true;
+    faceMonitorVideo.srcObject = captureStream;
+    faceMonitorVideo.play().catch(function () {});
+    faceMonitorCanvas = document.createElement("canvas");
+    faceMonitorCanvas.width = 160;
+    faceMonitorCanvas.height = 120;
+    faceMonitorCtx = faceMonitorCanvas.getContext("2d");
+    faceMonitorStreak = 0;
+    lastFaceFrameData = null;
+    faceMonitorInterval = window.setInterval(checkFacePresence, FACE_MONITOR_INTERVAL_MS);
+  }
+
+  // One analysis tick: reads the camera frame, checks for skin + motion, and
+  // escalates a sustained absence into a strike.
+  function checkFacePresence() {
+    if (submitting || submitted || redirectScheduled) return;
+    if (!faceMonitorVideo || !faceMonitorCtx) return;
+    if (!faceMonitorVideo.videoWidth || faceMonitorVideo.readyState < 2) return;
+
+    let frameData;
+    try {
+      faceMonitorCtx.drawImage(
+        faceMonitorVideo,
+        0, 0, faceMonitorCanvas.width, faceMonitorCanvas.height
+      );
+      frameData = faceMonitorCtx.getImageData(
+        0, 0, faceMonitorCanvas.width, faceMonitorCanvas.height
+      ).data;
+    } catch (err) {
+      return; // frame not ready / stream ended — do not guess
+    }
+
+    const w = faceMonitorCanvas.width;
+    const h = faceMonitorCanvas.height;
+    // Restrict analysis to the central ~70% — a face in frame is centered.
+    const x0 = Math.floor(w * 0.15);
+    const y0 = Math.floor(h * 0.15);
+    const x1 = Math.floor(w * 0.85);
+    const y1 = Math.floor(h * 0.85);
+
+    let skinCount = 0;
+    let total = 0;
+    let motionSum = 0;
+    let diffPixels = 0;
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        const idx = (y * w + x) * 4;
+        const r = frameData[idx];
+        const g = frameData[idx + 1];
+        const b = frameData[idx + 2];
+        // BT.601 YCbCr skin-tone heuristic.
+        const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+        const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+        if (cr >= 133 && cr <= 173 && cb >= 77 && cb <= 127) skinCount++;
+        total++;
+        if (lastFaceFrameData !== null) {
+          motionSum +=
+            Math.abs(r - lastFaceFrameData[idx]) +
+            Math.abs(g - lastFaceFrameData[idx + 1]) +
+            Math.abs(b - lastFaceFrameData[idx + 2]);
+          diffPixels++;
+        }
+      }
+    }
+    if (diffPixels > 0) lastFaceFrameData = frameData;
+    const avgMotion = diffPixels > 0 ? motionSum / (diffPixels * 3 * 255) : 0;
+    const hasSkin = total > 0 && skinCount / total >= FACE_SKIN_THRESHOLD;
+    const hasMotion = avgMotion >= FACE_MOTION_THRESHOLD;
+
+    faceMonitorStreak = hasSkin || hasMotion ? 0 : faceMonitorStreak + 1;
+    if (faceMonitorStreak >= FACE_MONITOR_MISSES_TO_FLAG) {
+      faceMonitorStreak = 0; // each sustained absence can accrue one strike
+      reportFaceAbsence();
     }
   }
 
@@ -490,9 +615,12 @@
     // Once a submission is underway, stop counting incidents.
     if (submitting || submitted || redirectScheduled) return;
 
-    // Debounce: blur + visibilitychange + fullscreen-exit from the SAME
-    // physical switch count as a single incident.
-    const nowMs = Date.now();
+    // Rate-limit: blur + visibilitychange + fullscreen-exit from the SAME
+    // physical switch fire within milliseconds and MUST count as ONE strike.
+    // The first event claims the cooldown window; anything inside it is
+    // dropped before the snapshot/fetch runs, so the server never even sees
+    // (or counts) a duplicate.
+    const nowMs = performance.now();
     if (nowMs - lastViolationReportAt < VIOLATION_COOLDOWN_MS) return;
     lastViolationReportAt = nowMs;
 
@@ -543,11 +671,12 @@
       forceSubmitExam();
       return;
     }
-    showWarningModal(violationCount);
+    showWarningModal(violationCount, proctorAlertMessage);
+    proctorAlertMessage = "";
   }
 
   // -------------------------- Warning modal ------------------------------
-  function showWarningModal(count) {
+  function showWarningModal(count, message) {
     if (submitting || submitted) return;
     if (!violationOverlay) return;
     const remaining = Math.max(0, MAX_VIOLATIONS - count);
@@ -560,6 +689,7 @@
     }
     if (violationModalText) {
       violationModalText.textContent =
+        message ||
         "Warning: Leaving the exam tab is prohibited and will be reported. " +
         "Do not switch tabs, minimize this window, open other programs, " +
         "right-click, or open developer tools while the exam is active.";
