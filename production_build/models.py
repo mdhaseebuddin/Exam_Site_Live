@@ -348,7 +348,8 @@ class ExamViolation(db.Model):
 
     * session_id      -> the attempt (Session) the incident belongs to
     * violation_type  -> e.g. "tab_switch", "focus_loss", "fullscreen_exit",
-                         "copy_paste", "contextmenu", "devtools_shortcut"
+                         "copy_paste", "contextmenu", "devtools_shortcut",
+                         "devtools_detected"
     * count           -> the 1-based ordinal of this incident for the session
                          (1st, 2nd, 3rd, ...) as tracked server-side
     * detail          -> short human-readable description

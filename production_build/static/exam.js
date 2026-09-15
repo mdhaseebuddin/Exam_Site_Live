@@ -63,11 +63,162 @@
   const fullscreenRetryBtn = document.getElementById("fullscreenRetryBtn");
   const forceSubmitOverlay = document.getElementById("forceSubmitOverlay");
   const forceSubmitText = document.getElementById("forceSubmitText");
+  const cameraGateOverlay = document.getElementById("cameraGateOverlay");
+  const cameraPreview = document.getElementById("cameraPreview");
+  const cameraGateStatus = document.getElementById("cameraGateStatus");
+  const cameraGateError = document.getElementById("cameraGateError");
+  const cameraRetryBtn = document.getElementById("cameraRetryBtn");
+  const cameraStartBtn = document.getElementById("cameraStartBtn");
 
   function hideViolationOverlays() {
     if (violationOverlay) violationOverlay.style.display = "none";
     if (fullscreenBlockOverlay) fullscreenBlockOverlay.style.display = "none";
     if (forceSubmitOverlay) forceSubmitOverlay.style.display = "none";
+  }
+
+  // ---------------------------- Camera gate -------------------------------
+  // The exam stays BLOCKED until a live webcam stream is verified. If the
+  // student denies permission, no camera is found, the camera is in use, or
+  // the stream never delivers real frames, a blocking warning is displayed
+  // and the Start Exam button stays disabled. The stream acquired here is
+  // kept alive for the whole exam and reused for violation proof snapshots.
+  const CAMERA_CONNECT_TIMEOUT_MS = 10000;
+  let cameraVerified = false;
+  let examStarted = false;
+
+  function setCameraGateState(statusText, errorText) {
+    if (cameraGateStatus) cameraGateStatus.textContent = statusText;
+    if (cameraGateError) {
+      cameraGateError.textContent = errorText || "";
+      cameraGateError.style.display = errorText ? "block" : "none";
+    }
+  }
+
+  function cameraErrorMessage(err) {
+    const name = (err && err.name) || "";
+    switch (name) {
+      case "NotAllowedError":
+      case "PermissionDeniedError":
+        return "Camera permission was denied. Click the camera icon in your browser\u2019s address bar, choose \u201cAllow\u201d, then press Try Again.";
+      case "NotFoundError":
+      case "DevicesNotFoundError":
+        return "No camera was detected on this device. Connect a working webcam and press Try Again.";
+      case "NotReadableError":
+      case "TrackStartError":
+        return "Your camera could not be started \u2014 it may already be in use by another application. Close other apps using the camera and press Try Again.";
+      case "OverconstrainedError":
+        return "Your camera cannot provide a usable video format. Press Try Again or try a different camera.";
+      case "AbortError":
+        return "The camera check was interrupted. Press Try Again to retry.";
+      case "SecurityError":
+        return "Camera access was blocked by the browser. This exam must be opened over HTTPS (or localhost) to use webcam proctoring.";
+      default:
+        return "Unable to connect to your camera. Press Try Again to attempt the check once more.";
+    }
+  }
+
+  // Performs the camera-verification check. Runs on every load (including
+  // refreshes) so a student can never skip it.
+  function verifyCamera() {
+    setCameraGateState("Requesting camera access\u2026", "");
+    if (cameraStartBtn) cameraStartBtn.disabled = true;
+    if (cameraRetryBtn) cameraRetryBtn.style.display = "none";
+    if (cameraPreview) {
+      cameraPreview.style.display = "none";
+      cameraPreview.srcObject = null;
+    }
+    cameraVerified = false;
+
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.mediaDevices ||
+      !navigator.mediaDevices.getUserMedia
+    ) {
+      setCameraGateState(
+        "\u26a0\ufe0f Camera check failed \u2014 the exam is blocked.",
+        "This browser does not support camera access on this page. Camera access requires a secure (HTTPS) connection \u2014 enable it and press Try Again."
+      );
+      if (cameraRetryBtn) cameraRetryBtn.style.display = "block";
+      return;
+    }
+
+    let verified = false;
+    const gateTimer = window.setTimeout(function () {
+      if (verified) return;
+      window.clearTimeout(gateTimer);
+      cameraVerified = false;
+      stopCaptureStream();
+      if (cameraPreview) {
+        cameraPreview.style.display = "none";
+        cameraPreview.srcObject = null;
+      }
+      setCameraGateState(
+        "\u26a0\ufe0f Camera check failed \u2014 no live video stream.",
+        "The video stream failed to start within the time limit. Make sure the camera is not covered or blocked, then press Try Again."
+      );
+      if (cameraRetryBtn) cameraRetryBtn.style.display = "block";
+    }, CAMERA_CONNECT_TIMEOUT_MS);
+
+    // Runs only when the video element has real frames available — a camera
+    // that reports a stream but delivers no pixels still fails the check.
+    function onLive() {
+      if (verified) return;
+      verified = true;
+      window.clearTimeout(gateTimer);
+      cameraVerified = true;
+      if (cameraRetryBtn) cameraRetryBtn.style.display = "none";
+      if (cameraStartBtn) cameraStartBtn.disabled = false;
+      setCameraGateState(
+        "\u2705 Camera connected \u2014 your live video feed is active. Click \u201cStart Exam\u201d to begin.",
+        ""
+      );
+    }
+
+    try {
+      navigator.mediaDevices.getUserMedia(
+        { video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false }
+      )
+        .then(function (stream) {
+          if (verified) return;
+          captureStream = stream;
+          // Preview element when present (student sees their own live feed);
+          // otherwise a detached element still proves frames are flowing.
+          const videoEl = cameraPreview || document.createElement("video");
+          videoEl.muted = true;
+          videoEl.playsInline = true;
+          videoEl.srcObject = stream;
+          if (cameraPreview) cameraPreview.style.display = "block";
+          // "loadeddata" fires only after actual video frames are available,
+          // so a camera that reports a stream but delivers no pixels fails.
+          videoEl.addEventListener("loadeddata", onLive, { once: true });
+          videoEl.play().then(function () {}).catch(function () {});
+        })
+        .catch(function (err) {
+          if (verified) return;
+          window.clearTimeout(gateTimer);
+          cameraVerified = false;
+          stopCaptureStream();
+          if (cameraPreview) {
+            cameraPreview.style.display = "none";
+            cameraPreview.srcObject = null;
+          }
+          setCameraGateState(
+            "\u26a0\ufe0f Camera check failed \u2014 the exam is blocked.",
+            cameraErrorMessage(err)
+          );
+          if (cameraRetryBtn) cameraRetryBtn.style.display = "block";
+        });
+    } catch (err) {
+      if (verified) return;
+      window.clearTimeout(gateTimer);
+      cameraVerified = false;
+      stopCaptureStream();
+      setCameraGateState(
+        "\u26a0\ufe0f Camera check failed \u2014 the exam is blocked.",
+        cameraErrorMessage(err)
+      );
+      if (cameraRetryBtn) cameraRetryBtn.style.display = "block";
+    }
   }
 
   // -------------------------- Fullscreen enforcement ---------------------
@@ -146,6 +297,109 @@
     });
   }
 
+  function initCameraGate() {
+    if (cameraGateOverlay) cameraGateOverlay.style.display = "flex";
+    // Lock every exam control until a live stream is verified.
+    if (submitBtn) submitBtn.disabled = true;
+    if (prevBtn) prevBtn.disabled = true;
+    if (nextBtn) nextBtn.disabled = true;
+    verifyCamera();
+  }
+
+  function hideCameraGate() {
+    if (cameraGateOverlay) cameraGateOverlay.style.display = "none";
+  }
+
+  if (cameraRetryBtn) {
+    cameraRetryBtn.addEventListener("click", function () {
+      verifyCamera();
+    });
+  }
+
+  if (cameraStartBtn) {
+    cameraStartBtn.addEventListener("click", function () {
+      if (cameraVerified && !examStarted) beginExam();
+    });
+  }
+
+  // ---------------------------- Exam start -------------------------------
+  // Called from the camera gate after a live stream is verified. Establishes
+  // the server-anchored deadline (so time at the camera gate never counts
+  // against the student) and then launches the exam.
+  function beginExam() {
+    if (!cameraVerified || examStarted) return;
+    examStarted = true;
+    requestStartClock();
+  }
+
+  function requestStartClock() {
+    // If the server hasn't started this session's clock yet, POST /start so
+    // the deadline is anchored at the moment the student actually begins, NOT
+    // at the moment the page loaded.
+    if (!cfg.deadlineUnix) {
+      fetch("/exam/" + cfg.sessionId + "/start", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": cfg.csrfToken
+        },
+        body: JSON.stringify({})
+      })
+        .then(function (res) {
+          return res.json().catch(function () { return {}; });
+        })
+        .then(function (data) {
+          if (data && data.deadline_unix != null && data.server_now_unix != null) {
+            deadlineUnix = data.deadline_unix;
+            serverNowUnix = data.server_now_unix;
+            launchExam();
+          } else {
+            startClockFailed();
+          }
+        })
+        .catch(function () {
+          startClockFailed();
+        });
+    } else {
+      launchExam();
+    }
+  }
+
+  function startClockFailed() {
+    examStarted = false;
+    setCameraGateState(
+      "\u26a0\ufe0f Could not start the exam.",
+      "The exam server could not be reached, so the clock could not be started. Check your connection and press Start Exam to try again."
+    );
+    if (cameraGateOverlay) cameraGateOverlay.style.display = "flex";
+    if (cameraStartBtn) cameraStartBtn.disabled = false;
+  }
+
+  function launchExam() {
+    hideCameraGate();
+    if (submitBtn) submitBtn.disabled = false;
+    if (prevBtn) prevBtn.disabled = false;
+    if (nextBtn) nextBtn.disabled = false;
+    renderQuestion(0);
+    startLockdown(); // enforce fullscreen + block re-entry to non-fullscreen mode
+    startDevToolsDetection(); // monitor window-size / debugger probes for devtools
+
+    // Anti-cheating: if this attempt was already flagged server-side (3rd
+    // violation landed while the student was away, or after a page refresh),
+    // force-submit immediately and redirect to the results page.
+    if (cfg.flagged || (violationCount >= MAX_VIOLATIONS)) {
+      timerEl.textContent = "00:00";
+      timerEl.classList.add("time-up");
+      forceSubmitExam();
+    } else if (computeRemaining() <= 0) {
+      timerEl.textContent = "00:00";
+      timerEl.classList.add("time-up");
+      submitExam(true); // deadline already passed -> submit immediately
+    } else {
+      startTimer();
+    }
+  }
+
   // -------------------------- Violation reporting ------------------------
   // Best-effort proctoring proof capture: grabs one small webcam frame as a
   // JPEG data-URL at the moment a strike is recorded. Pure webcam (no external
@@ -163,12 +417,52 @@
 
   function captureSnapshot(done) {
     let finished = false; // idempotency guard: two finish(null) paths exist
+    let ownsStream = false; // true when a throwaway stream was acquired here
+
     function finish(url) {
       if (finished) return;
       finished = true;
-      stopCaptureStream();
+      // Only stop a stream we acquired for this snapshot — the camera-gate
+      // stream stays alive for the whole exam and is reused for later frames.
+      if (ownsStream) stopCaptureStream();
       done(url);
     }
+
+    function drawFrame(stream) {
+      const video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.srcObject = stream;
+      // Watchdog so a hung camera never blocks the violation report.
+      const failTimer = window.setTimeout(function () {
+        window.clearTimeout(failTimer);
+        finish(null);
+      }, 1500);
+      video.addEventListener("loadedmetadata", function () {
+        video.play().catch(function () {});
+        // Give the sensor a frame or two to deliver pixels, then draw.
+        window.setTimeout(function () {
+          window.clearTimeout(failTimer);
+          try {
+            const canvas = document.createElement("canvas");
+            canvas.width = 320;
+            canvas.height = 240;
+            canvas.getContext("2d").drawImage(video, 0, 0, 320, 240);
+            finish(canvas.toDataURL("image/jpeg", 0.4));
+          } catch (err) {
+            finish(null);
+          }
+        }, 350);
+      });
+    }
+
+    // Reuse the live camera-gate stream when it is still active, so the proof
+    // frame is instant and the browser is never re-prompted for permission.
+    if (captureStream && captureStream.active && captureStream.getVideoTracks().length) {
+      drawFrame(captureStream);
+      return;
+    }
+
     if (
       typeof navigator === "undefined" ||
       !navigator.mediaDevices ||
@@ -178,36 +472,13 @@
       return;
     }
     try {
+      ownsStream = true;
       navigator.mediaDevices.getUserMedia(
         { video: { width: 320, height: 240 }, audio: false }
       )
         .then(function (stream) {
           captureStream = stream;
-          const video = document.createElement("video");
-          video.muted = true;
-          video.playsInline = true;
-          video.srcObject = stream;
-          // Watchdog so a hung camera never blocks the violation report.
-          const failTimer = window.setTimeout(function () {
-            window.clearTimeout(failTimer);
-            finish(null);
-          }, 1500);
-          video.addEventListener("loadedmetadata", function () {
-            video.play().catch(function () {});
-            // Give the sensor a frame or two to deliver pixels, then draw.
-            window.setTimeout(function () {
-              window.clearTimeout(failTimer);
-              try {
-                const canvas = document.createElement("canvas");
-                canvas.width = 320;
-                canvas.height = 240;
-                canvas.getContext("2d").drawImage(video, 0, 0, 320, 240);
-                finish(canvas.toDataURL("image/jpeg", 0.4));
-              } catch (err) {
-                finish(null);
-              }
-            }, 350);
-          });
+          drawFrame(stream);
         })
         .catch(function () { finish(null); });
     } catch (err) {
@@ -390,13 +661,14 @@
 
     const isDevtoolsKey =
       e.key === "F12" ||
-      (ctrl && e.shiftKey && (key === "i" || key === "j" || key === "c" || key === "k")) ||
+      (ctrl && e.shiftKey && (key === "i" || key === "j" || key === "c" || key === "e" || key === "k")) ||
       (ctrl && (key === "u" || key === "s" || key === "p")) ||
       (e.key === "F5" || (ctrl && key === "r"));
     const isClipboardKey = ctrl && (key === "c" || key === "x" || key === "v");
+    const isSelectAllKey = ctrl && key === "a";
     const isFullscreenToggle = e.key === "F11";
 
-    if (isDevtoolsKey || isClipboardKey || isFullscreenToggle) {
+    if (isDevtoolsKey || isClipboardKey || isSelectAllKey || isFullscreenToggle) {
       e.preventDefault();
       e.stopPropagation();
       if (!submitting && !submitted && !e.repeat) {
@@ -404,13 +676,103 @@
           ? "Developer tools / save / print / refresh shortcut"
           : isFullscreenToggle
             ? "Fullscreen toggle shortcut"
-            : "Clipboard shortcut";
+            : isSelectAllKey
+              ? "Text selection (Select All) shortcut"
+              : "Clipboard shortcut";
         reportViolation("devtools_shortcut", what + " blocked: " + e.key);
       }
       return false;
     }
     return true;
   });
+
+  // -------------------------- DevTools detection --------------------------
+  // Two independent heuristics catch the browser's developer tools while the
+  // exam is active. Either one firing reports a `devtools_detected` strike
+  // through the normal violation pipeline (server-authoritative count,
+  // on-screen warning modal, and a hard auto-submit at the threshold):
+  //   1. Window-size discrepancy: docked devtools shrink innerWidth/Height
+  //      while outerWidth/Height stay the same, so the outer-inner delta grows
+  //      by ~100px+. A normal window resize keeps that delta roughly constant.
+  //   2. `debugger` probe: with devtools attached and breakpoints active, a
+  //      `debugger;` statement pauses execution, making the measured round-trip
+  //      time far exceed the sub-millisecond cost when devtools is closed.
+  const DEVTOOLS_POLL_MS = 2000;
+  const DEVTOOLS_DELTA_THRESHOLD = 100;
+  const DEVTOOLS_DEBUGGER_THRESHOLD_MS = 120;
+  const DEVTOOLS_REARM_MS = 5000;
+  let devtoolsInterval = null;
+  let devtoolsOpen = false;
+  let baselineOuterInnerDelta = null;
+
+  function measureOuterInnerDelta() {
+    let w = 0;
+    let h = 0;
+    if (typeof window.outerWidth === "number" && typeof window.innerWidth === "number") {
+      w = Math.max(0, window.outerWidth - window.innerWidth);
+    }
+    if (typeof window.outerHeight === "number" && typeof window.innerHeight === "number") {
+      h = Math.max(0, window.outerHeight - window.innerHeight);
+    }
+    return { w: w, h: h };
+  }
+
+  function debuggerProbe() {
+    const start = performance.now();
+    try {
+      (function () { debugger; })();
+    } catch (err) {
+      // Some browsers treat the statement as a no-op — never crash on it.
+    }
+    return performance.now() - start;
+  }
+
+  function checkDevTools() {
+    if (submitting || submitted || redirectScheduled) return;
+    if (devtoolsOpen) return; // already struck for the current open session
+
+    // 1) Window-size discrepancy (catches docked devtools).
+    if (baselineOuterInnerDelta !== null) {
+      const delta = measureOuterInnerDelta();
+      const grew =
+        delta.w - baselineOuterInnerDelta.w >= DEVTOOLS_DELTA_THRESHOLD ||
+        delta.h - baselineOuterInnerDelta.h >= DEVTOOLS_DELTA_THRESHOLD;
+      if (grew) {
+        triggerDevToolsStrike();
+        return;
+      }
+    }
+
+    // 2) debugger probe (catches undocked / remote devtools); near-instant
+    //    while devtools is closed.
+    if (debuggerProbe() > DEVTOOLS_DEBUGGER_THRESHOLD_MS) {
+      triggerDevToolsStrike();
+    }
+  }
+
+  function triggerDevToolsStrike() {
+    if (submitting || submitted || redirectScheduled) return;
+    if (devtoolsOpen) return;
+    devtoolsOpen = true;
+    reportViolation(
+      "devtools_detected",
+      "Developer tools detected (window size discrepancy / debugger probe)"
+    );
+    // Re-arm after a few seconds so KEEPING devtools open accrues further
+    // strikes (and eventually the hard auto-submit), while an incidental blip
+    // is counted only once.
+    window.setTimeout(function () {
+      if (!submitting && !submitted && !redirectScheduled) devtoolsOpen = false;
+    }, DEVTOOLS_REARM_MS);
+  }
+
+  // Begins the detection loop exactly when the exam starts (after the camera
+  // gate) and is a no-op thereafter, so no strikes are possible pre-exam.
+  function startDevToolsDetection() {
+    if (devtoolsInterval) return;
+    baselineOuterInnerDelta = measureOuterInnerDelta();
+    devtoolsInterval = window.setInterval(checkDevTools, DEVTOOLS_POLL_MS);
+  }
 
   // On first paint: enforce fullscreen best-effort and, if the browser
   // supports it but the user hasn't entered yet, block the page behind the
@@ -672,22 +1034,21 @@
   submitBtn.addEventListener("click", () => submitExam(false));
 
 // --------------------------- Init ------------------------------
-  renderQuestion(0);
-  startLockdown(); // enforce fullscreen + block re-entry to non-fullscreen mode
-
-  // Anti-cheating: if this attempt was already flagged server-side (3rd
-  // violation landed while the student was away, or after a page refresh),
-  // force-submit immediately and redirect to the results page.
+  // The exam NEVER auto-starts on load: a blocking camera-verification gate
+  // runs first, and the timer/questions stay locked until a live video stream
+  // is verified and the student clicks "Start Exam". The only exceptions are
+  // server-side terminal states (already flagged, or deadline already passed),
+  // which must be honored immediately regardless of camera availability.
   if (cfg.flagged || (violationCount >= MAX_VIOLATIONS)) {
     timerEl.textContent = "00:00";
     timerEl.classList.add("time-up");
     forceSubmitExam();
-  } else if (computeRemaining() <= 0) {
+  } else if (cfg.deadlineUnix && computeRemaining() <= 0) {
     timerEl.textContent = "00:00";
     timerEl.classList.add("time-up");
     submitExam(true); // deadline already passed -> submit immediately
   } else {
-    startTimer();
+    initCameraGate();
   }
 })();
 
