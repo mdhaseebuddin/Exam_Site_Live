@@ -74,6 +74,31 @@
   <div class="container" id="resultBox" style="display:none;"></div>
 
   <!-- ===== Anti-cheating / browser-lockdown UI ===== -->
+  <!-- Camera-verification gate: the exam stays fully BLOCKED until a live
+       webcam stream is established. Shown on every load (including refreshes)
+       so a student can never skip the proctor check. The Start Exam button is
+       disabled until a stream with real video frames is confirmed. -->
+  <div id="cameraGateOverlay" class="violation-overlay" style="display:none;" role="alertdialog" aria-modal="true" aria-labelledby="cameraGateTitle">
+    <div class="violation-modal">
+      <div class="violation-modal-header">
+        <span class="violation-warning-icon">📷</span>
+        <span id="cameraGateTitle">Camera Check Required</span>
+      </div>
+      <div class="violation-modal-body">
+        <p>This exam is proctored. You must allow camera access and connect a
+           working webcam before the exam can start. The exam stays locked
+           until a live video feed is detected.</p>
+        <video id="cameraPreview" class="camera-preview" autoplay muted playsinline style="display:none;"></video>
+        <p id="cameraGateStatus" class="mb-1">Requesting camera access…</p>
+        <p id="cameraGateError" class="violation-modal-count camera-gate-error"></p>
+      </div>
+      <div class="violation-modal-footer">
+        <button id="cameraRetryBtn" type="button" class="btn btn-outline-secondary w-100 mb-2" style="display:none;">🔄 Try Again</button>
+        <button id="cameraStartBtn" type="button" class="btn btn-success w-100" disabled>Start Exam →</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Strict warning modal: shown for the first (threshold - 1) violations. -->
   <div id="violationModal" class="violation-overlay" style="display:none;" role="alertdialog" aria-modal="true" aria-labelledby="violationModalTitle">
     <div class="violation-modal">

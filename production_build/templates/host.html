@@ -40,6 +40,8 @@
       <div class="alert alert-warning">⚠️ Time and ratio must be positive whole numbers.</div>
     {% elif request.args.get('error') == 'must_agree' %}
       <div class="alert alert-warning">⚠️ You must check the "I Agree to the Terms & Privacy Policy" box before generating an exam session.</div>
+    {% elif request.args.get('error') == 'clear_failed' %}
+      <div class="alert alert-warning">⚠️ Could not clear submissions. No exam data was changed — please try again. If the problem persists, contact the administrator.</div>
     {% endif %}
 
     <!-- ================= Host-Only Informational Notice ================= -->

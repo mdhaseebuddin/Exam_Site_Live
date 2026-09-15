@@ -576,6 +576,25 @@ code, .question-text, .cf-label, .student-info-value, a, .card-text {
   background: #b45309;
 }
 
+/* Camera-verification gate (exam page): live webcam preview + error state. */
+.camera-preview {
+  display: block;
+  width: 100%;
+  max-height: 260px;
+  border-radius: 10px;
+  border: 2px solid #dee2e6;
+  background: #000000;
+  object-fit: cover;
+  margin-bottom: 0.75rem;
+}
+
+.camera-gate-error {
+  display: none;
+  color: #b02a37;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
 }
 
 /* ===== Registered Students (attempts) table — fully responsive on mobile =====

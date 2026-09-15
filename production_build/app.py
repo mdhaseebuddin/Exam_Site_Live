@@ -2159,33 +2159,62 @@ def clear_submissions():
 audited server-side.
     """
     # Per-host isolation: only clear THIS host's exam sessions and their
-    # child records (answers, session_questions, students). Other hosts'
-    # data is never touched.
+    # child records (answers, session_questions, students, exam_violations).
+    # Other hosts' data is never touched.
     host_email = _current_host_email()
     if not host_email:
         return redirect(url_for("host_login"))
 
     my_sessions = [s.id for s in Session.query.filter_by(host_email=host_email).all()]
 
-    # Order matters: children must be deleted before parents.
+    # Order matters: children must be deleted before parents. exam_violations
+    # (the anti-cheating proctoring records) also FK-reference sessions and
+    # MUST be cleared too. Bulk Query.delete() bypasses ORM relationship
+    # cascades, so without this explicit delete the final DELETE on sessions
+    # would violate the foreign key constraint and raise a 500 as soon as any
+    # attempt has recorded a violation (PostgreSQL always enforces FKs; this
+    # local SQLite pool enables PRAGMA foreign_keys=ON).
     n_answers = 0
     n_session_questions = 0
+    n_violations = 0
     n_students = 0
     n_sessions = 0
-    if my_sessions:
-        n_answers = Answer.query.filter(Answer.session_id.in_(my_sessions)).delete(synchronize_session=False)
-        n_session_questions = SessionQuestion.query.filter(
-            SessionQuestion.session_id.in_(my_sessions)
-        ).delete(synchronize_session=False)
-        n_students = Student.query.filter(Student.session_id.in_(my_sessions)).delete(synchronize_session=False)
-        n_sessions = Session.query.filter(Session.id.in_(my_sessions)).delete(synchronize_session=False)
-        # Commit the bulk delete so the reset actually takes effect. Without an
-        # explicit commit here the ORM would silently roll back the deletions at
-        # request teardown, turning "Clear Exam Data" into a no-op.
-        db.session.commit()
-    else:
-        n_sessions = 0
-        db.session.commit()
+
+    try:
+        if my_sessions:
+            n_answers = Answer.query.filter(Answer.session_id.in_(my_sessions)).delete(synchronize_session=False)
+            n_session_questions = SessionQuestion.query.filter(
+                SessionQuestion.session_id.in_(my_sessions)
+            ).delete(synchronize_session=False)
+            n_violations = ExamViolation.query.filter(
+                ExamViolation.session_id.in_(my_sessions)
+            ).delete(synchronize_session=False)
+            n_students = Student.query.filter(Student.session_id.in_(my_sessions)).delete(synchronize_session=False)
+            n_sessions = Session.query.filter(Session.id.in_(my_sessions)).delete(synchronize_session=False)
+            # Commit the bulk delete so the reset actually takes effect. Without
+            # an explicit commit here the ORM would silently roll back the
+            # deletions at request teardown, turning "Clear Exam Data" into a
+            # no-op.
+            db.session.commit()
+        else:
+            db.session.commit()
+    except Exception:
+        # A failed reset must never surface as a raw 500: roll back the
+        # incomplete transaction so nothing is half-deleted, and send the host
+        # back to the dashboard with a friendly error message.
+        db.session.rollback()
+        audit(
+            "submissions_clear_failed",
+            host_email=host_email,
+            answers=n_answers,
+            session_questions=n_session_questions,
+            students=n_students,
+            sessions=n_sessions,
+            violations=n_violations,
+            error=traceback.format_exc()[-600:],
+            ip=get_remote_address(),
+        )
+        return redirect(url_for("host", error="clear_failed"))
 
     # The destructive action is audited server-side regardless of outcome.
     audit(
@@ -2195,6 +2224,7 @@ audited server-side.
         session_questions=n_session_questions,
         students=n_students,
         sessions=n_sessions,
+        violations=n_violations,
         ip=get_remote_address(),
     )
 
@@ -2957,25 +2987,28 @@ def exam(session_id):
             return redirect(url_for("exam_register", exam_id=s.exam_id))
         return redirect(url_for("register", session_id=session_id))
 
-    # First visit: start the clock and persist a server-side deadline so the
-    # countdown survives page refreshes (a refresh cannot reset the timer).
+    time_limit_minutes = int((s.config or {}).get("time_limit_minutes", 30) or 30)
+
+    # The exam clock is NOT started on page load. The exam page runs a blocking
+    # camera-verification gate first; only after a live webcam stream is
+    # verified does the client call POST /exam/<session_id>/start, which sets
+    # started_at / deadline / status and starts the official countdown. This
+    # keeps time spent granting camera permission out of the student's exam
+    # budget. Once started, the deadline is persisted server-side so a page
+    # refresh can never reset or extend the timer.
     now = datetime.now(timezone.utc)
-    if s.started_at is None:
-        s.started_at = now.isoformat()
-        s.deadline = (
-            now + timedelta(minutes=s.config["time_limit_minutes"])
-        ).isoformat()
-        s.status = "started"
-        db.session.commit()
-
-    deadline = datetime.fromisoformat(s.deadline)
-    remaining_seconds = max(0, int((deadline - now).total_seconds()))
-
-    # Server-anchored timeline (both UTC Unix timestamps). The client timer is
-    # driven by these absolute values + periodic re-sync from the server, so a
-    # user changing their system clock or refreshing the page CANNOT extend time.
-    deadline_unix = int(deadline.timestamp())
-    server_now_unix = int(now.timestamp())
+    if s.started_at is not None:
+        deadline = datetime.fromisoformat(s.deadline)
+        remaining_seconds = max(0, int((deadline - now).total_seconds()))
+        deadline_unix = int(deadline.timestamp())
+        server_now_unix = int(now.timestamp())
+    else:
+        # Not started yet: send the full limit as the remaining time and a
+        # sentinel deadline_unix of 0 so the client knows to call /start after
+        # the camera check instead of starting the countdown.
+        remaining_seconds = time_limit_minutes * 60
+        deadline_unix = 0
+        server_now_unix = int(now.timestamp())
 
     # Security: NEVER send the correct answers to the client. The exam page
     # only receives question text + options; grading happens server-side.
@@ -3008,7 +3041,7 @@ def exam(session_id):
         remaining_seconds=remaining_seconds,
         deadline_unix=deadline_unix,
         server_now_unix=server_now_unix,
-        time_limit_minutes=s.config["time_limit_minutes"],
+        time_limit_minutes=time_limit_minutes,
         student=student_to_dict(s.student) if s.student else None,
         required_fields=required_fields,
         custom_registration_fields=custom_registration_fields,
@@ -3019,6 +3052,47 @@ def exam(session_id):
         violation_threshold=MAX_VIOLATIONS,
         violation_count=s.violation_count or 0,
         flagged=bool(s.flagged),
+    )
+
+
+@app.route("/exam/<session_id>/start", methods=["POST"])
+@limiter.limit("10000 per minute", methods=["POST"])
+def start_exam(session_id):
+    """Start the official exam countdown.
+
+    Called by the client ONLY after the blocking camera-verification gate has
+    confirmed a live webcam stream. Starting the clock here — instead of on
+    the first page load — means the time a student spends granting camera
+    access is never charged against their exam time. Idempotent: a session
+    whose clock is already running simply returns its existing deadline.
+    """
+    s = db.session.get(Session, session_id)
+    if s is None:
+        return jsonify({"error": "invalid session"}), 400
+    if s.status == "completed":
+        return jsonify({"error": "exam already completed"}), 400
+    if not session.get(f"auth_{session_id}"):
+        return jsonify({"error": "unauthorized"}), 403
+    if s.student is None:
+        return jsonify({"error": "session not registered"}), 400
+
+    now = datetime.now(timezone.utc)
+    if s.started_at is None:
+        s.started_at = now.isoformat()
+        s.deadline = (
+            now
+            + timedelta(minutes=int((s.config or {}).get("time_limit_minutes", 30) or 30))
+        ).isoformat()
+        s.status = "started"
+        db.session.commit()
+        audit("exam_started", session_id=session_id, ip=get_remote_address())
+
+    deadline = datetime.fromisoformat(s.deadline)
+    return jsonify(
+        {
+            "deadline_unix": int(deadline.timestamp()),
+            "server_now_unix": int(now.timestamp()),
+        }
     )
 
 
@@ -3568,6 +3642,16 @@ def _submit_exam(session_id):
     if s is None:
         return jsonify({"error": "invalid or already submitted"}), 400
     max_cap = session_max_capacity(s)
+
+    # A session whose clock was never started (the camera-verification gate /
+    # POST /start never ran) cannot be submitted — the exam must begin first.
+    if s.started_at is None:
+        audit(
+            "submit_rejected_not_started",
+            session_id=session_id,
+            ip=get_remote_address(),
+        )
+        return jsonify({"error": "The exam has not started yet."}), 400
 
     # ---- DEADLINE ENFORCEMENT (server-side, tamper-proof) ----------------
     # The exam's absolute UTC deadline is stored on the server (in the DB),
