@@ -417,7 +417,7 @@ def init_db() -> None:
         # Student.agreed_to_policy / agreed_at (back-fill for older DBs)
         stu_cols = [c["name"] for c in insp.get_columns("students")]
         if "agreed_to_policy" not in stu_cols:
-            db.session.execute(text("ALTER TABLE students ADD COLUMN agreed_to_policy BOOLEAN NOT NULL DEFAULT 0"))
+            db.session.execute(text("ALTER TABLE students ADD COLUMN agreed_to_policy BOOLEAN NOT NULL DEFAULT FALSE"))
         if "agreed_at" not in stu_cols:
             db.session.execute(text("ALTER TABLE students ADD COLUMN agreed_at VARCHAR(64)"))
         # Student.email (email verification OTP for student registration)
@@ -432,12 +432,12 @@ def init_db() -> None:
             )
         if "flagged" not in sess_cols:
             db.session.execute(
-                text("ALTER TABLE sessions ADD COLUMN flagged BOOLEAN NOT NULL DEFAULT 0")
+                text("ALTER TABLE sessions ADD COLUMN flagged BOOLEAN NOT NULL DEFAULT FALSE")
             )
         # Session.auto_submitted (submission forced by the 3-strike threshold)
         if "auto_submitted" not in sess_cols:
             db.session.execute(
-                text("ALTER TABLE sessions ADD COLUMN auto_submitted BOOLEAN NOT NULL DEFAULT 0")
+                text("ALTER TABLE sessions ADD COLUMN auto_submitted BOOLEAN NOT NULL DEFAULT FALSE")
             )
         # ExamViolation.snapshot (proctoring proof image captured at strike time)
         viol_cols = [c["name"] for c in insp.get_columns("exam_violations")]
