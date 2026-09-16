@@ -11,6 +11,10 @@
 
   let currentIndex = 0;
   let timerInterval = null;
+  // Handle for the 30s server-time re-sync poll (started together with the
+  // countdown) so it can be cleared alongside every other interval the moment
+  // the exam is submitted.
+  let serverSyncInterval = null;
   // Server-anchored timeline (absolute UTC Unix timestamps). The countdown is
   // ALWAYS derived from (deadline - serverNow), so the user's system clock and
   // page refreshes can never extend the exam.
@@ -26,11 +30,18 @@
   let submitted = false;
 
   // ---- Anti-cheating / browser-lockdown state -------------------------------
+  // Host-controlled proctoring policy (from the Exam's settings, injected as
+  // `enableProctoring` / `maxViolations`). When proctoring is DISABLED the
+  // student takes the exam normally: no camera gate, no tab/shortcut/DevTools
+  // lockdown, no face monitoring, and no strike counting — the server also
+  // treats any violation reports as a no-op, so this flag must mirror that.
+  const PROCTORING_ENABLED = cfg.enableProctoring !== false;
   // The violation threshold and current tally are SERVER-authoritative: the
   // page receives the persisted count (cfg.violationCount) so a page refresh
   // can never reset a student's violation tally. The server re-anchors it via
-  // the /time and /violation endpoints.
-  const MAX_VIOLATIONS = cfg.violationThreshold || 3;
+  // the /time and /violation endpoints. The threshold is the HOST-configured
+  // per-exam max_violations (e.g. 3 or 5), not a hardcoded constant.
+  const MAX_VIOLATIONS = cfg.maxViolations || cfg.violationThreshold || 3;
   let violationCount = cfg.violationCount || 0;
   // True once (a) the server confirms the threshold, (b) the local tally hits
   // it, or (c) the server reports the attempt flagged. The exam is then
@@ -78,6 +89,45 @@
     if (violationOverlay) violationOverlay.style.display = "none";
     if (fullscreenBlockOverlay) fullscreenBlockOverlay.style.display = "none";
     if (forceSubmitOverlay) forceSubmitOverlay.style.display = "none";
+  }
+
+  // Tears down EVERYTHING media/proctoring related the moment a submission is
+  // triggered, so the webcam hardware light turns off immediately and nothing
+  // keeps polling the camera, DevTools detection or the server afterwards.
+  // Idempotent — safe to call from both the manual submit handler and the
+  // forced (violation) auto-submit path, in any order.
+  function teardownExamMedia() {
+    // 1) Stop every active media track (turns the camera light off now, not
+    //    after the fetch) and detach the stream from every <video> element.
+    stopCaptureStream();
+    if (cameraPreview) {
+      cameraPreview.style.display = "none";
+      cameraPreview.srcObject = null;
+    }
+    if (faceMonitorVideo) {
+      faceMonitorVideo.srcObject = null;
+    }
+    // 2) Clear the countdown and every proctoring poll interval.
+    if (timerInterval) {
+      window.clearInterval(timerInterval);
+      timerInterval = null;
+    }
+    if (serverSyncInterval) {
+      window.clearInterval(serverSyncInterval);
+      serverSyncInterval = null;
+    }
+    if (faceMonitorInterval) {
+      window.clearInterval(faceMonitorInterval);
+      faceMonitorInterval = null;
+    }
+    if (devtoolsInterval) {
+      window.clearInterval(devtoolsInterval);
+      devtoolsInterval = null;
+    }
+    // 3) Hide the camera preview and every lingering proctoring overlay so
+    //    only the "Thank You" result screen remains visible.
+    hideViolationOverlays();
+    if (cameraGateOverlay) cameraGateOverlay.style.display = "none";
   }
 
   // ---------------------------- Camera gate -------------------------------
@@ -225,6 +275,35 @@
     }
   }
 
+  // Re-acquires the webcam AFTER a FAILED submission attempt (best-effort and
+  // silent): permission was already granted at the camera gate, so this only
+  // repopulates `captureStream` and resumes the face monitor — no gate UI is
+  // shown and the camera preview stays hidden. Degrades gracefully when the
+  // camera is unavailable (the exam can still be retried and submitted).
+  function acquireCameraStream() {
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.mediaDevices ||
+      !navigator.mediaDevices.getUserMedia
+    ) {
+      return;
+    }
+    try {
+      navigator.mediaDevices.getUserMedia(
+        { video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false }
+      )
+        .then(function (stream) {
+          captureStream = stream;
+          startFaceMonitor(); // stream is live again -> resume face checks
+        })
+        .catch(function () {
+          captureStream = null; // camera busy / denied -> monitor stays off
+        });
+    } catch (err) {
+      captureStream = null;
+    }
+  }
+
   // -------------------------- Fullscreen enforcement ---------------------
   function supportsFullscreen() {
     return !!(document.documentElement.requestFullscreen ||
@@ -271,12 +350,15 @@
   // Re-enter fullscreen on ANY user gesture (capture phase) while the exam is
   // active. This is the workhorse that makes exiting fullscreen hard: even if
   // Esc / F11 kicks the student out, the very next click puts them back in.
-  document.addEventListener("click", function () {
-    if (!submitting && !submitted && !redirectScheduled) requestFullscreen();
-  }, true);
-  document.addEventListener("keydown", function () {
-    if (!submitting && !submitted && !redirectScheduled) requestFullscreen();
-  }, true);
+  // Proctoring-only: unproctored exams never force fullscreen.
+  if (PROCTORING_ENABLED) {
+    document.addEventListener("click", function () {
+      if (!submitting && !submitted && !redirectScheduled) requestFullscreen();
+    }, true);
+    document.addEventListener("keydown", function () {
+      if (!submitting && !submitted && !redirectScheduled) requestFullscreen();
+    }, true);
+  }
 
   function onFullscreenChange() {
     if (submitting || submitted || redirectScheduled) return;
@@ -290,10 +372,12 @@
       fullscreenBlockOverlay.style.display = "none";
     }
   }
-  document.addEventListener("fullscreenchange", onFullscreenChange);
-  document.addEventListener("webkitfullscreenchange", onFullscreenChange);
-  document.addEventListener("mozfullscreenchange", onFullscreenChange);
-  document.addEventListener("MSFullscreenChange", onFullscreenChange);
+  if (PROCTORING_ENABLED) {
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", onFullscreenChange);
+    document.addEventListener("mozfullscreenchange", onFullscreenChange);
+    document.addEventListener("MSFullscreenChange", onFullscreenChange);
+  }
 
   if (fullscreenRetryBtn) {
     fullscreenRetryBtn.addEventListener("click", function () {
@@ -331,7 +415,11 @@
   // the server-anchored deadline (so time at the camera gate never counts
   // against the student) and then launches the exam.
   function beginExam() {
-    if (!cameraVerified || examStarted) return;
+    // Unproctored exams have no camera gate: the init path calls this directly
+    // and the clock starts right away. In proctored exams the Start Exam
+    // button may only call this after a live camera stream was verified.
+    if (examStarted) return;
+    if (PROCTORING_ENABLED && !cameraVerified) return;
     examStarted = true;
     requestStartClock();
   }
@@ -371,12 +459,18 @@
 
   function startClockFailed() {
     examStarted = false;
-    setCameraGateState(
-      "\u26a0\ufe0f Could not start the exam.",
-      "The exam server could not be reached, so the clock could not be started. Check your connection and press Start Exam to try again."
-    );
-    if (cameraGateOverlay) cameraGateOverlay.style.display = "flex";
-    if (cameraStartBtn) cameraStartBtn.disabled = false;
+    if (PROCTORING_ENABLED) {
+      setCameraGateState(
+        "\u26a0\ufe0f Could not start the exam.",
+        "The exam server could not be reached, so the clock could not be started. Check your connection and press Start Exam to try again."
+      );
+      if (cameraGateOverlay) cameraGateOverlay.style.display = "flex";
+      if (cameraStartBtn) cameraStartBtn.disabled = false;
+    } else {
+      // Unproctored exams have no gate UI to retry from, so silently retry the
+      // start once the network recovers — the student keeps a normal exam page.
+      window.setTimeout(beginExam, 2000);
+    }
   }
 
   function launchExam() {
@@ -385,14 +479,21 @@
     if (prevBtn) prevBtn.disabled = false;
     if (nextBtn) nextBtn.disabled = false;
     renderQuestion(0);
-    startLockdown(); // enforce fullscreen + block re-entry to non-fullscreen mode
-    startDevToolsDetection(); // monitor window-size / debugger probes for devtools
-    startFaceMonitor(); // continuous out-of-frame / face-absence monitoring
 
-    // Anti-cheating: if this attempt was already flagged server-side (3rd
+    // Proctoring suite — skipped entirely for unproctored exams so the
+    // student takes the exam normally (no fullscreen enforcement, no DevTools
+    // probing, no face-absence monitoring).
+    if (PROCTORING_ENABLED) {
+      startLockdown(); // enforce fullscreen + block re-entry to non-fullscreen mode
+      startDevToolsDetection(); // monitor window-size / debugger probes for devtools
+      startFaceMonitor(); // continuous out-of-frame / face-absence monitoring
+    }
+
+    // Anti-cheating: if this attempt was already flagged server-side (final
     // violation landed while the student was away, or after a page refresh),
-    // force-submit immediately and redirect to the results page.
-    if (cfg.flagged || (violationCount >= MAX_VIOLATIONS)) {
+    // force-submit immediately and redirect to the results page. This only
+    // applies to proctored exams — an unproctored attempt can never be flagged.
+    if (cfg.flagged || (PROCTORING_ENABLED && violationCount >= MAX_VIOLATIONS)) {
       timerEl.textContent = "00:00";
       timerEl.classList.add("time-up");
       forceSubmitExam();
@@ -612,6 +713,9 @@
   }
 
   function reportViolation(type, detail) {
+    // Unproctored exams have no strike counting at all (the server also
+    // ignores any reports), so nothing to report here.
+    if (!PROCTORING_ENABLED) return;
     // Once a submission is underway, stop counting incidents.
     if (submitting || submitted || redirectScheduled) return;
 
@@ -667,7 +771,8 @@
   function handleViolationResult(data) {
     if (submitting || submitted) return;
     // Server confirmed the threshold (or we hit it locally) -> force submit.
-    if ((data && data.auto_submit) || violationCount >= MAX_VIOLATIONS) {
+    if ((data && data.auto_submit) ||
+        (PROCTORING_ENABLED && violationCount >= MAX_VIOLATIONS)) {
       forceSubmitExam();
       return;
     }
@@ -720,7 +825,11 @@
   function forceSubmitExam() {
     if (submitted || redirectScheduled) return;
     forcedSubmitRequested = true;
-    hideViolationOverlays();
+    // Stop the webcam + clear every proctoring interval IMMEDIATELY, before
+    // any fetch — the camera light must go off the moment a forced submit is
+    // triggered (the submission either succeeds, or the flagged page redirect
+    // and force-submits on reload; either way the camera is already off).
+    teardownExamMedia();
     if (forceSubmitOverlay) {
       forceSubmitOverlay.style.display = "flex";
       if (forceSubmitText) {
@@ -734,6 +843,10 @@
   }
 
   // -------------------------- Tab / focus detection ----------------------
+  // Tab-switch / focus-loss / clipboard / right-click / keyboard-shortcut
+  // lockdown is part of the PROCTORING suite — never installed for unproctored
+  // exams, where the student browses and switches tabs normally.
+  if (PROCTORING_ENABLED) {
   function onVisibilityChange() {
     if (document.hidden) {
       focusLost = true;
@@ -815,6 +928,7 @@
     }
     return true;
   });
+  } // end of PROCTORING_ENABLED lockdown listeners
 
   // -------------------------- DevTools detection --------------------------
   // Two independent heuristics catch the browser's developer tools while the
@@ -942,16 +1056,18 @@
           renderTimer();
         }
         // Re-anchor the violation tally from the server too — a page refresh
-        // or a lost network report can never reset it.
-        if (data && typeof data.violation_count === "number") {
+        // or a lost network report can never reset it. Only meaningful while
+        // proctoring is enabled (unproctored exams never accrue strikes).
+        if (PROCTORING_ENABLED && data && typeof data.violation_count === "number") {
           violationCount = Math.max(violationCount, data.violation_count);
           if (violationCount >= MAX_VIOLATIONS && !submitted) {
             forceSubmitExam();
           }
         }
         // If the server flagged the attempt while the student was away, stop
-        // the exam immediately.
-        if (data && data.flagged && !submitted) {
+        // the exam immediately. Also proctoring-only (a flagged attempt is the
+        // terminal outcome of the strike threshold).
+        if (PROCTORING_ENABLED && data && data.flagged && !submitted) {
           forceSubmitExam();
         }
       })
@@ -982,8 +1098,9 @@
       renderTimer();
     }, 1000);
     // Periodically re-sync the true server time (corrects drift and any
-    // attempt to pause the browser tab from gaining extra time).
-    setInterval(syncFromServer, 30000);
+    // attempt to pause the browser tab from gaining extra time). The handle is
+    // kept so it can be cleared together with the countdown on submission.
+    serverSyncInterval = setInterval(syncFromServer, 30000);
   }
 
   // ------------------------- Rendering ---------------------------
@@ -1064,6 +1181,32 @@
   });
 
   // ---------------------------- Submit ---------------------------
+  // Rebuilds the countdown ticker + server-time sync and, for proctored exams,
+  // the DevTools + face monitors AFTER a FAILED submission attempt, so the
+  // student keeps a correctly-timed, fully-monitored exam while they retry.
+  // The webcam is re-acquired silently (permission was granted at the gate).
+  function resumeExamAfterFailedSubmit() {
+    if (submitted || redirectScheduled) return;
+
+    if (!timerInterval) {
+      timerInterval = setInterval(() => {
+        serverNowUnix += 1;
+        renderTimer();
+      }, 1000);
+    }
+    if (!serverSyncInterval) {
+      serverSyncInterval = setInterval(syncFromServer, 30000);
+    }
+    if (PROCTORING_ENABLED) {
+      startDevToolsDetection(); // no camera needed for this one
+      if (captureStream && captureStream.active) {
+        startFaceMonitor();
+      } else {
+        acquireCameraStream(); // repopulates captureStream, then restarts the monitor
+      }
+    }
+  }
+
   async function submitExam(auto) {
     // Never submit more than once (manual + auto, or repeated auto triggers).
     if (submitted || submitting) return;
@@ -1071,8 +1214,12 @@
       const ok = window.confirm("Are you sure you want to submit your test?");
       if (!ok) return;
     }
-    clearInterval(timerInterval);
-    timerInterval = null;
+    // The submission is now TRIGGERED: immediately stop every active media
+    // track (the webcam light goes off NOW, not after the fetch completes),
+    // clear the countdown and all proctoring poll intervals, and hide the
+    // camera preview + overlays. Idempotent, so a forced auto-submit that
+    // reaches this same handler tears nothing down twice.
+    teardownExamMedia();
     submitBtn.disabled = true;
     submitBtn.textContent = "Submitting...";
     submitting = true;
@@ -1121,7 +1268,13 @@
       // and let the flagged exam page retry the submit.
       if (!submitted) {
         if (forcedSubmitRequested) scheduleResultRedirect();
-        else window.alert("Submission failed: " + err.message);
+        else {
+          window.alert("Submission failed: " + err.message);
+          // Restore the countdown + proctoring monitors so an interrupted
+          // submission never leaves the student with a frozen timer or an
+          // unmonitored (camera-off) exam while they retry.
+          resumeExamAfterFailedSubmit();
+        }
       }
     } finally {
       submitting = false;
@@ -1164,12 +1317,17 @@
   submitBtn.addEventListener("click", () => submitExam(false));
 
 // --------------------------- Init ------------------------------
-  // The exam NEVER auto-starts on load: a blocking camera-verification gate
-  // runs first, and the timer/questions stay locked until a live video stream
-  // is verified and the student clicks "Start Exam". The only exceptions are
-  // server-side terminal states (already flagged, or deadline already passed),
-  // which must be honored immediately regardless of camera availability.
-  if (cfg.flagged || (violationCount >= MAX_VIOLATIONS)) {
+  // PROCTORED exams NEVER auto-start on load: a blocking camera-verification
+  // gate runs first, and the timer/questions stay locked until a live video
+  // stream is verified and the student clicks "Start Exam". The only
+  // exceptions are server-side terminal states (already flagged, or deadline
+  // already passed), which must be honored immediately regardless of camera
+  // availability.
+  //
+  // UNPROCTORED exams skip the gate entirely: no camera check runs, no
+  // lockdown is installed, and the clock starts as soon as the page loads so
+  // the student takes the exam like a normal test.
+  if (cfg.flagged || (PROCTORING_ENABLED && violationCount >= MAX_VIOLATIONS)) {
     timerEl.textContent = "00:00";
     timerEl.classList.add("time-up");
     forceSubmitExam();
@@ -1177,8 +1335,10 @@
     timerEl.textContent = "00:00";
     timerEl.classList.add("time-up");
     submitExam(true); // deadline already passed -> submit immediately
-  } else {
+  } else if (PROCTORING_ENABLED) {
     initCameraGate();
+  } else {
+    beginExam(); // no camera gate — start the clock right away
   }
 })();
 

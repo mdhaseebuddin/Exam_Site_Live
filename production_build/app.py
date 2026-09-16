@@ -130,6 +130,26 @@ MAX_VIOLATIONS = int(os.environ.get("MAX_VIOLATIONS", "3"))
 # that still blocks abuse of the column as bulk storage.
 SNAPSHOT_MAX_BYTES = int(os.environ.get("SNAPSHOT_MAX_BYTES", "480000"))
 
+
+def _exam_proctoring_policy(ex):
+    """Resolve the proctoring policy for an Exam -> (enabled, max_violations).
+
+    `ex` may be None (legacy single-session attempt with no parent Exam), in
+    which case the previous global behavior is preserved: proctoring enabled
+    with the env-configured MAX_VIOLATIONS threshold. For a real Exam, the
+    host-configured columns are the single source of truth (falling back to
+    their model defaults if somehow unset).
+    """
+    if ex is None:
+        return True, MAX_VIOLATIONS
+    enabled = ex.enable_proctoring
+    if enabled is None:
+        enabled = True
+    max_violations = ex.max_violations
+    if not max_violations or max_violations < 1:
+        max_violations = MAX_VIOLATIONS
+    return bool(enabled), int(max_violations)
+
 # ---------------------------------------------------------------------------
 # Secrets & configuration — loaded from .env (never from the code itself)
 # ---------------------------------------------------------------------------
@@ -443,6 +463,17 @@ def init_db() -> None:
         viol_cols = [c["name"] for c in insp.get_columns("exam_violations")]
         if "snapshot" not in viol_cols:
             db.session.execute(text("ALTER TABLE exam_violations ADD COLUMN snapshot TEXT"))
+        # Exam.enable_proctoring / Exam.max_violations (host-facing proctoring
+        # policy — pre-existing exams keep the old behavior: proctored, 3 strikes).
+        exam_cols = [c["name"] for c in insp.get_columns("exams")]
+        if "enable_proctoring" not in exam_cols:
+            db.session.execute(
+                text("ALTER TABLE exams ADD COLUMN enable_proctoring BOOLEAN NOT NULL DEFAULT TRUE")
+            )
+        if "max_violations" not in exam_cols:
+            db.session.execute(
+                text("ALTER TABLE exams ADD COLUMN max_violations INTEGER NOT NULL DEFAULT 3")
+            )
         db.session.commit()
 
         # --- Back-fill the durable daily-registration LEDGER from existing
@@ -2428,13 +2459,18 @@ def session_details(session_id):
 
     data = session_to_dict(s)
     cfg = s.config or {}
+    # Per-exam proctoring threshold so the audit gate matches the host's
+    # configured max_violations (falls back to the global default).
+    _proctoring_enabled, max_violations = _exam_proctoring_policy(
+        s.exam if s.exam_id else None
+    )
     return render_template(
         "details.html",
         session=data,
         custom_registration_fields=cfg.get("custom_registration_fields") or [],
         # Anti-cheating: the strict proctoring-audit gate on the details page
         # compares the session's strike count against this server threshold.
-        violation_threshold=MAX_VIOLATIONS,
+        violation_threshold=max_violations,
     )
 
 
@@ -2535,6 +2571,16 @@ def generate_session():
     # The exam capacity is permanently hardcoded to MAX_SUBMISSIONS (500).
     max_capacity = MAX_SUBMISSIONS
 
+    # --- Proctoring policy (host-configurable) ------------------------------
+    # `enable_proctoring` is a standard HTML checkbox (value="1" when checked);
+    # `max_violations` is a small dropdown (3 / 5 / 7 / 10), clamped defensively.
+    enable_proctoring = request.form.get("enable_proctoring") in ("1", "on", "true")
+    try:
+        max_violations = int(request.form.get("max_violations", "3") or 3)
+    except (TypeError, ValueError):
+        max_violations = 3
+    max_violations = max(1, min(10, max_violations))
+
     exam_id = uuid.uuid4().hex[:16]
 
     # ---- Dynamic Form Builder ------------------------------------------
@@ -2572,6 +2618,8 @@ def generate_session():
     ex = Exam(
         id=exam_id,
         host_email=(host_user.email if host_user else None),
+        enable_proctoring=enable_proctoring,
+        max_violations=max_violations,
         config={
             "exam_title": exam_title,
             "time_limit_minutes": time_limit,
@@ -2579,6 +2627,10 @@ def generate_session():
             "max_capacity": max_capacity,
             "custom_registration_fields": custom_registration_fields,
             "required_fields": required_fields,
+            # Host proctoring policy — mirrored into config JSON so session
+            # copies and legacy serializers can read it without changes.
+            "enable_proctoring": enable_proctoring,
+            "max_violations": max_violations,
         },
         created_at=datetime.now(timezone.utc).isoformat(),
     )
@@ -2608,6 +2660,8 @@ def generate_session():
         exam_id=exam_id,
         time_limit=time_limit,
         ratio=ratio,
+        enable_proctoring=enable_proctoring,
+        max_violations=max_violations,
         bank_size=len(bank_questions),
         ip=get_remote_address(),
     )
@@ -2729,6 +2783,10 @@ def exam_register(exam_id):
                     "max_capacity": max_cap,
                     "custom_registration_fields": cfg.get("custom_registration_fields", []),
                     "required_fields": cfg.get("required_fields", DEFAULT_REQUIRED_FIELDS),
+                    # Host proctoring policy copied from the parent Exam so the
+                    # server and the exam page read ONE consistent value.
+                    "enable_proctoring": cfg.get("enable_proctoring", True),
+                    "max_violations": cfg.get("max_violations", 3),
                 },
                 created_at=now.isoformat(),
             )
@@ -3026,6 +3084,12 @@ def exam(session_id):
     # the exam link was generated). Used to dynamically render the student's
     # captured details in the exam header.
     cfg = s.config or {}
+    # Host-configured proctoring policy (from the parent Exam, or the legacy
+    # global default for pre-exam attempts). When disabled, the client skips
+    # the camera gate + lockdown entirely and the student takes a normal exam.
+    proctoring_enabled, max_violations = _exam_proctoring_policy(
+        s.exam if s.exam_id else None
+    )
     required_fields = [
         f
         for f in (cfg.get("required_fields") or DEFAULT_REQUIRED_FIELDS)
@@ -3048,8 +3112,12 @@ def exam(session_id):
         field_labels=REG_FIELD_LABELS,
         # Anti-cheating: server-authoritative violation tally is passed to the
         # client so a page refresh NEVER resets the student's violation count,
-        # and a flagged attempt force-submits immediately on load.
-        violation_threshold=MAX_VIOLATIONS,
+        # and a flagged attempt force-submits immediately on load. The
+        # threshold is the host-configured per-exam max_violations, and the
+        # whole suite is skipped client-side when proctoring is disabled.
+        enable_proctoring=proctoring_enabled,
+        max_violations=max_violations,
+        violation_threshold=max_violations,
         violation_count=s.violation_count or 0,
         flagged=bool(s.flagged),
     )
@@ -3150,16 +3218,21 @@ def exam_time(session_id):
         return jsonify({"error": "invalid deadline"}), 400
 
     now = datetime.now(timezone.utc)
+    # Per-exam proctoring threshold (max_violations) so the client's local
+    # force-submit check matches the host's configured value.
+    _proctoring_enabled, max_violations = _exam_proctoring_policy(
+        s.exam if s.exam_id else None
+    )
     return jsonify(
         {
             "server_now_unix": int(now.timestamp()),
             "deadline_unix": int(deadline.timestamp()),
-            # Anti-cheating: if the attempt has been flagged for 3+ violations
+            # Anti-cheating: if the attempt has been flagged for N+ violations
             # while the student was away, the client force-submits immediately
             # on the next poll instead of letting them keep working.
             "flagged": bool(s.flagged),
             "violation_count": s.violation_count or 0,
-            "violation_threshold": MAX_VIOLATIONS,
+            "violation_threshold": max_violations,
         }
     )
 
@@ -3178,16 +3251,41 @@ def exam_violation(session_id):
     The server is the single source of truth for the violation tally:
       * It appends one ExamViolation row per incident (type + timestamp).
       * It increments the session's violation_count in the same transaction.
-      * When the count reaches MAX_VIOLATIONS the session is flagged; the
-        client receives `auto_submit: true` and triggers a forced final
-        submission, and any later return to the exam page force-submits too.
+      * When the count reaches the host-configured max_violations the session
+        is flagged; the client receives `auto_submit: true` and triggers a
+        forced final submission, and any later return to the exam page
+        force-submits too.
 
     A page refresh or a tampered client that suppresses reporting can NEVER
     reset the counter, because it lives here on the server.
+
+    For exams created with proctoring DISABLED this endpoint is a no-op (OK,
+    no strike recorded, never flags) — the student takes the exam normally
+    and the host's override is honored server-side.
     """
     s = db.session.get(Session, session_id)
     if s is None or s.status != "started":
         return jsonify({"error": "invalid session"}), 400
+
+    # Host-configured proctoring policy. If the exam is NOT proctored, no
+    # strikes are ever recorded or counted: a tampered/legacy client posting a
+    # violation report gets a no-op OK (never the auto-submit trigger), and the
+    # session can never be flagged. This mirrors the client-side behavior where
+    # the whole anti-cheating module is skipped for unproctored exams.
+    proctoring_enabled, max_violations = _exam_proctoring_policy(
+        s.exam if s.exam_id else None
+    )
+    if not proctoring_enabled:
+        return jsonify(
+            {
+                "ok": True,
+                "proctoring": False,
+                "count": s.violation_count or 0,
+                "threshold": max_violations,
+                "auto_submit": False,
+                "flagged": False,
+            }
+        )
 
     payload = request.get_json(silent=True) or {}
     vtype = str(payload.get("type", "")).strip() or "unknown"
@@ -3211,7 +3309,7 @@ def exam_violation(session_id):
 
     s.violation_count = (s.violation_count or 0) + 1
     count = s.violation_count
-    if count >= MAX_VIOLATIONS:
+    if count >= max_violations:
         s.flagged = True
     db.session.add(
         ExamViolation(
@@ -3235,11 +3333,11 @@ def exam_violation(session_id):
         ip=get_remote_address(),
     )
 
-    auto_submit = count >= MAX_VIOLATIONS
+    auto_submit = count >= max_violations
     response = {
         "ok": True,
         "count": count,
-        "threshold": MAX_VIOLATIONS,
+        "threshold": max_violations,
         "auto_submit": auto_submit,
         "flagged": auto_submit,
     }

@@ -73,6 +73,7 @@
   <!-- Result is injected here after submission -->
   <div class="container" id="resultBox" style="display:none;"></div>
 
+  {% if enable_proctoring %}
   <!-- ===== Anti-cheating / browser-lockdown UI ===== -->
   <!-- Camera-verification gate: the exam stays fully BLOCKED until a live
        webcam stream is established. Shown on every load (including refreshes)
@@ -145,6 +146,7 @@
       </div>
     </div>
   </div>
+  {% endif %}
 
   <!-- Exam config is injected as pure JSON (no inline JS) and parsed in exam.js -->
 <script type="application/json" id="examConfig">
@@ -157,6 +159,8 @@
     "totalQuestions": questions | length,
     "student": student,
     "csrfToken": csrf_token(),
+    "enableProctoring": enable_proctoring,
+    "maxViolations": max_violations,
     "violationThreshold": violation_threshold,
     "violationCount": violation_count,
     "flagged": flagged

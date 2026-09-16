@@ -222,6 +222,34 @@
                 ℹ️ Note: If you add questions to the bank, you can set a Question Ratio so that students automatically receive a randomized subset of unique questions from your bank.
               </div>
 
+              <!-- ====== Proctoring policy (host-configurable) ====== -->
+              <hr class="my-4">
+              <div class="mb-3">
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="enable_proctoring" id="enable_proctoring" value="1" checked>
+                  <label class="form-check-label fw-semibold" for="enable_proctoring">🛡️ Enable Proctoring</label>
+                </div>
+                <p class="text-muted small mb-2">
+                  Turn this <strong>off</strong> to let students take the exam like a normal
+                  test — no webcam requirement and no browser lockdown.
+                </p>
+                <div class="row mt-2">
+                  <div class="col-md-6">
+                    <label class="form-label" for="max_violations">Max Violations (auto-submit after this many incidents)</label>
+                    <select class="form-select" name="max_violations" id="max_violations">
+                      <option value="3" selected>3</option>
+                      <option value="5">5</option>
+                      <option value="7">7</option>
+                      <option value="10">10</option>
+                    </select>
+                    <div class="form-text">Security incidents allowed before the exam is automatically submitted (proctored exams only).</div>
+                  </div>
+                </div>
+                <div class="form-text mt-2 text-info fw-semibold">
+                  💡 Note: When enabled, proctoring enforces webcam verification, tab-switch monitoring, shortcut blocking, and face-presence checks to prevent cheating.
+                </div>
+              </div>
+
               <!-- ====== Dynamic Form Builder: Field Manager ====== -->
               <hr class="my-4">
               <label class="form-label fw-semibold d-block">📋 Dynamic Registration Fields</label>
@@ -523,6 +551,19 @@
     }
 
     refreshCorrectAnswer();
+
+    // Proctoring toggle: when proctoring is switched off, the Max Violations
+    // dropdown is irrelevant (it only applies to proctored exams), so grey it
+    // out and drop it from the submitted form.
+    const proctoringCheckbox = document.getElementById('enable_proctoring');
+    const maxViolationsSelect = document.getElementById('max_violations');
+    if (proctoringCheckbox && maxViolationsSelect) {
+      const syncProctoringState = () => {
+        maxViolationsSelect.disabled = !proctoringCheckbox.checked;
+      };
+      proctoringCheckbox.addEventListener('change', syncProctoringState);
+      syncProctoringState(); // apply on load
+    }
   </script>
 </body>
 </html>

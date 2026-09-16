@@ -36,7 +36,13 @@ class Exam(db.Model):
     * host_email  -> the host who generated this exam
     * config      -> JSON blob (exam_title, time_limit_minutes, ratio,
                      max_capacity, custom_registration_fields,
-                     required_fields)
+                     required_fields, enable_proctoring, max_violations)
+    * enable_proctoring -> host toggle: when False the exam runs with NO
+                     webcam gate / tab-switch monitoring / shortcut blocking /
+                     DevTools checks / face detection — students take it as a
+                     normal exam and no strikes are recorded.
+    * max_violations    -> per-exam security-strike threshold (e.g. 3 or 5)
+                     that force-submits a flagged proctored attempt.
     """
 
     __tablename__ = "exams"
@@ -44,6 +50,10 @@ class Exam(db.Model):
     id = db.Column(db.String(32), primary_key=True)  # shareable exam token
     host_email = db.Column(db.String(255), nullable=True, index=True)
     config = db.Column(db.JSON, nullable=False, default=dict)
+    # Host-facing anti-cheating policy (mirrored into config JSON so legacy
+    # serializers and session copies keep working without code changes).
+    enable_proctoring = db.Column(db.Boolean, nullable=False, default=True)
+    max_violations = db.Column(db.Integer, nullable=False, default=3)
     created_at = db.Column(
         db.String(64),
         nullable=False,
@@ -447,6 +457,10 @@ def session_to_dict(s: Session) -> dict:
         "required_fields": (s.config or {}).get(
             "required_fields", ["name", "phone"]
         ),
+        # Host-configured proctoring policy (copied into the session config at
+        # registration). Defaults preserve the pre-configuration behavior.
+        "enable_proctoring": (s.config or {}).get("enable_proctoring", True),
+        "max_violations": (s.config or {}).get("max_violations", 3),
         "questions": [session_question_to_dict(q) for q in s.questions],
         "student": student_to_dict(s.student) if s.student else None,
         "status": s.status,
@@ -488,6 +502,19 @@ def exam_to_dict(ex: Exam) -> dict:
             "custom_registration_fields", []
         ),
         "required_fields": cfg.get("required_fields", ["name", "phone"]),
+        # Host-facing proctoring policy. Read from the real columns first (the
+        # single source of truth after the model change) with a config fallback
+        # so rows written before/without the migration stay safe.
+        "enable_proctoring": (
+            ex.enable_proctoring
+            if ex.enable_proctoring is not None
+            else cfg.get("enable_proctoring", True)
+        ),
+        "max_violations": (
+            ex.max_violations
+            if ex.max_violations is not None
+            else cfg.get("max_violations", 3)
+        ),
         "questions": [exam_question_to_dict(q) for q in ex.exam_questions],
         "created_at": ex.created_at,
         "attempt_count": len(ex.sessions),
