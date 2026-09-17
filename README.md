@@ -32,38 +32,81 @@ to run lives inside it, and deployment is driven from the repo root via the
 
 ## Anti-Cheating & Browser-Lockdown System
 
-Every exam attempt runs inside a locked-down proctoring environment:
+Every exam attempt runs inside a locked-down, **host-configurable** proctoring
+environment. When the host enables proctoring for an exam (the default), the
+student cannot start or answer until their webcam is verified, and the browser
+is locked down until the exam is submitted:
 
+- **Per-exam proctoring policy (host-configurable)** — each generated exam
+  carries its own `enable_proctoring` toggle and a `max_violations` strike
+  threshold (3 / 5 / 7 / 10 on the Generate-Exam form, clamped server-side to
+  1–10). Unproctored exams skip the camera gate, the browser lockdown, and
+  strike counting entirely — the server treats any violation report as a
+  no-op, and students take the exam like a normal test.
+- **Blocking webcam verification gate** — the exam stays fully locked until
+  `navigator.mediaDevices.getUserMedia` delivers real video frames (verified
+  via the Canvas `loadeddata` event). Denied / missing / busy cameras show a
+  blocking error with retry guidance; the server clock only starts once the
+  student clicks "Start Exam", so camera-setup time is never charged.
 - **Fullscreen enforcement with click recapture & `Esc` mitigation** — the exam
   page requests browser fullscreen on load and re-enters it on **every** click
   or keystroke (capture phase), so `Esc` / `F11` cannot keep the student out.
   Exiting fullscreen is counted as a violation and a blocking "Enter
   Fullscreen" overlay appears until the student clicks back in.
-- **Tab-switch, focus-loss, copy/paste & devtools restrictions** —
-  `visibilitychange` and `blur` detect tab switches, window minimizes, and
-  clicks into other applications; right-click (`contextmenu`), `Ctrl+C/X/V`,
-  `F12`, `Ctrl+Shift+I/J/C`, view-source (`Ctrl+U`), save/print (`Ctrl+S/P`),
-  and refresh (`F5` / `Ctrl+R`) are all blocked while the exam is active.
-- **Smart 3-strike face-absence webcam proctoring** — on every strike a
-  `getUserMedia` webcam frame is captured, compressed to a small base64 JPEG
-  via the HTML5 Canvas API, uploaded with the incident, and persisted
-  server-side on the `ExamViolation` record. The first two strikes show a
-  strict warning modal; the **3rd strike automatically submits the exam** and
-  redirects the student to the results page.
+- **Tab-switch, focus-loss, clipboard & shortcut lockdown** — `visibilitychange`
+  and `blur` detect tab switches, window minimizes, and clicks into other
+  applications; right-click (`contextmenu`), native `copy`/`cut`/`paste`,
+  `Ctrl+C/X/V`, `Ctrl+A` (Select All), `F12`, `Ctrl+Shift+I/J/C/E/K`,
+  view-source (`Ctrl+U`), save/print (`Ctrl+S/P`), refresh (`F5` / `Ctrl+R`),
+  and the `F11` fullscreen toggle are all blocked while the exam is active.
+- **DevTools detection (window-size + debugger probe)** — a 2-second poll
+  catches docked DevTools via the outer/inner window-size delta and undocked /
+  remote DevTools via a `debugger;` round-trip probe, reporting
+  `devtools_detected` strikes with a 5-second re-arm so keeping DevTools open
+  keeps accruing strikes.
+- **Vanilla-JS face-presence monitor** — every second a small Canvas frame is
+  analyzed with a YCbCr skin-tone heuristic plus inter-frame motion; ~5
+  seconds of sustained absence reports a `face_not_detected` strike. No
+  external ML library is used and it works fully offline.
+- **Proof snapshots on every strike** — each incident captures one webcam
+  frame, JPEG-encoded to a base64 data-URL via the HTML5 Canvas API, uploaded
+  with the incident, and persisted server-side on the `ExamViolation` record
+  (size-capped by `SNAPSHOT_MAX_BYTES`).
+- **Monotonic 5-second strike debounce** — one physical action (tab switch,
+  focus loss, fullscreen exit) fires `blur` + `visibilitychange` +
+  `fullscreenchange` near-simultaneously; a `performance.now()`-based 5-second
+  cooldown collapses them into **one** strike, so students are never double-
+  charged for a single action.
 - **Server-authoritative violation counter & deadline-tamper protection** —
   every incident increments `session.violation_count` server-side in the same
   transaction that writes the `exam_violations` row, so page refreshes and
   tampered clients **cannot reset the tally**; the countdown and submit
   deadline are anchored to absolute UTC server timestamps and enforced on the
   server (any submission past the deadline is rejected).
+- **Blocking warning modal that pauses monitoring** — non-final strikes show a
+  strict modal with the exact count ("Strike 1 of 3") and the specific reason
+  ("Reason: Face not detected in camera view"). While it is open, a
+  high-z-index backdrop plus a capture-phase keydown lock block all clicking,
+  typing and answering, and **every background check (face monitor, DevTools
+  poll, countdown and server-sync timers) is paused** so strikes can never
+  stack behind an un-acknowledged warning — nothing resumes until the student
+  clicks "I Understand — Continue Exam".
+- **Immediate teardown on submit & auto-submit at the threshold** — the moment
+  a submission is triggered (manual, time-out, or the final strike), every
+  media track is stopped (the webcam light turns off immediately), all
+  intervals are cleared, and overlays are hidden. At `max_violations` the exam
+  is force-submitted and the student is redirected to the results page.
 - **Conditional host session review** — the host's Session Details page renders
   a dedicated **Proctoring Audit** card (strike count, chronological
   timestamps, and thumbnail previews of the proof snapshots) **only** when the
-  attempt reached the 3-strike threshold and was auto-submitted. Normal
-  completions with 0, 1, or 2 warnings stay clean and uncluttered.
+  attempt reached the host-configured `max_violations` threshold and was
+  auto-submitted. Normal completions with fewer strikes stay clean.
 
-The policy is tunable with environment variables: `MAX_VIOLATIONS` (default
-`3`) and `SNAPSHOT_MAX_BYTES` (default `480000`).
+The global fallback policy is tunable with environment variables:
+`MAX_VIOLATIONS` (default `3`, used only for legacy attempts without a parent
+Exam) and `SNAPSHOT_MAX_BYTES` (default `480000`) — every exam generated through
+the dashboard carries its own per-exam proctoring policy, which takes
+precedence.
 
 ## Configuration
 
@@ -86,7 +129,7 @@ production are:
 | `MAX_SUBMISSIONS` | Lifetime cap on completed submissions (default 500)           |
 | `DAILY_REGISTRATION_LIMIT` | Strict per-host cap on student registrations per 24h (default 70) |
 | `DAILY_REGISTRATION_WINDOW_HOURS` | Rolling window (hours) defining a host's "day" (default 24) |
-| `MAX_VIOLATIONS` | Security-strike threshold that force-submits a flagged attempt (default 3) |
+| `MAX_VIOLATIONS` | Global **fallback** strike threshold that force-submits a flagged attempt (default 3; per-exam `max_violations` set on the Generate-Exam form takes precedence) |
 | `SNAPSHOT_MAX_BYTES` | Max base64 length accepted for a proctoring proof snapshot (default 480000) |
 
 ## Deploying to a cloud host (Render / Koyeb)

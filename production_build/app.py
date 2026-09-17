@@ -1623,6 +1623,38 @@ def validate_registration_fields(fields: dict) -> str | None:
     return None
 
 
+def _find_student_duplicate(exam_id, email_val="", phone_val=""):
+    """Return an existing Student already registered on the SAME exam link.
+
+    Student email/phone uniqueness is scoped PER EXAM LINK (the shared
+    ``Exam`` that a registration portal belongs to), NOT across the whole
+    database. The same student may register with the same email + phone for
+    ANY number of different exam links, but only once per link.
+
+    The lookup joins ``Student`` -> ``Session`` on the session's parent
+    ``exam_id``, so registrations collected on OTHER exams never block this
+    one. Returns the first matching Student row, or None.
+
+    When ``exam_id`` is empty (a legacy single-session attempt with no parent
+    Exam) there is no cross-session scope to check — a fresh Session can hold
+    at most one Student anyway (UNIQUE on ``students.session_id``) — so the
+    helper returns None and the legacy check is effectively skipped.
+    """
+    if not exam_id or (not email_val and not phone_val):
+        return None
+    q = (
+        Student.query.join(Session, Student.session_id == Session.id)
+        .filter(Session.exam_id == exam_id)
+    )
+    if email_val and phone_val:
+        q = q.filter((Student.email == email_val) | (Student.phone == phone_val))
+    elif email_val:
+        q = q.filter(Student.email == email_val)
+    else:
+        q = q.filter(Student.phone == phone_val)
+    return q.first()
+
+
 # ---------------------------------------------------------------------------
 # Randomizer — the heart of the per-candidate exam
 # ---------------------------------------------------------------------------
@@ -2769,6 +2801,42 @@ def exam_register(exam_id):
             ratio = int(pending.get("ratio", 0) or 0)
             max_cap = int(pending.get("max_cap") or MAX_SUBMISSIONS)
 
+            # Per-exam uniqueness is re-checked at finalization (after the OTP
+            # round-trip): if the same email/phone was registered for THIS exam
+            # link in another browser while the code was pending, the OTP is
+            # burned and the registration is rejected. Registrations on OTHER
+            # exam links never affect this check.
+            dup = _find_student_duplicate(exam_id, email_val, phone_val)
+            if dup is not None:
+                audit(
+                    "registration_failed",
+                    exam_id=exam_id,
+                    email=email_val,
+                    phone=phone_val,
+                    reason="duplicate_student",
+                    step="verify",
+                    ip=get_remote_address(),
+                )
+                session.pop("stu_reg_step", None)
+                session.pop("stu_reg_pending", None)
+                session.pop("stu_reg_otp", None)
+                err = (
+                    "This email address or phone number is already registered for this exam link. "
+                    "Use the exam link you were given."
+                )
+                if request.is_json:
+                    return jsonify({"error": err}), 400
+                return (
+                    render_template(
+                        "register.html",
+                        error=err,
+                        form={},
+                        captcha=captcha_payload(),
+                        **template_vars,
+                    ),
+                    400,
+                )
+
             session_id = uuid.uuid4().hex[:16]
             now = datetime.now(timezone.utc)
             s = Session(
@@ -2877,18 +2945,12 @@ def exam_register(exam_id):
         student_data = {}
         missing = []
 
-        # --- Duplicate check: email OR phone must not already be registered --
+        # --- Duplicate check: email OR phone must not already be registered
+        # for THIS exam link (scoped per exam_id — the same student may
+        # register with the same email/phone for any OTHER exam link).
         phone_val = request.form.get("phone", "").strip()
         email_val = request.form.get("email", "").strip().lower()
-        dup = None
-        if email_val and phone_val:
-            dup = Student.query.filter(
-                (Student.email == email_val) | (Student.phone == phone_val)
-            ).first()
-        elif email_val:
-            dup = Student.query.filter(Student.email == email_val).first()
-        elif phone_val:
-            dup = Student.query.filter(Student.phone == phone_val).first()
+        dup = _find_student_duplicate(exam_id, email_val, phone_val)
         if dup:
             if email_val and dup.email == email_val and phone_val and dup.phone == phone_val:
                 err = "This email address and phone number are already registered."
@@ -3557,17 +3619,14 @@ def register(session_id):
             student_data[slug] = value
 
 
-        # --- Duplicate check: email OR phone must not already be used ---------
+        # --- Duplicate check: email OR phone must not already be used on the
+        # SAME exam link (scoped per exam_id, NOT across the whole DB — the
+        # same student may register for other exam links with the same
+        # credentials). Legacy sessions without a parent Exam skip the check.
         email_val = student_data.get("email", "").strip().lower()
         phone_val = student_data.get("phone", "")
         student_data["email"] = email_val
-        dup = None
-        if email_val and phone_val:
-            dup = Student.query.filter((Student.email == email_val) | (Student.phone == phone_val)).first()
-        elif email_val:
-            dup = Student.query.filter(Student.email == email_val).first()
-        elif phone_val:
-            dup = Student.query.filter(Student.phone == phone_val).first()
+        dup = _find_student_duplicate(s.exam_id, email_val, phone_val)
         if dup:
             if email_val and dup.email == email_val and phone_val and dup.phone == phone_val:
                 err = "This email address and phone number are already registered."

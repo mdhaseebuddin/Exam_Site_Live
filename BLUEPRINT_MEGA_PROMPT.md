@@ -49,7 +49,9 @@ platform described below **from scratch**, in a **`production_build/`** folder o
     ├── static/
     │   ├── logo.png                # site favicon + logo
     │   ├── style.css               # shared stylesheet
-    │   └── exam.js                 # exam-page logic (timer, nav, submit)
+    │   └── exam.js                 # exam-page logic + anti-cheating engine (camera gate,
+    │   │                           #   fullscreen lockdown, shortcut/DevTools/face monitors,
+    │   │                           #   blocking violation modal, teardown on submit)
     └── templates/                  # 17 Jinja2 templates (section 14)
         ├── welcome.html            ├── host.html            ├── host_login.html
         ├── host_login_verify.html  ├── host_register.html   ├── host_register_verify.html
@@ -85,6 +87,18 @@ platform described below **from scratch**, in a **`production_build/`** folder o
    `IntegrityError` is always done and never blocks startup.
 8. **PDFs are generated with ReportLab (pure Python, no system binary)** and always fall back to a
    print-friendly HTML response (with a `.pdf` filename) if ReportLab is missing or throws.
+9. **The violation tally is server-authoritative.** The client POSTs incidents to
+   `/exam/<session_id>/violation`; the server appends an `ExamViolation` row, increments
+   `session.violation_count` and flags the session at the host-configured `max_violations` in the
+   SAME transaction. A tampered/page-refreshed client can never reset the count, and the endpoint
+   is a NO-OP (`proctoring:false`, never flags) for exams created with proctoring disabled.
+10. **The exam clock only starts after the camera gate.** `/exam/<session_id>/start` (POST) is
+    called ONLY after the client verifies a live webcam stream and the student clicks "Start Exam";
+    the deadline is then persisted server-side so camera-setup time is never charged and refreshes
+    can't extend it.
+11. **Webcam proctoring requires a secure context (HTTPS or `http://localhost`).** Without one,
+    snapshot capture degrades gracefully — strikes and timestamps are still recorded, and the
+    audit shows the "no snapshot captured" placeholder.
 
 ### 3. TECH STACK & PINNED DEPENDENCIES (`requirements.txt`)
 
@@ -137,37 +151,46 @@ DATABASE_URL="<NEON_DATABASE_URL>"
 # DAILY_REGISTRATION_WINDOW_HOURS=24  # rolling window (hours) defining a host's "day"
 # MAX_CONTENT_LENGTH=1048576            # 1 MiB default request cap
 # WTF_CSRF_TIME_LIMIT=21600             # 6 h CSRF-token lifetime
+# MAX_VIOLATIONS=3                      # global FALLBACK strike threshold for legacy attempts with
+#                                       #   no parent Exam (per-exam max_violations overrides it)
+# SNAPSHOT_MAX_BYTES=480000             # max base64 length accepted for a proctoring proof snapshot
 ```
 
 `load_dotenv()` must run **before** reading `FLASK_ENV` / `SECRET_KEY`. Set `FLASK_ENV` and
 `IS_PRODUCTION = FLASK_ENV == "production"`; fail-fast with `RuntimeError` if production and
 `SECRET_KEY` is missing.
-### 5. DATABASE SCHEMA (`models.py`) — 9 tables exactly like this
+### 5. DATABASE SCHEMA (`models.py`) — 11 tables exactly like this
 
 Use `db = SQLAlchemy()` (no init args; call `db.init_app(app)` in `app.py`). All timestamps are
 ISO-8601 **strings** in UTC so templates render them directly. JSON columns store config blobs.
 
 | Table | Columns & notes |
 |---|---|
-| `exams` | `id` String(32) PK (shareable token), `host_email` String(255) indexed+nullable, `config` JSON, `created_at` String(64). Relationships `sessions` and `exam_questions` (both cascade all/delete-orphan; exam_questions ordered by position). |
+| `exams` | `id` String(32) PK (shareable token), `host_email` String(255) indexed+nullable, `config` JSON, `enable_proctoring` Boolean NOT NULL default True, `max_violations` Integer NOT NULL default 3 (the per-exam proctoring policy is MIRRORED into `config` too, so legacy serializers and session copies keep working), `created_at` String(64). Relationships `sessions` and `exam_questions` (both cascade all/delete-orphan; exam_questions ordered by position). |
 | `exam_questions` | `id` int PK, `exam_id` FK→exams.id, `position` int (0-based), `question_id` String(16) nullable, `type` String(16) default `mcq`, `text` Text, `options` JSON, `correct_index` int. **Immutable snapshot of the bank at exam-generation time.** |
 | `questions` | Master bank: `id` String(16) PK (`q_<hex>`), `host_email` String indexed+nullable, `type` String(16) (`mcq`/`essay`/`coding`), `text` Text, `options` JSON, `correct_index` int, `created_at` String(64). |
-| `sessions` | `id` String(16) PK (session hex), `exam_id` FK→exams.id nullable indexed, `host_email` String nullable indexed, `expiry` DateTime nullable, `config` JSON, `status` String(16) default `pending` (`pending→registered→started→completed`), `started_at`/`deadline`/`completed_at` String(64) nullable, `score` int nullable, `total_selected` int nullable, `created_at` String(64). Cascades: `student` (uselist=False), `questions`, `answers`. |
+| `sessions` | `id` String(16) PK (session hex), `exam_id` FK→exams.id nullable indexed, `host_email` String nullable indexed, `expiry` DateTime nullable, `config` JSON, `status` String(16) default `pending` (`pending→registered→started→completed`), `started_at`/`deadline`/`completed_at` String(64) nullable, `score` int nullable, `total_selected` int nullable, `violation_count` Integer NOT NULL default 0, `flagged` Boolean NOT NULL default False, `auto_submitted` Boolean NOT NULL default False, `created_at` String(64). Cascades: `student` (uselist=False), `questions`, `answers`, `violations`. |
 | `students` | `id` int PK, `session_id` String(16) **UNIQUE** FK→sessions.id (anti-duplicate registration), `name` String(200), `email` String(255) indexed, `phone` String(20), `custom_fields` JSON, `registered_at` String(64), `agreed_to_policy` Boolean default False, `agreed_at` String(64). |
 | `host_users` | `id` int PK, `email` String(255) **UNIQUE** indexed, `name` String(200), `password_hash` String(255), `created_at` String(64). |
 | `otp_tokens` | `id` int PK, `email` String(255) indexed, `code_hash` String(255), `purpose` String(32) default `reset`, `expires_at` String(64), `used` Boolean default False, `created_at` String(64). |
 | `session_questions` | Per-attempt dealt-question snapshot. `id` int PK, `session_id` FK→sessions.id, `position` int, `question_id` String(16), `type`, `text`, `options` JSON, `correct_index` int. |
 | `answers` | `id` int PK, `session_id` FK→sessions.id, `position` int, `question_id` String(16), `type` String(16), `response` JSON (int for MCQ / str for essay+coding), `correct` Boolean nullable, `correct_index` int nullable. |
 | `daily_registrations` | Durable per-host ledger. `id` int PK, `host_email` String(255) indexed, `registered_at` String(64). **Never touched by delete/reset actions**, so a host's rolling-24h count survives exam deletion. |
+| `exam_violations` | Proctoring incident ledger per attempt. `id` int PK, `session_id` FK→sessions.id, `violation_type` String(32), `count` int (1-based strike number), `detail` String(255) nullable, `snapshot` Text nullable (base64 JPEG proof data-URL), `created_at` String(64). Append-only: written in the SAME transaction that increments `sessions.violation_count`. |
 
 **Serializers** in `models.py` must rebuild exactly the legacy dict shapes templates consume:
 `bank_question_to_dict`, `session_question_to_dict`, `answer_to_graded_dict`,
 `student_to_dict` (merges `custom_fields` with name/phone/registered_at), `session_to_dict`
 (exam_title, time_limit_minutes, ratio, custom_registration_fields, required_fields default
-`["name","phone"]`, questions, student, status, started_at, deadline, completed_at, answers
-`{position: response}`, graded, score, total_selected, created_at), and `exam_to_dict`
+`["name","phone"]`, **enable_proctoring, max_violations** (from the session config, default
+True/3), questions, student, status, started_at, deadline, completed_at, answers
+`{position: response}`, graded, score, total_selected, **violation_count, flagged,
+auto_submitted, violations** (array of `{type, count, detail, snapshot, created_at}`),
+created_at), and `exam_to_dict`
 (exam_id, exam_title, time_limit_minutes, ratio, max_capacity, custom_registration_fields,
-required_fields, questions, created_at, attempt_count, completed_count).
+required_fields, **enable_proctoring / max_violations — read from the real columns FIRST with a
+config fallback** (the columns are the single source of truth after the model change),
+questions, created_at, attempt_count, completed_count).
 ### 6. DUAL-DIALECT DB INITIALIZATION (`app.py`) — THE CRITICAL FIX
 
 Resolve the URI once, detect SQLite, and build engine options **conditionally**:
@@ -343,7 +366,15 @@ and the terms checkbox (`agree=="1"` else `error=must_agree`); parse a positive 
 hardcoded — not host-configurable). Parse dynamic **custom registration fields**
 (`cf_name`/`cf_required`/`cf_slug` triplets) into `[{name, required, slug}]` (dedupe slugs with a
 `_<i>` suffix). Build the `Exam` with `id = uuid4().hex[:16]` and config JSON {exam_title,
-time_limit_minutes, ratio, max_capacity, custom_registration_fields, required_fields}.
+time_limit_minutes, ratio, max_capacity, custom_registration_fields, required_fields,
+enable_proctoring, max_violations}, and set the real columns `enable_proctoring` /
+`max_violations`. **Host proctoring policy:** `enable_proctoring` is a standard HTML checkbox
+(`value="1"` when checked; the dashboard JS greys out and drops the `max_violations` select from
+the submitted form when the switch is off) and `max_violations` is a 3/5/7/10 dropdown, clamped
+server-side to `[1, 10]`. The same policy is copied into each Session's `config` at registration
+(`_exam_proctoring_policy(ex)` resolves `(enabled, max_violations)`; legacy attempts with no parent
+Exam default to enabled + the env `MAX_VIOLATIONS`), so the exam page and server read ONE
+consistent policy.
 **Snapshot the entire bank** into `ExamQuestion` rows (immutable isolation); commit; audit
 `exam_generated`; refresh `/host` (redirect).
 **Randomizer** `randomize_questions(bank, ratio)`: clamp the ratio, `random.sample` without
@@ -388,10 +419,19 @@ session_id stored so a stale browser can be detected and reset):
   session has an `exam_id`, else the legacy register route). First visit: persist `started_at`,
   compute `deadline = started_at + time_limit_minutes`, set `status="started"` (survives
   refreshes). Render `exam.html` with `public_questions` (text + options **only**, never answers),
-  `deadline_unix`, `server_now_unix`, `remaining_seconds`, `csrf_token()` in a JSON config blob,
-  plus the student's captured details and required/custom field labels.
-- **`/exam/<session_id>/time` (JSON, 120/min):** returns `{server_now_unix, deadline_unix}`;
-  rejects completed/invalid/not-started sessions. This is the countdown/drift anchor.
+  `deadline_unix`, `server_now_unix`, `remaining_seconds`, `csrf_token()`, plus the student's
+  captured details and required/custom field labels, AND the proctoring config
+  `enable_proctoring` / `max_violations` / `violation_threshold` / `violation_count` / `flagged`
+  (resolved via `_exam_proctoring_policy`). A `flagged` attempt (or a force-submit pending from a
+  previous session) renders a `deadline_unix=0` sentinel and force-submits on load — the whole
+  suite is skipped client-side when proctoring is disabled.
+- **`/exam/<session_id>/time` (JSON, 120/min):** returns `{server_now_unix, deadline_unix,
+  flagged, violation_count, violation_threshold}`; rejects completed/invalid/not-started sessions.
+  This is the countdown/drift anchor AND the re-anchor for the server-authoritative violation
+  tally — the client force-submits on the next poll when the server reports `flagged`.
+- **`/exam/<session_id>/start` (POST JSON, 10000/min):** starts the official server-anchored
+  countdown — called ONLY after the blocking camera gate confirms a live webcam stream, so
+  camera-setup time is never charged. Idempotent (a running clock just returns its deadline).
 - **`/exam/<session_id>/submit` (POST JSON, 10000/min):** wrapped in try/except so **every** path
   returns JSON. Inside `_submit_exam`:
   1. Marshmallow `validate_submit_payload` (400 on malformed/unknown fields).
@@ -400,8 +440,17 @@ session_id stored so a stale browser can be detected and reset):
      deadline is logged but does not block.
   4. **Atomic gate** (single SQL UPDATE with `WHERE status != 'completed'` AND completed-count <
      max_cap) — rowcount 0 → "invalid or already submitted" or, if cap hit, the capacity message.
-  5. Reload the (now-owned) session; merge submitted `student` info into the stored record
-     (custom slugs included).
+  5. Reload the (now-owned) session. **Proctoring:** if `s.flagged` is set (the attempt reached
+     the host-configured `max_violations`), persist `auto_submitted = True` and audit
+     `exam_submitted_flag` so the host's Proctoring Audit card renders. Merge submitted `student`
+     info into the stored record (custom slugs included).
+  5b. **`/exam/<session_id>/violation` (POST JSON, 10000/min, server-authoritative):**
+     unproctored sessions → NO-OP `{ok, proctoring:false, count, threshold, auto_submit:false,
+     flagged:false}` (never counts, never flags). Otherwise: clamp `type` ≤ 32 chars / `detail` ≤
+     255, accept the optional `snapshot` ONLY as a `data:image/` URL ≤ `SNAPSHOT_MAX_BYTES`, then
+     in ONE transaction increment `session.violation_count`, set `flagged` at `max_violations`,
+     append the `ExamViolation` row and audit. Respond `{ok, count, threshold, auto_submit,
+     flagged}` (+ a message when auto_submit).
   6. **Grade** each dealt question: MCQ → compare `int(raw)` to `correct_index` (score++);
      essay/coding → store the text verbatim (no auto score).
   7. Commit answers + `completed_at`. All-auto-graded → persist `score`/`total_selected` and return
@@ -425,6 +474,105 @@ session_id stored so a stale browser can be detected and reset):
   Content-Disposition: attachment; filename="..." )`; else fall back to a print-friendly HTML
   render with an `inline; filename="...pdf"` header (browser "Save as…" still yields `.pdf`).
 
+### 12.5 ANTI-CHEATING & BROWSER-LOCKDOWN SYSTEM (host-configurable proctoring) — `static/exam.js` + `app.py`
+
+The proctoring suite lives in `static/exam.js` (frontend enforcement) and is backed by
+server-authoritative endpoints in `app.py`. It is **skipped entirely** for exams generated with
+`enable_proctoring=false`: no camera gate, no lockdown listeners, no monitors installed, no strikes
+counted — and `/exam/<session_id>/violation` is a no-op for such sessions (defense in depth).
+
+**Policy resolution (`_exam_proctoring_policy(ex)` → `(enabled, max_violations)`):** for a real
+`Exam`, the columns `enable_proctoring` / `max_violations` are the single source of truth (host
+dropdown 3/5/7/10, clamped 1–10, mirrored into config JSON); for legacy attempts with no parent
+Exam, enabled=True and the env `MAX_VIOLATIONS` (default 3) are used. The exam page renders the
+policy into `#examConfig` as `enableProctoring`, `maxViolations`, `violationThreshold`,
+`violationCount`, and `flagged`; a `flagged` attempt force-submits immediately on load.
+
+**Camera gate (pre-exam, blocking):** `verifyCamera()` opens
+`navigator.mediaDevices.getUserMedia` ({video: 640×480 ideal, audio: false}) and treats the stream
+as verified only when the `<video>` element fires Canvas `loadeddata` (i.e. real frames arrive — a
+stream that reports but delivers no pixels fails). A 10 s watchdog (`CAMERA_CONNECT_TIMEOUT_MS`),
+friendly per-error messages (denied / no device / busy / overconstrained / insecure context) and a
+retry button are shown until it passes. Only then does `/exam/<id>/start` fire, starting the
+server-anchored countdown and its 30 s `/time` re-sync.
+
+**Fullscreen enforcement:** the page requests browser fullscreen on load and re-enters it on EVERY
+click and keystroke (capture phase), so `Esc` / `F11` cannot keep the student out; `fullscreenchange`
+exits are reported as `fullscreen_exit` strikes and covered by a blocking "Enter Fullscreen"
+overlay until the student clicks back in.
+
+**Tab / focus / clipboard / shortcut lockdown (installed ONLY when PROCTORING_ENABLED):**
+- `visibilitychange` (hidden) → `tab_switch`; `window blur` → `focus_loss`; returning focus /
+  visibility re-requests fullscreen.
+- `contextmenu` (right-click / inspect) and native `copy` / `cut` / `paste` events are
+  preventDefault'ed.
+- `keydown` blocks: `F12`, `Ctrl+Shift+I/J/C/E/K`, `Ctrl+U`, `Ctrl+S`, `Ctrl+P`, `F5`, `Ctrl+R`,
+  `Ctrl+C/X/V`, `Ctrl+A` (Select All) and `F11` — each reported as a `devtools_shortcut`/
+  `copy_paste` strike with the key name.
+- On every strike `captureSnapshot()` JPEG-encodes one webcam frame (Canvas `toDataURL`, 1.5 s
+  watchdog) as the proof payload.
+
+**DevTools detection (2 s poll):** `checkDevTools()` uses (1) the outer-inner window-size delta
+(`DEVTOOLS_DELTA_THRESHOLD = 100` px — catches docked panels incl. Network/Console/…) and (2) a
+`debugger;` statement round-trip probe (`DEVTOOLS_DEBUGGER_THRESHOLD_MS = 120` — catches
+undocked/remote DevTools). One `devtools_detected` strike per open session, re-armed after
+`DEVTOOLS_REARM_MS = 5000` so keeping DevTools open keeps accruing strikes.
+
+**Face-presence monitor (vanilla JS, NO external ML):** `startFaceMonitor()`/`checkFacePresence()`
+every `FACE_MONITOR_INTERVAL_MS = 1000` draws the LIVE stream to a 160×120 canvas and analyzes the
+central ~70%: (1) **skin-tone** — BT.601 YCbCr pixels ≥ `FACE_SKIN_THRESHOLD = 0.08` of central
+pixels; (2) **motion** — normalized inter-frame channel delta > `FACE_MOTION_THRESHOLD = 0.012`
+(a present-but-still student is never flagged). Both absent for `FACE_MONITOR_MISSES_TO_FLAG = 5`
+consecutive ticks (~5 s) → `face_not_detected` strike. The miss-streak resets on any present frame
+and on restart.
+
+**Strike debounce (monotonic):** `reportViolation(type, detail)` drops anything inside
+`VIOLATION_COOLDOWN_MS = 5000` measured with `performance.now()` (a monotonic clock), so the
+`blur` + `visibilitychange` + `fullscreenchange` burst of ONE physical action counts exactly ONE
+strike. The cooldown resets when the warning modal is acknowledged so the next action is fairly
+counted.
+
+**Strike pipeline (server-authoritative):**
+1. `reportViolation` → `captureSnapshot` → `postViolation` POSTs `{type, detail, snapshot}` to
+   `/exam/<session_id>/violation` (with the CSRF header).
+2. Server: unproctored → no-op; otherwise validate (`type` ≤ 32, `detail` ≤ 255, snapshot only as
+   `data:image/` ≤ `SNAPSHOT_MAX_BYTES`), then in ONE transaction increment
+   `session.violation_count`, flag at `max_violations`, append the `ExamViolation` row, audit.
+3. Response `{count, threshold, auto_submit, flagged}` → client sets `violationCount =
+   Math.max(violationCount, data.count)`; `auto_submit` / threshold → `forceSubmitExam()`; else →
+   `showWarningModal(count, ...)`.
+
+**Warning modal (blocking — pauses monitoring):** `showWarningModal` shows the fixed full-viewport
+`.violation-overlay` backdrop (`position:fixed; inset:0; z-index:99999; backdrop-filter:blur(3px)`)
+with a **"Strike X of Y"** badge (`#violationStrikeBadge`), an explicit **"Reason: …"** line
+(`#violationModalReason`, mapped from the type code via `VIOLATION_REASONS`:
+`face_not_detected` / `tab_switch` / `focus_loss` / `fullscreen_exit` / `devtools_detected` /
+`devtools_shortcut` / `contextmenu` / `copy_paste`), the caution text, the remaining-strikes
+sentence, and the "I Understand — Continue Exam" button. While open:
+
+- a capture-phase `keydown` handler swallows EVERY keystroke (only Enter/Space on the
+  auto-focused `#violationAckBtn` passes, and Tab is blocked so focus cannot drift), and the
+  backdrop blocks all clicks — the student cannot click, type, or answer;
+- `warningModalOpen = true` + `pauseProctoringMonitors()` immediately clear the face-monitor,
+  DevTools, countdown and server-sync intervals, and `reportViolation()` drops all further
+  reports — so NO new strike can ever stack behind an un-acknowledged warning.
+
+Only the student's click on **"I Understand — Continue Exam"** runs `resumeProctoringMonitors()`
+(restarts the countdown/server-sync + DevTools detector + face monitor with a fresh absence grace,
+resets the strike cooldown, re-anchors the clock via `/time`), hides the modal, and re-asserts
+fullscreen.
+
+**Teardown on submission:** `teardownExamMedia()` stops every media track immediately (webcam
+hardware light turns off NOW, not after the fetch), nulls `srcObject` on preview/video elements,
+clears the countdown / server-sync / face-monitor / DevTools intervals and hides all overlays. It
+runs on manual submit, time-out auto-submit, and forced (violation-threshold) submit; a failed
+submission restores monitors via `resumeExamAfterFailedSubmit()` (+ `acquireCameraStream()`).
+
+**Host review:** `details.html` renders the red "Proctoring Audit — Repeated Violations
+(Auto-Submitted)" card ONLY when `session.flagged and session.auto_submitted and
+session.violation_count >= threshold`, listing every strike chronologically (type, detail,
+timestamp, thumbnail proof snapshot, or the "no snapshot captured" placeholder).
+
 ### 13. FRONTEND TEMPLATES (`templates/`) — 17 FILES
 
 All templates load Bootstrap 5.3.3 from `cdn.jsdelivr.net`, the local `style.css`, and the logo
@@ -439,11 +587,12 @@ POSTs run client-side. Rebuild each with these context variables and content:
 | `host_register.html` / `host_register_verify.html` | 2-step registration. Input: name, email, password, confirm, CAPTCHA, terms checkbox. Verify: email echo, OTP input, resend + verify. |
 | `host_forgot.html` | Email + CAPTCHA; after POST show a static "sent" message (anti-enumeration). |
 | `host_reset.html` | Email + OTP + new password + confirm + CAPTCHA; success screen on success. |
-| `host.html` | Dashboard: navbar with host email badge + logout; feedback `query` alerts (submissions_cleared, exam_deleted, errors empty_bank/invalid_question/invalid_config/must_agree/session_not_found); **Daily Registration Capacity notice & progress card** (`daily_registration_limit`, `daily_student_registrations`, `daily_registration_window_hours`, `completed_submissions`, `max_capacity`, contact `<ADMIN_EMAIL>`/`<ADMIN_PHONE>`); left column = Add Question form (type select mcq/essay/coding, dynamic options rows, correct index) + question bank list with delete buttons + Clear All; right column = Generate Exam form (exam_title, time_limit, ratio, custom registration fields builder via `cf_name`/`cf_required`/`cf_slug` formed as `field_<i>[]` arrays, terms checkbox) + exams list showing each link (`{{ url_for('exam_register', exam_id=x.exam_id) }}`), attempts link, delete button. |
+| `host.html` | Dashboard: navbar with host email badge + logout; feedback `query` alerts (submissions_cleared, exam_deleted, errors empty_bank/invalid_question/invalid_config/must_agree/session_not_found); **Daily Registration Capacity notice & progress card** (`daily_registration_limit`, `daily_student_registrations`, `daily_registration_window_hours`, `completed_submissions`, `max_capacity`, contact `<ADMIN_EMAIL>`/`<ADMIN_PHONE>`); left column = Add Question form (type select mcq/essay/coding, dynamic options rows, correct index) + question bank list with delete buttons + Clear All; right column = Generate Exam form (exam_title, time_limit, ratio, **Proctoring policy block: `enable_proctoring` switch + `max_violations` dropdown 3/5/7/10 with JS grey-out/drop when disabled**, custom registration fields builder via `cf_name`/`cf_required`/`cf_slug` formed as `field_<i>[]` arrays, terms checkbox) + exams list showing each link (`{{ url_for('exam_register', exam_id=x.exam_id) }}`), attempts link, delete button. |
 | `exam_attempts.html` | Per-exam attempt list: exam title, each candidate (name/email/phone/status/score), link to `/host/session/<id>`. Context: `exam`, `attempts`, `custom_registration_fields`. |
+| `details.html` | Session details: student/candidate info, per-question answered review, score / "Awaiting manual review", download links (details PDF, result PDF), and the **Proctoring Audit** card shown ONLY when the attempt was flagged + auto-submitted at the strike threshold (chronological strikes with `type`, `detail`, `created_at`, thumbnail proof snapshots or the "no snapshot captured" placeholder). Context: `session` (serialized dict incl. `violations`, `violation_count`, `flagged`, `auto_submitted`), `violation_threshold`. |
 | `register.html` | Candidate registration portal: exam title, dynamic required fields (name/email/phone + custom), CAPTCHA, mandatory privacy checkbox; used by BOTH the universal and legacy flows (different `form.action`s). Context: `error`, `form`, `captcha`, `required_fields`, `field_labels`, `custom_registration_fields` (+ `exam_id` or `session_id`). |
 | `register_verify.html` | Candidate OTP step with resend/verify. Context: `email`, `error`, `exam_id`/`session_id`. |
-| `exam.html` | Distraction-free exam: title bar (`exam_title`), candidate-details panel, question counter + server countdown (`#timer`) + Finish btn; single-question card; prev/next footer; hidden `#resultBox`; then a JSON script tag `#examConfig` containing `{sessionId, questions, remainingSeconds, deadlineUnix, serverNowUnix, totalQuestions, student, csrfToken}` serialized with `| tojson`, loaded by `exam.js`. |
+| `exam.html` | Distraction-free exam: title bar (`exam_title`), candidate-details panel, question counter + server countdown (`#timer`) + Finish btn; single-question card; prev/next footer; hidden `#resultBox`; then a JSON script tag `#examConfig` containing `{sessionId, questions, remainingSeconds, deadlineUnix, serverNowUnix, totalQuestions, student, csrfToken, enableProctoring, maxViolations, violationThreshold, violationCount, flagged}` serialized with `| tojson`, loaded by `exam.js`. **When `enable_proctoring` is true the page also renders the proctoring overlays:** `#cameraGateOverlay` (blocking webcam-verification gate with preview + Start Exam), `#violationModal` (strict warning with `#violationStrikeBadge`, `#violationModalReason`, `#violationModalText`, `#violationModalCount`, `#violationAckBtn`), `#fullscreenBlockOverlay` (Enter Fullscreen), and `#forceSubmitOverlay` (auto-submitting…). |
 | `result.html` | Result view: score card (percent, score/total) with "Download Result PDF" button linking `/exam/<session_id>/result.pdf`, plus answer review. Context: `session` (serialized dict). |
 | `details_pdf.html` / `result_pdf.html` | Print-friendly HTML mirroring the ReportLab PDFs (used both as the fallback and as a reference): title header, student/candidate info, per-question answer review, print CSS (`@media print`). |
 
@@ -452,16 +601,35 @@ via `JSON.parse(document.getElementById("examConfig").textContent)`.
 
 ### 14. FRONTEND LOGIC (`static/exam.js`)
 
-IIFE reading `#examConfig`: single-question rendering (MCQ radios labeled `A./B./C.`; essay/coding
-textareas with placeholders); previous/next navigation; `answers = {index: value}` kept in memory;
-server-anchored countdown derived ONLY from `deadlineUnix - serverNowUnix` (browser clock never
-trusted), ticking every second and re-synced via `fetch("/exam/<id>/time")` every 30s; when time
-hits zero it auto-submits once (guards `submitting`/`submitted` so repeated triggers can't double
-POST); manual submit asks `window.confirm`; POST JSON to `/exam/<id>/submit` with header
+IIFE reading `#examConfig` (parsed via
+`JSON.parse(document.getElementById("examConfig").textContent)`) with THREE responsibilities:
+(A) the exam UI, (B) the server-anchored clock, and (C) — when `cfg.enableProctoring !== false` —
+the complete anti-cheating engine described in §12.5.
+
+**Exam UI:** single-question rendering (MCQ radios labeled `A./B./C.`; essay/coding textareas with
+placeholders); previous/next navigation; `answers = {index: value}` kept in memory; Prev/Next/Finish
+disabled until the camera gate passes.
+
+**Clock:** server-anchored countdown derived ONLY from `deadlineUnix - serverNowUnix` (browser
+clock never trusted), ticking every second and re-synced via `fetch("/exam/<id>/time")` every 30 s;
+when time hits zero it auto-submits once (guards `submitting`/`submitted` so repeated triggers
+can't double POST). `syncFromServer()` also re-anchors `violationCount` and force-submits if the
+server reports the attempt flagged.
+
+**Submit:** manual submit asks `window.confirm`; POST JSON to `/exam/<id>/submit` with header
 `X-CSRFToken: cfg.csrfToken` and body `{student: cfg.student, answers}`; parse the JSON response
-(defensively, so a non-JSON error body never throws raw tokens at the student); renders a
-"Thank You" card for `manual_review`, else a percent/success-fail score card in `#resultBox`;
-alerts only when the submission did NOT already succeed.
+defensively (a non-JSON error body never throws raw tokens at the student); render a "Thank You"
+card for `manual_review`, else a percent/success-fail score card in `#resultBox`; alert only when
+the submission did NOT already succeed. `teardownExamMedia()` (stop webcam tracks, clear every
+interval, hide overlays) runs the instant ANY submission is triggered, and a failed submission
+restores everything via `resumeExamAfterFailedSubmit()`.
+
+**Anti-cheating engine (PROCTORING_ENABLED only)** — implement it exactly as described in §12.5:
+blocking camera gate (verifyCamera → `/start` once real frames arrive), fullscreen recapture,
+tab/focus/clipboard/shortcut lockdown, DevTools window-size + debugger-probe detection, the vanilla
+face monitor, the monotonic 5 s strike debounce, the `reportViolation → /violation` pipeline, the
+blocking "Strike X of Y" warning modal that pauses monitoring and resumes only on the ack button,
+and the 5 s / 30 s / 2 s / 1 s interval bookkeeping with null-guards so nothing leaks.
 
 ### 15. INPUT-VALIDATION SCHEMAS (`schemas.py`) — MARSHMALLOW
 
@@ -537,7 +705,9 @@ if __name__ == "__main__":
 | GET+POST | `/exam/register/<exam_id>` | 10000/min POST | universal candidate portal |
 | GET | `/exam/<session_id>` | — | exam page (auth-gated) |
 | GET | `/exam/<session_id>/result.pdf` | — | result PDF (completed only) |
-| GET | `/exam/<session_id>/time` | 120/min | server-anchored time JSON |
+| GET | `/exam/<session_id>/time` | 120/min | server-anchored time + violation re-anchor JSON |
+| POST | `/exam/<session_id>/start` | 10000/min | start server-anchored countdown (after camera gate; idempotent) |
+| POST | `/exam/<session_id>/violation` | 10000/min | anti-cheating strike reporter (server-authoritative; no-op when unproctored) |
 | GET+POST | `/exam/<session_id>/register`, `/register/<session_id>` | 10000/min POST | legacy registration gate |
 | POST | `/exam/<session_id>/submit` | 10000/min | save + grade (JSON) |
 
@@ -563,6 +733,18 @@ if __name__ == "__main__":
    error paths are parseable by the client.
 9. `init_db()` re-runs on an existing DB without error (guarded migrations are idempotent).
 10. The privacy page renders all sections and is linked in the site footer.
+11. **Proctoring migration + pages:** run `python _verify_proctoring.py` — the guarded migration
+    adds `enable_proctoring`/`max_violations` to `exams`; a proctored page renders the camera gate +
+    `#violationModal` + `"maxViolations": 5`; an unproctored page renders NONE of them; the
+    `/exam/<id>/violation` endpoint is a no-op for unproctored and honours the host's threshold
+    (flags exactly at 5 for proctored).
+12. **Gate + force-submit flow:** with proctoring enabled the exam stays BLOCKED until the camera
+    gate confirms real frames (`/start` is only callable then); a `flagged` session force-submits on
+    load; and a flagged submission persists `auto_submitted=True` so the host's Proctoring Audit
+    card renders in `details.html`.
+13. **No-strike-stacking:** with the v2 modal, opening the warning pauses face/DevTools/countdown/
+    server-sync intervals and drops further reports until the student clicks "I Understand —
+    Continue Exam".
 
 ### 21. OPERATOR HANDOFF NOTES (write these into a `README.md`)
 
@@ -573,6 +755,11 @@ if __name__ == "__main__":
   persistent disk OR `DATABASE_URL`).
 - The dual-dialect database explanation (`check_same_thread` is SQLite-only; PRAGMAs guarded).
 - The privacy-policy summary and footer link.
+- How to configure **per-exam proctoring** in the Generate-Exam form (the `Enable Proctoring` switch
+  and the `Max Violations` dropdown 3/5/7/10): unproctored exams are a true no-lockdown mode (the
+  server ignores violation reports), the warning modal hard-blocks the screen and PAUSES monitoring
+  until the student clicks "I Understand — Continue Exam", and `MAX_VIOLATIONS`/`SNAPSHOT_MAX_BYTES`
+  are only global fallbacks for legacy attempts without a parent Exam.
 
 ---
 

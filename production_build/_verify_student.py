@@ -240,7 +240,7 @@ r = client.post("/exam/register/TESTEXAM001", data={
     "captcha": get_captcha(), "agree": "1",
 })
 assert r.status_code == 400, (r.status_code, r.get_data(as_text=True)[:300])
-log("STEP2_OK: duplicate email (existing DB student) rejected")
+log("STEP2_OK: duplicate email on the SAME exam link rejected")
 
 # 3) Duplicate phone rejected on input (against pre-existing student)
 r = client.post("/exam/register/TESTEXAM001", data={
@@ -248,7 +248,7 @@ r = client.post("/exam/register/TESTEXAM001", data={
     "captcha": get_captcha(), "agree": "1",
 })
 assert r.status_code == 400, (r.status_code, r.get_data(as_text=True)[:300])
-log("STEP3_OK: duplicate phone (existing DB student) rejected")
+log("STEP3_OK: duplicate phone on the SAME exam link rejected")
 
 # 4) Valid input -> real _send_student_otp emails the code, redirect to verify
 emails_sent.clear()
@@ -289,7 +289,7 @@ r = client.post("/exam/register/TESTEXAM001", data={
     "captcha": get_captcha(), "agree": "1",
 })
 assert r.status_code == 400, (r.status_code, r.get_data(as_text=True)[:300])
-log("STEP7_OK: duplicate email blocked (across DB, past OTP)")
+log("STEP7_OK: duplicate email blocked on the SAME exam link (past OTP)")
 
 # 8) Duplicate phone blocked across DB after OTP registration
 r = client.post("/exam/register/TESTEXAM001", data={
@@ -297,9 +297,43 @@ r = client.post("/exam/register/TESTEXAM001", data={
     "captcha": get_captcha(), "agree": "1",
 })
 assert r.status_code == 400, (r.status_code, r.get_data(as_text=True)[:300])
-log("STEP8_OK: duplicate phone blocked (across DB, past OTP)")
+log("STEP8_OK: duplicate phone blocked on the SAME exam link (past OTP)")
 
-# 9) Daily per-host cap blocks a new student once the host has hit the cap
+# 9) SAME email+phone on a DIFFERENT exam link -> ALLOWED (per-exam scoping).
+#    A student may register for ANY number of separate exam links with the
+#    same credentials, as long as they are not already on that link.
+with A.app.app_context():
+    ex2 = A.Exam(
+        id="TESTEXAM002", host_email="host@example.com",
+        config={"exam_title": "Test 2", "required_fields": ["name", "email", "phone"],
+                "time_limit_minutes": 30, "ratio": 1},
+    )
+    A.db.session.add(ex2)
+    A.db.session.commit()
+emails_sent.clear()
+client.get("/exam/register/TESTEXAM002")
+r = client.post("/exam/register/TESTEXAM002", data={
+    "name": "Alice", "email": "alice@example.com", "phone": "2222222222",
+    "captcha": get_captcha(), "agree": "1",
+}, follow_redirects=False)
+assert r.status_code == 302, (r.status_code, r.get_data(as_text=True)[:300])
+assert "/exam/register/TESTEXAM002" in r.headers.get("Location", "")
+# Complete the OTP so the second registration is actually persisted too.
+code2 = emails_sent[-1]["code"] if emails_sent else None
+assert code2 and len(code2) == 6, emails_sent
+r = client.post("/exam/register/TESTEXAM002", data={"action": "verify", "otp": code2},
+                follow_redirects=False)
+assert r.status_code == 302, (r.status_code, r.get_data(as_text=True)[:300])
+with A.app.app_context():
+    alice_rows = A.Student.query.filter_by(email="alice@example.com").all()
+    assert len(alice_rows) == 2, f"expected 2 sessions for alice (one per exam link), got {len(alice_rows)}"
+    sess_ids = [st.session_id for st in alice_rows]
+    sess_exams = A.Session.query.filter(A.Session.id.in_(sess_ids)).all()
+    exams_for_alice = sorted({x.exam_id for x in sess_exams})
+    assert exams_for_alice == ["TESTEXAM001", "TESTEXAM002"], exams_for_alice
+log("STEP9_OK: SAME email+phone allowed on a DIFFERENT exam link (per-exam scoping); both sessions persisted")
+
+# 10) Daily per-host cap blocks a new student once the host has hit the cap
 limit_backup = A.DAILY_REGISTRATION_LIMIT
 A.DAILY_REGISTRATION_LIMIT = 1
 client.get("/exam/register/TESTEXAM001")

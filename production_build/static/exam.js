@@ -58,6 +58,16 @@
   let lastViolationReportAt = 0;
   const VIOLATION_COOLDOWN_MS = 5000;
   let focusLost = false;
+  // True while the strict warning modal is on screen. While set, every
+  // background proctoring loop (face monitor, DevTools detector, countdown
+  // and server-sync timers) is paused and every further violation report is
+  // dropped, so strikes can never stack behind an un-acknowledged warning.
+  // Only the student's click on "Continue Exam" clears it and resumes.
+  let warningModalOpen = false;
+  // The most recently reported violation, remembered until the modal renders
+  // so it can show the exact rule that was tripped ("Reason: ...").
+  let pendingViolationType = "";
+  let pendingViolationDetail = "";
 
   const timerEl = document.getElementById("timer");
   const questionText = document.getElementById("questionText");
@@ -73,6 +83,8 @@
   const violationOverlay = document.getElementById("violationModal");
   const violationModalText = document.getElementById("violationModalText");
   const violationModalCount = document.getElementById("violationModalCount");
+  const violationStrikeBadge = document.getElementById("violationStrikeBadge");
+  const violationModalReason = document.getElementById("violationModalReason");
   const violationAckBtn = document.getElementById("violationAckBtn");
   const fullscreenBlockOverlay = document.getElementById("fullscreenBlockOverlay");
   const fullscreenRetryBtn = document.getElementById("fullscreenRetryBtn");
@@ -86,6 +98,9 @@
   const cameraStartBtn = document.getElementById("cameraStartBtn");
 
   function hideViolationOverlays() {
+    // Any path that hides the overlays (submission, forced submit) also ends
+    // the interaction lock so no stale flag lingers.
+    warningModalOpen = false;
     if (violationOverlay) violationOverlay.style.display = "none";
     if (fullscreenBlockOverlay) fullscreenBlockOverlay.style.display = "none";
     if (forceSubmitOverlay) forceSubmitOverlay.style.display = "none";
@@ -719,6 +734,11 @@
     // Once a submission is underway, stop counting incidents.
     if (submitting || submitted || redirectScheduled) return;
 
+    // While the strict warning modal is on screen, ALL further reports are
+    // dropped (the background monitors are paused too), so strikes can never
+    // stack behind an un-acknowledged warning.
+    if (warningModalOpen) return;
+
     // Rate-limit: blur + visibilitychange + fullscreen-exit from the SAME
     // physical switch fire within milliseconds and MUST count as ONE strike.
     // The first event claims the cooldown window; anything inside it is
@@ -727,6 +747,10 @@
     const nowMs = performance.now();
     if (nowMs - lastViolationReportAt < VIOLATION_COOLDOWN_MS) return;
     lastViolationReportAt = nowMs;
+    // Record exactly what tripped today's strike so the modal can name the
+    // precise reason as soon as the server confirms the new count.
+    pendingViolationType = type;
+    pendingViolationDetail = detail || "";
 
     // Capture a proof frame first (bounded by the watchdog), then report the
     // strike together with it so the host gets a chronological audited trail.
@@ -781,16 +805,44 @@
   }
 
   // -------------------------- Warning modal ------------------------------
+  // Human-readable labels mapped from the server-side violation type codes so
+  // the modal always names the exact rule that was tripped ("Reason: Face not
+  // detected in camera view", "Reason: Tab switched away", ...).
+  const VIOLATION_REASONS = {
+    face_not_detected: "Face not detected in camera view",
+    tab_switch: "Tab switched away from the exam page",
+    focus_loss: "Exam window lost focus to another window or app",
+    fullscreen_exit: "Exited full-screen mode (Esc / F11 / gesture)",
+    devtools_detected: "Developer tools were detected",
+    devtools_shortcut: "Developer-tools / save / print / refresh shortcut was blocked",
+    contextmenu: "Right-click / inspect-element attempt was blocked",
+    copy_paste: "Clipboard operation (copy / cut / paste) was blocked"
+  };
+
+  function violationReasonLabel(type, detail) {
+    const mapped = VIOLATION_REASONS[type];
+    return mapped || detail || "A security violation was detected";
+  }
+
   function showWarningModal(count, message) {
     if (submitting || submitted) return;
     if (!violationOverlay) return;
     const remaining = Math.max(0, MAX_VIOLATIONS - count);
+    // 1) Clear strike display: "Strike 1 of 3", "Strike 2 of 5", ...
+    if (violationStrikeBadge) {
+      violationStrikeBadge.textContent =
+        "Strike " + count + " of " + MAX_VIOLATIONS;
+    }
     if (violationModalCount) {
       violationModalCount.textContent =
-        "Security incident " + count + " of " + MAX_VIOLATIONS +
-        (remaining > 0
-          ? " — your exam will be submitted automatically after " + remaining + " more."
-          : " — your exam is being submitted.");
+        remaining > 0
+          ? "Your exam will be submitted automatically after " + remaining + " more."
+          : "Maximum strikes reached — your exam is being submitted.";
+    }
+    // 2) Specific violation type: "Reason: Face not detected in camera view".
+    if (violationModalReason) {
+      violationModalReason.textContent =
+        "Reason: " + violationReasonLabel(pendingViolationType, pendingViolationDetail);
     }
     if (violationModalText) {
       violationModalText.textContent =
@@ -799,12 +851,74 @@
         "Do not switch tabs, minimize this window, open other programs, " +
         "right-click, or open developer tools while the exam is active.";
     }
+    pendingViolationType = "";
+    pendingViolationDetail = "";
+
+    // 3) Hard screen lock: the fixed high-z-index backdrop (CSS) covers the
+    // whole viewport and the capture-phase keydown lock below swallows every
+    // keystroke, so the student can neither click nor type past the warning.
+    warningModalOpen = true;
+    pauseProctoringMonitors();
+    if (document.activeElement && typeof document.activeElement.blur === "function") {
+      document.activeElement.blur(); // drop focus from any exam control
+    }
+    if (violationAckBtn && typeof violationAckBtn.focus === "function") {
+      // Enter/Space on "Continue Exam" is the only key input allowed while
+      // the modal is open (see the capture-phase keydown lock below).
+      violationAckBtn.focus();
+    }
     violationOverlay.style.display = "flex";
     requestFullscreen();
   }
 
+  // 4) Pause monitoring the MOMENT the modal opens: every background interval
+  // (face-presence monitor, DevTools detector, the 1s countdown tick and the
+  // 30s server re-sync poll) is cleared so no new strike — or a missed-face
+  // re-flag — can accumulate while the student reads the warning. The camera
+  // stream itself stays alive (it is only torn down on submission), so each
+  // monitor can simply be restarted when the student resumes.
+  function pauseProctoringMonitors() {
+    if (faceMonitorInterval) {
+      window.clearInterval(faceMonitorInterval);
+      faceMonitorInterval = null;
+    }
+    if (devtoolsInterval) {
+      window.clearInterval(devtoolsInterval);
+      devtoolsInterval = null;
+    }
+    if (timerInterval) {
+      window.clearInterval(timerInterval);
+      timerInterval = null;
+    }
+    if (serverSyncInterval) {
+      window.clearInterval(serverSyncInterval);
+      serverSyncInterval = null;
+    }
+  }
+
+  // 5) Resume on "OK": restarts the countdown/server-sync, DevTools detector
+  // and face monitor, and re-anchors the server clock. The strike cooldown is
+  // reset so the very next action after the acknowledgement is counted fairly,
+  // and the face monitor restarts with a fresh absence grace period.
+  function resumeProctoringMonitors() {
+    warningModalOpen = false;
+    if (submitting || submitted || redirectScheduled) return;
+    lastViolationReportAt = 0;
+    focusLost = false;
+    startTimer(); // restarts the 1s countdown tick + the 30s server-time sync
+    if (PROCTORING_ENABLED) {
+      startDevToolsDetection();
+      startFaceMonitor(); // resets its miss-streak internally
+    }
+    syncFromServer(); // re-anchor deadline / strike tally / flagged state now
+  }
+
   if (violationAckBtn) {
     violationAckBtn.addEventListener("click", function () {
+      // The ONLY way out of the warning: resume monitoring, unblock the
+      // screen (hide the modal), then re-assert fullscreen from inside this
+      // click (a real user gesture, so the browser always allows it).
+      resumeProctoringMonitors();
       if (violationOverlay) violationOverlay.style.display = "none";
       requestFullscreen();
     });
@@ -928,6 +1042,22 @@
     }
     return true;
   });
+  // 3) Hard input lock while the warning modal is on screen: a capture-phase
+  // keydown swallows EVERY keystroke before it can reach the exam (radio
+  // inputs, textareas, the Prev / Next / Finish buttons, shortcuts), so the
+  // modal blocks typing and answering exactly as the backdrop blocks clicks.
+  // The only exception is activating "Continue Exam" itself with Enter/Space
+  // while it is focused (it is auto-focused when the modal opens, and Tab is
+  // blocked so focus can never drift to the exam controls).
+  document.addEventListener("keydown", function (e) {
+    if (!warningModalOpen) return;
+    const isAckActivation =
+      (e.key === "Enter" || e.key === " ") &&
+      document.activeElement === violationAckBtn;
+    if (isAckActivation) return; // allow keyboard activation of "Continue"
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
   } // end of PROCTORING_ENABLED lockdown listeners
 
   // -------------------------- DevTools detection --------------------------
