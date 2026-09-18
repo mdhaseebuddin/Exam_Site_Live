@@ -46,7 +46,8 @@ production_build/
 
    ```bash
    cp .env.example .env
-   # then edit .env with real values (especially SECRET_KEY and SMTP credentials)
+   # then edit .env with real values (especially SECRET_KEY and the Brevo
+   # API keys + verified sender addresses)
    ```
 
    At minimum, set a strong `SECRET_KEY`. In production also set
@@ -99,4 +100,5 @@ web: gunicorn --chdir production_build wsgi:app
   git-ignored and never committed.
 - Use a real, strong `SECRET_KEY` in production.
 - Set `SESSION_COOKIE_SECURE="true"` when serving over HTTPS.
-- Provide real `SMTP_*` credentials for working password-reset emails.
+- Provide real `BREVO_*` API keys plus verified sender addresses
+  (`MAIL_DEFAULT_SENDER` / `MAIL_STUDENT_SENDER`) for working OTP emails.

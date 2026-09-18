@@ -96,6 +96,7 @@
   const cameraGateError = document.getElementById("cameraGateError");
   const cameraRetryBtn = document.getElementById("cameraRetryBtn");
   const cameraStartBtn = document.getElementById("cameraStartBtn");
+  const cameraAllowBtn = document.getElementById("cameraAllowBtn");
 
   function hideViolationOverlays() {
     // Any path that hides the overlays (submission, forced submit) also ends
@@ -167,8 +168,21 @@
     const name = (err && err.name) || "";
     switch (name) {
       case "NotAllowedError":
-      case "PermissionDeniedError":
-        return "Camera permission was denied. Click the camera icon in your browser\u2019s address bar, choose \u201cAllow\u201d, then press Try Again.";
+      case "PermissionDeniedError": {
+        let msg = "Camera permission was denied. ";
+        if (isMobileDevice()) {
+          const ua = navigator.userAgent || "";
+          if (/Android/i.test(ua)) {
+            msg += "On Android Chrome: open the browser menu (\u22ee) \u2192 Settings \u2192 Site settings \u2192 Camera, set this site to \u201cAllow\u201d, reload, then press Try Again. ";
+          } else {
+            msg += "On iOS: open Settings \u2192 Safari (or your browser) \u2192 Camera, set it to \u201cAllow\u201d, reopen this page, then press Try Again. ";
+          }
+        } else {
+          msg += "Click the camera icon in the browser\u2019s address bar, choose \u201cAllow\u201d, then press Try Again. ";
+        }
+        msg += "The exam cannot start until camera access is enabled.";
+        return msg;
+      }
       case "NotFoundError":
       case "DevicesNotFoundError":
         return "No camera was detected on this device. Connect a working webcam and press Try Again.";
@@ -186,12 +200,49 @@
     }
   }
 
+  // Front-facing (selfie) lens constraints for getUserMedia — required on
+  // mobile so the correct camera is opened; desktop browsers ignore
+  // `facingMode` when it cannot be satisfied.
+  function userMediaConstraints() {
+    return {
+      video: {
+        facingMode: "user",
+        width: { ideal: 640 },
+        height: { ideal: 480 }
+      },
+      audio: false
+    };
+  }
+
+  // Try the explicit front-camera constraints first; if the browser/device
+  // rejects them (e.g. OverconstrainedError / NotReadableError on some Android
+  // Chrome and iOS Safari builds), fall back to a bare `{ video: true }`
+  // request so a working camera still connects.
+  function getUserMediaWithFallback(onStream, onError) {
+    navigator.mediaDevices.getUserMedia(userMediaConstraints())
+      .then(onStream)
+      .catch(function (err) {
+        navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+          .then(onStream)
+          .catch(onError);
+      });
+  }
+
+  function isMobileDevice() {
+    const ua = (navigator.userAgent || "") + " " + (navigator.platform || "");
+    return (
+      /Android|iPhone|iPad|iPod/i.test(ua) ||
+      (ua.indexOf("Macintosh") !== -1 && navigator.maxTouchPoints > 1) // iPadOS 13+
+    );
+  }
+
   // Performs the camera-verification check. Runs on every load (including
   // refreshes) so a student can never skip it.
   function verifyCamera() {
     setCameraGateState("Requesting camera access\u2026", "");
     if (cameraStartBtn) cameraStartBtn.disabled = true;
     if (cameraRetryBtn) cameraRetryBtn.style.display = "none";
+    if (cameraAllowBtn) cameraAllowBtn.style.display = "none";
     if (cameraPreview) {
       cameraPreview.style.display = "none";
       cameraPreview.srcObject = null;
@@ -244,25 +295,30 @@
     }
 
     try {
-      navigator.mediaDevices.getUserMedia(
-        { video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false }
-      )
-        .then(function (stream) {
+      getUserMediaWithFallback(
+        function (stream) {
           if (verified) return;
           captureStream = stream;
           // Preview element when present (student sees their own live feed);
           // otherwise a detached element still proves frames are flowing.
           const videoEl = cameraPreview || document.createElement("video");
           videoEl.muted = true;
+          videoEl.autoplay = true;
           videoEl.playsInline = true;
+          // Inline-playback attributes (as properties AND attributes) so the
+          // iOS Safari / Android Chrome autoplay heuristics honour them.
+          videoEl.setAttribute("muted", "");
+          videoEl.setAttribute("autoplay", "");
+          videoEl.setAttribute("playsinline", "");
+          videoEl.setAttribute("webkit-playsinline", "");
           videoEl.srcObject = stream;
           if (cameraPreview) cameraPreview.style.display = "block";
           // "loadeddata" fires only after actual video frames are available,
           // so a camera that reports a stream but delivers no pixels fails.
           videoEl.addEventListener("loadeddata", onLive, { once: true });
           videoEl.play().then(function () {}).catch(function () {});
-        })
-        .catch(function (err) {
+        },
+        function (err) {
           if (verified) return;
           window.clearTimeout(gateTimer);
           cameraVerified = false;
@@ -276,7 +332,8 @@
             cameraErrorMessage(err)
           );
           if (cameraRetryBtn) cameraRetryBtn.style.display = "block";
-        });
+        }
+      );
     } catch (err) {
       if (verified) return;
       window.clearTimeout(gateTimer);
@@ -304,16 +361,15 @@
       return;
     }
     try {
-      navigator.mediaDevices.getUserMedia(
-        { video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false }
-      )
-        .then(function (stream) {
+      getUserMediaWithFallback(
+        function (stream) {
           captureStream = stream;
           startFaceMonitor(); // stream is live again -> resume face checks
-        })
-        .catch(function () {
+        },
+        function () {
           captureStream = null; // camera busy / denied -> monitor stays off
-        });
+        }
+      );
     } catch (err) {
       captureStream = null;
     }
@@ -406,11 +462,26 @@
     if (submitBtn) submitBtn.disabled = true;
     if (prevBtn) prevBtn.disabled = true;
     if (nextBtn) nextBtn.disabled = true;
-    verifyCamera();
+    if (cameraStartBtn) cameraStartBtn.disabled = true;
+    // Camera acquisition MUST start from an explicit user gesture — iOS Safari
+    // and Android Chrome can silently reject getUserMedia calls that are not
+    // triggered by a tap/click — so wait for "Allow & Turn On Camera".
+    if (cameraAllowBtn) cameraAllowBtn.style.display = "block";
+    if (cameraRetryBtn) cameraRetryBtn.style.display = "none";
+    setCameraGateState(
+      "Tap \u201cAllow & Turn On Camera\u201d below to start the camera check. A secure (HTTPS) connection is required.",
+      ""
+    );
   }
 
   function hideCameraGate() {
     if (cameraGateOverlay) cameraGateOverlay.style.display = "none";
+  }
+
+  if (cameraAllowBtn) {
+    cameraAllowBtn.addEventListener("click", function () {
+      verifyCamera(); // user gesture -> getUserMedia is permitted on mobile
+    });
   }
 
   if (cameraRetryBtn) {
@@ -544,15 +615,23 @@
   //      across skin tones), and
   //   2. Inter-frame motion (pixel deltas between consecutive frames), so a
   //      present-but-still student is never falsely flagged.
-  // When BOTH are absent for a sustained window (~5s), the student is treated
+  // When BOTH are absent for a sustained window (~7s), the student is treated
   // as out-of-frame / lens covered. A `face_not_detected` strike is then
   // reported through the SAME pipeline as tab-switching — server-authoritative
   // count, the on-screen security warning modal, and a hard auto-submit once
   // the threshold is reached.
   const FACE_MONITOR_INTERVAL_MS = 1000;
-  const FACE_MONITOR_MISSES_TO_FLAG = 5;    // ~5s of sustained absence
-  const FACE_SKIN_THRESHOLD = 0.08;         // >= 8% of central pixels skin-toned
-  const FACE_MOTION_THRESHOLD = 0.012;      // avg normalized channel delta
+  // Consecutive zero-detection ticks required before a strike is reported.
+  // At a 1s interval this means ~7 SECONDS of sustained absence — a clearly
+  // visible but briefly-motionless student is never flagged for a couple of
+  // dropped or dead-still frames.
+  const FACE_MONITOR_MISSES_TO_FLAG = 7;    // ~7s of sustained absence
+  // Forgiving presence baselines: only >= 3.5% of the central pixels need to
+  // register as skin-toned (down from 8%), and the inter-frame motion required
+  // is halved, so varying room lighting and darker/fairer skin tones all
+  // still count as "face present" instead of earning a false strike.
+  const FACE_SKIN_THRESHOLD = 0.035;        // >= 3.5% of central pixels skin-toned
+  const FACE_MOTION_THRESHOLD = 0.006;      // avg normalized channel delta
   let faceMonitorInterval = null;
   let faceMonitorVideo = null;
   let faceMonitorCanvas = null;
@@ -580,7 +659,12 @@
     if (!captureStream || !captureStream.active) return; // no live camera -> skip
     faceMonitorVideo = document.createElement("video");
     faceMonitorVideo.muted = true;
+    faceMonitorVideo.autoplay = true;
     faceMonitorVideo.playsInline = true;
+    faceMonitorVideo.setAttribute("muted", "");
+    faceMonitorVideo.setAttribute("autoplay", "");
+    faceMonitorVideo.setAttribute("playsinline", "");
+    faceMonitorVideo.setAttribute("webkit-playsinline", "");
     faceMonitorVideo.srcObject = captureStream;
     faceMonitorVideo.play().catch(function () {});
     faceMonitorCanvas = document.createElement("canvas");
@@ -630,10 +714,13 @@
         const r = frameData[idx];
         const g = frameData[idx + 1];
         const b = frameData[idx + 2];
-        // BT.601 YCbCr skin-tone heuristic.
+        // BT.601 YCbCr skin-tone heuristic. The bounding ranges are deliberately
+        // BROAD (Cr 130-180 / Cb 70-130) so darker, fairer and differently-lit
+        // skin tones all count toward "present" under standard room lighting —
+        // only a genuinely empty or lens-covered frame fails the check.
         const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
         const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-        if (cr >= 133 && cr <= 173 && cb >= 77 && cb <= 127) skinCount++;
+        if (cr >= 130 && cr <= 180 && cb >= 70 && cb <= 130) skinCount++;
         total++;
         if (lastFaceFrameData !== null) {
           motionSum +=
@@ -672,7 +759,12 @@
     function drawFrame(stream) {
       const video = document.createElement("video");
       video.muted = true;
+      video.autoplay = true;
       video.playsInline = true;
+      video.setAttribute("muted", "");
+      video.setAttribute("autoplay", "");
+      video.setAttribute("playsinline", "");
+      video.setAttribute("webkit-playsinline", "");
       video.srcObject = stream;
       // Watchdog so a hung camera never blocks the violation report.
       const failTimer = window.setTimeout(function () {
@@ -714,14 +806,13 @@
     }
     try {
       ownsStream = true;
-      navigator.mediaDevices.getUserMedia(
-        { video: { width: 320, height: 240 }, audio: false }
-      )
-        .then(function (stream) {
+      getUserMediaWithFallback(
+        function (stream) {
           captureStream = stream;
           drawFrame(stream);
-        })
-        .catch(function () { finish(null); });
+        },
+        function () { finish(null); }
+      );
     } catch (err) {
       finish(null);
     }

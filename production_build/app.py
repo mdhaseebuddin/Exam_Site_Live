@@ -160,6 +160,37 @@ IS_PRODUCTION = FLASK_ENV == "production"
 
 app = Flask(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Human-readable UTC timestamp filter (`utc_fmt`) for templates
+# ---------------------------------------------------------------------------
+def _format_utc_timestamp(value):
+    """Render an ISO-8601 UTC timestamp as 'YYYY-MM-DD HH:MM:SS UTC'.
+
+    The DB stores timestamps as ISO-8601 strings (e.g.
+    '2026-09-17T17:42:29.123456+00:00'), which wrap awkwardly when rendered
+    raw inside the host's violation audit cards. This filter normalizes the
+    value to a compact, single-line format. Naive values are assumed to be
+    UTC; anything unparseable is returned unchanged so legacy/odd data never
+    crashes the page.
+    """
+    if not value:
+        return ""
+    try:
+        ts = str(value).strip()
+        # Python < 3.11 cannot parse a trailing 'Z' — normalize it first.
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S") + " UTC"
+    except (TypeError, ValueError, OverflowError):
+        return value
+
+
+app.jinja_env.filters["utc_fmt"] = _format_utc_timestamp
+
 # SECRET_KEY: fail-fast in production instead of silently using an insecure
 # fallback. In development, a clearly-marked fallback is acceptable.
 _secret_key = os.environ.get("SECRET_KEY", "")
@@ -673,17 +704,19 @@ def _send_otp_email(email: str, code: str) -> bool:
 
     Requires a BREVO_API_KEY (or BREVO_HOST_API_KEY) environment variable. The
     sender address comes from MAIL_DEFAULT_SENDER (defaults to
-    mdhaseebuddin77@gmail.com). If the API key is missing, or delivery fails,
-    the code is logged to the server console/audit log so the flow works
-    out-of-the-box.
+    mdhaseebuddin77@gmail.com). If the API key is missing, the OTP is logged to
+    the audit log so the flow still works out-of-the-box in development. Any
+    provider failure is ALWAYS logged in full (HTTP status / reason / response
+    body / traceback) so the real rejection reason — e.g. Brevo's
+    "Sender not verified" — is never hidden behind a generic message.
     """
     api_key = os.environ.get('BREVO_HOST_API_KEY') or os.environ.get('BREVO_API_KEY')
     sender_email = app.config["MAIL_DEFAULT_SENDER"]
 
-    # Debug: Always log the OTP to the console for local testing/ngrok.
-    print(f"\n[OTP DEBUG] Target: {email} | Code: {code}\n")
-
     if not api_key:
+        # Dev fallback: no live channel is configured — surface the code the
+        # same way the audit log does so the flow still works locally.
+        print(f"\n[OTP DEBUG] Target: {email} | Code: {code}\n")
         print("[OTP] Neither BREVO_HOST_API_KEY nor BREVO_API_KEY configured. OTP printed to console only.")
         audit("otp_generated", email=email, code=code, ip=get_remote_address())
         return False
@@ -703,12 +736,67 @@ def _send_otp_email(email: str, code: str) -> bool:
                 f"{code}\n\nThis code expires in {OTP_LIFETIME_MINUTES} minutes."
             ),
         )
-        api_instance.send_transac_email(send_smtp_email)
+        # Brevo returns a CreateSmtpEmail whose message_id proves the message
+        # was ACCEPTED for delivery. Never assume success: a missing messageId
+        # means Brevo did not queue the email, so report a failure instead of
+        # silently treating it as delivered.
+        response = api_instance.send_transac_email(send_smtp_email)
+        message_id = getattr(response, "message_id", None) if response else None
+        if not message_id:
+            detail = f"Brevo responded without a messageId (response={response!r})"
+            print(f"[OTP WARN] Brevo did not return a messageId — message NOT accepted: {detail}")
+            audit(
+                "otp_email_failed",
+                email=email,
+                sender=sender_email,
+                key="BREVO_HOST_API_KEY",
+                reason="no_message_id",
+                response=repr(response),
+                ip=get_remote_address(),
+                channel="host",
+            )
+            # Dev fallback only: log the code so the flow still works locally.
+            audit("otp_generated", email=email, code=code, ip=get_remote_address())
+            return False
+        print(f"[OTP] Sent host OTP (messageId={message_id}).")
+        audit(
+            "otp_email_sent",
+            email=email,
+            sender=sender_email,
+            key="BREVO_HOST_API_KEY",
+            message_id=message_id,
+            ip=get_remote_address(),
+            channel="host",
+        )
         return True
     except Exception as exc:  # pragma: no cover - network/API dependent
-        print(f"[OTP ERROR] Brevo API Failure: {exc}")
+        # Brevo's REST client raises ApiException carrying .status, .reason
+        # and .body (the raw HTTP response body with Brevo's error details,
+        # e.g. a JSON "Sender not verified" rejection). Extract them explicitly
+        # so the ACTUAL rejection reason is logged/audited instead of a generic
+        # message or a silent fallback to console debug printing.
+        status = getattr(exc, "status", None)
+        reason = getattr(exc, "reason", None)
+        body = getattr(exc, "body", None)
+        if status is not None or body is not None:
+            detail = f"HTTP {status} {reason} body={body!r}"
+            print(f"[OTP ERROR] Brevo API rejected host OTP: {detail}")
+        else:
+            detail = repr(exc)
+            print(f"[OTP ERROR] Brevo delivery exception for host OTP: {detail}")
         traceback.print_exc()
-        audit("otp_email_failed", email=email, error=str(exc), ip=get_remote_address())
+        audit(
+            "otp_email_failed",
+            email=email,
+            sender=sender_email,
+            key="BREVO_HOST_API_KEY",
+            status=status,
+            reason=reason,
+            body=repr(body) if body is not None else None,
+            error=detail,
+            ip=get_remote_address(),
+            channel="host",
+        )
 
     # Delivery failed -> log the code (dev-friendly).
     audit("otp_generated", email=email, code=code, ip=get_remote_address())
@@ -750,9 +838,6 @@ def _send_student_otp(email: str, code: str) -> bool:
     sender_email = (sender_email or "").strip()
     email = (email or "").strip()
 
-    # Debug: Always log the OTP to the console for local testing/ngrok.
-    print(f"\n[OTP DEBUG] Target: {email} | Code: {code}\n")
-
     # Local payload sanity checks — Brevo rejects these payloads anyway, so
     # fail fast with a clear, logged reason instead of a bare API call.
     if not email:
@@ -771,6 +856,9 @@ def _send_student_otp(email: str, code: str) -> bool:
     keys = [k for k in keys if k]
 
     if not keys:
+        # Dev fallback: no live channel configured — surface the code exactly
+        # as the audit log does so the flow still works locally.
+        print(f"\n[OTP DEBUG] Target: {email} | Code: {code}\n")
         print(
             "[OTP] No BREVO_STUDENT_API_KEY_1/_2 configured. "
             "OTP printed to console only."
@@ -1985,6 +2073,48 @@ def host_logout():
     return redirect(url_for("host_login"))
 
 
+# --- Host OTP resend (login / registration) ----------------------------------
+@app.route("/host/resend-otp", methods=["POST"])
+@limiter.limit("6 per minute", methods=["POST"])
+def host_resend_otp():
+    """Re-issue the active host-channel OTP (login or registration).
+
+    This endpoint drives the async "Resend Code" buttons on the host verify
+    pages. It NEVER trusts a client-supplied email: the recipient is taken
+    exclusively from server-side session state, so only a browser that
+    actually has a pending login/registration in progress can trigger a
+    resend. A brand-new code is generated, the 2-minute expiry window is
+    reset, and the code is dispatched through the host Brevo channel.
+    """
+    if session.get("login_step") == "verify" and session.get("login_pending"):
+        target = session["login_pending"]
+        token_key = "login_otp"
+    elif (
+        session.get("reg_step") == "verify"
+        and isinstance(session.get("reg_pending"), dict)
+        and (session.get("reg_pending") or {}).get("email")
+    ):
+        target = session["reg_pending"]["email"]
+        token_key = "reg_otp"
+    else:
+        audit("otp_resend_rejected", ip=get_remote_address())
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "No active verification request was found. Please start again.",
+                }
+            ),
+            400,
+        )
+
+    _issue_session_otp(token_key, target)  # host email channel (default)
+    audit("otp_resend", email=target, channel="host", ip=get_remote_address())
+    return jsonify(
+        {"ok": True, "message": "A new verification code has been sent to your email."}
+    )
+
+
 # --- Host forgot / reset password (OTP) -------------------------------------
 @app.route("/host/forgot-password", methods=["GET", "POST"])
 @limiter.limit("10 per hour", methods=["POST"])
@@ -2700,6 +2830,47 @@ def generate_session():
     if ex.host_email:
         write_tests_conducted(ex.host_email)
     return redirect(url_for("host"))
+
+
+# --- Student OTP resend (registration, universal + legacy entry points) ------
+@app.route("/exam/resend-otp", methods=["POST"])
+@limiter.limit("6 per minute", methods=["POST"])
+def exam_resend_otp():
+    """Re-issue the active student-channel OTP for the in-progress registration.
+
+    Drives the async "Resend Code" button on register_verify.html for BOTH the
+    universal (/exam/register/<exam_id>) and legacy (/register/<session_id>)
+    entry points. Resend uses ONLY server-side pending state — never a
+    client-supplied email — and dispatches through the isolated student Brevo
+    channel, resetting the 2-minute expiry window with a fresh code.
+    """
+    pending = session.get("stu_reg_pending")
+    if (
+        session.get("stu_reg_step") != "verify"
+        or not pending
+        or not pending.get("email")
+    ):
+        audit("otp_resend_rejected", ip=get_remote_address())
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "No active registration was found. Please start the registration again.",
+                }
+            ),
+            400,
+        )
+
+    _issue_session_otp("stu_reg_otp", pending["email"], is_email=True, channel="student")
+    audit(
+        "otp_resend",
+        email=pending["email"],
+        channel="student",
+        ip=get_remote_address(),
+    )
+    return jsonify(
+        {"ok": True, "message": "A new verification code has been sent to your email."}
+    )
 
 
 @app.route("/exam/register/<exam_id>", methods=["GET", "POST"])

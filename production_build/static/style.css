@@ -61,6 +61,16 @@ body {
   white-space: nowrap !important;
 }
 
+/* Host audit-card timestamps: keep the formatted time (YYYY-MM-DD HH:MM:SS
+   UTC) on ONE clean line, aligned with the strike badge and immune to
+   flexbox squeezing so it never wraps under the badge. */
+.violation-timestamp {
+  white-space: nowrap !important;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+}
+
 /* Override specifically for table cells that contain multiline content if needed */
 /* e.g., the student name/phone cell in exam_attempts */
 .table td.nowrap-off {

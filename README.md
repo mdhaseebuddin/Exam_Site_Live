@@ -65,8 +65,8 @@ is locked down until the exam is submitted:
   `devtools_detected` strikes with a 5-second re-arm so keeping DevTools open
   keeps accruing strikes.
 - **Vanilla-JS face-presence monitor** — every second a small Canvas frame is
-  analyzed with a YCbCr skin-tone heuristic plus inter-frame motion; ~5
-  seconds of sustained absence reports a `face_not_detected` strike. No
+  analyzed with a broadened YCbCr skin-tone heuristic plus inter-frame motion;
+  ~7 seconds of sustained absence reports a `face_not_detected` strike. No
   external ML library is used and it works fully offline.
 - **Proof snapshots on every strike** — each incident captures one webcam
   frame, JPEG-encoded to a base64 data-URL via the HTML5 Canvas API, uploaded
@@ -119,13 +119,11 @@ production are:
 |---------------|--------------------------------------------------------|
 | `SECRET_KEY`  | Flask session signing (fail-fast if missing)           |
 | `FLASK_ENV`   | `production`                                           |
-| `SMTP_HOST`   | Gmail SMTP server (`smtp.gmail.com`)                   |
-| `SMTP_PORT`   | `587`                                                  |
-| `SMTP_USER`   | Gmail address used for OTP emails                      |
-| `SMTP_PASS`   | Gmail **App Password** (not your normal password)      |
-| `SMTP_FROM`   | From-address for OTP emails                            |
-| `MAIL_DEFAULT_SENDER` | Host OTP sender (verified on the host Brevo key)    |
-| `MAIL_STUDENT_SENDER` | Student OTP sender (verified on the student Brevo keys) |
+| `BREVO_HOST_API_KEY` | Host-channel Brevo API key (`xkeysib-…`) for password-reset/login OTP emails |
+| `BREVO_STUDENT_API_KEY_1` | Student-channel Brevo API key (tried first) for registration OTP emails |
+| `BREVO_STUDENT_API_KEY_2` | Optional student failover key (used only if key 1 fails) |
+| `MAIL_DEFAULT_SENDER` | Host OTP sender (must be verified on the host Brevo key's account) |
+| `MAIL_STUDENT_SENDER` | Student OTP sender (must be verified on the student Brevo keys' account) |
 | `MAX_SUBMISSIONS` | Lifetime cap on completed submissions (default 500)           |
 | `DAILY_REGISTRATION_LIMIT` | Strict per-host cap on student registrations per 24h (default 70) |
 | `DAILY_REGISTRATION_WINDOW_HOURS` | Rolling window (hours) defining a host's "day" (default 24) |

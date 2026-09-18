@@ -101,7 +101,7 @@
               <span class="badge bg-danger">⚠️ Flagged — auto-submitted</span>
               <span class="badge bg-secondary">Total strikes: {{ session.violation_count }}</span>
               {% if session.completed_at %}
-                <span class="badge bg-secondary">Auto-submitted at: {{ session.completed_at }}</span>
+                <span class="badge bg-secondary violation-timestamp">Auto-submitted at: {{ session.completed_at | utc_fmt }}</span>
               {% endif %}
             </div>
             <ul class="list-unstyled mb-0">
@@ -112,7 +112,7 @@
                       <span class="badge bg-danger">Strike #{{ v.count }}</span>
                       <strong>{{ v.type | replace('_', ' ') | title }}</strong>
                     </div>
-                    <span class="text-muted small">{{ v.created_at }}</span>
+                    <span class="text-muted small violation-timestamp" title="{{ v.created_at }}">{{ v.created_at | utc_fmt }}</span>
                   </div>
                   {% if v.detail %}
                     <div class="text-muted small mt-1">{{ v.detail }}</div>

@@ -102,6 +102,40 @@
           </li>
         </ul>
 
+        <h5>6.1 Live Webcam Monitoring &amp; Snapshot Capture (Proctored Exams)</h5>
+        <p>
+          <strong>Purpose.</strong> For <em>proctored</em> assessments, access to your
+          webcam is requested strictly for identity verification and anti-cheating
+          enforcement. Live frames are analysed on your own device only to confirm that
+          a face is present in the frame; the stream is never broadcast and is not sent
+          to any third party.
+        </p>
+        <p>
+          <strong>Snapshot auditing.</strong> When a security incident is recorded (for
+          example, a tab switch, window-focus loss, or a face-not-detected event), one
+          low-resolution video frame is captured as a proof snapshot and stored securely
+          in the host&rsquo;s audit log together with the violation record and its
+          timestamp. Periodic low-resolution frames are also analysed in the browser
+          during face-presence monitoring; these transient frames are not retained
+          outside the audit record.
+        </p>
+        <p>
+          <strong>Retention &amp; deletion.</strong> Proof snapshots and the
+          face-presence telemetry derived from them are tied strictly to your exam
+          session and are kept only as long as the session&rsquo;s audit record is
+          retained under Section 8 below. The exam host may delete the attempt (which
+          removes its snapshots) at any time, and the snapshots are never used for
+          facial recognition profiling, sold, or shared with any unauthorised third
+          party.
+        </p>
+        <p>
+          <strong>Consent.</strong> Camera access begins only after you are informed of
+          this policy at registration and on the camera-gate screen (which links to it),
+          and only when you deliberately allow camera access for the proctored exam. You
+          may deny permission, but a proctored exam cannot then be started on that
+          device.
+        </p>
+
         <h5>7. How Your Data Is Stored Securely</h5>
         <p>
           All platform data is stored in a structured, relational database and
@@ -149,6 +183,12 @@
             <strong>Preserve exam history</strong> — retain past exams, results,
             and server-side reports so you can review your history across
             logins at any time.
+          </li>
+          <li>
+            <strong>Proctoring evidence</strong> — violation records, timestamps,
+            and proof snapshots are retained with the exam session until the exam
+            host deletes them or the associated session/account data is removed
+            under these retention rules.
           </li>
         </ul>
 

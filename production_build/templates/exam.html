@@ -89,11 +89,18 @@
         <p>This exam is proctored. You must allow camera access and connect a
            working webcam before the exam can start. The exam stays locked
            until a live video feed is detected.</p>
-        <video id="cameraPreview" class="camera-preview" autoplay muted playsinline style="display:none;"></video>
-        <p id="cameraGateStatus" class="mb-1">Requesting camera access…</p>
+        <p class="small text-muted mb-2">
+          By turning on the camera you consent to live camera monitoring and
+          capture of low-resolution proof snapshots for identity verification
+          and anti-cheating enforcement, as described in the
+          <a href="{{ url_for('privacy') }}" target="_blank" rel="noopener">Privacy Policy</a>.
+        </p>
+        <video id="cameraPreview" class="camera-preview" autoplay muted playsinline webkit-playsinline style="display:none;"></video>
+        <p id="cameraGateStatus" class="mb-1">Tap “Allow & Turn On Camera” to begin.</p>
         <p id="cameraGateError" class="violation-modal-count camera-gate-error"></p>
       </div>
       <div class="violation-modal-footer">
+        <button id="cameraAllowBtn" type="button" class="btn btn-primary w-100 mb-2">📷 Allow &amp; Turn On Camera</button>
         <button id="cameraRetryBtn" type="button" class="btn btn-outline-secondary w-100 mb-2" style="display:none;">🔄 Try Again</button>
         <button id="cameraStartBtn" type="button" class="btn btn-success w-100" disabled>Start Exam →</button>
       </div>

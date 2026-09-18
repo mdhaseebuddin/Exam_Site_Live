@@ -62,8 +62,9 @@ including the enterprise-grade, host-configurable proctoring and browser-lockdow
   `loadeddata` event (real frames), with a 10-second watchdog and per-error guidance; the server
   clock only starts via `/exam/<id>/start` after the gate passes.
 - **Face-presence monitor**: every second a 160×120 canvas frame is analyzed with a BT.601 YCbCr
-  skin-tone heuristic (≥ 8% central pixels) plus inter-frame motion (> 0.012 normalized delta);
-  ~5 seconds of sustained absence reports a `face_not_detected` strike. Works fully offline.
+  skin-tone heuristic (broad Cb/Cr ranges, ≥ 3.5% central pixels) plus inter-frame motion
+  (> 0.006 normalized delta); ~7 seconds of sustained absence reports a `face_not_detected`
+  strike. Works fully offline.
 - **DevTools detection**: a 2-second poll combining an outer/inner window-size-delta probe
   (≥ 100 px — catches docked panels including Network/Console) with a `debugger;` round-trip probe
   (> 120 ms — catches undocked/remote DevTools), re-armed every 5 seconds.
