@@ -3971,15 +3971,36 @@ def _submit_exam(session_id):
         return jsonify({"error": "invalid or already submitted"}), 400
     max_cap = session_max_capacity(s)
 
-    # A session whose clock was never started (the camera-verification gate /
-    # POST /start never ran) cannot be submitted — the exam must begin first.
+    # A submission request may arrive for a session whose clock was never
+    # started (the camera-verification gate / POST /start never ran). This must
+    # NEVER bounce back with a rejection that provokes client-side alert
+    # cascades (the historical "The exam has not started yet." 400 + alert ->
+    # blur -> strike -> resubmit loop). Instead, back-fill the missing clock
+    # fields (started_at now, plus a deadline so the deadline-enforcement below
+    # has a sane value, using the session's configured time limit) and let the
+    # normal submission flow finish, grade and finalize the attempt. The final
+    # commit — the same transaction that persists the answers and completed_at —
+    # also persists these back-filled fields. If genuine work exists (real
+    # answers and/or recorded violations) this is a lost-/start race; if the
+    # payload is empty it is a stray pre-exam auto-submit that escaped the
+    # client guard — either way the session finalizes cleanly instead of being
+    # left in a half-open state.
     if s.started_at is None:
+        now_utc = datetime.now(timezone.utc)
+        s.started_at = now_utc.isoformat()
+        if not s.deadline:
+            s.deadline = (
+                now_utc
+                + timedelta(
+                    minutes=int((s.config or {}).get("time_limit_minutes", 30) or 30)
+                )
+            ).isoformat()
         audit(
-            "submit_rejected_not_started",
+            "submit_started_retroactively",
             session_id=session_id,
+            reason="started_at_backfilled_on_submit",
             ip=get_remote_address(),
         )
-        return jsonify({"error": "The exam has not started yet."}), 400
 
     # ---- DEADLINE ENFORCEMENT (server-side, tamper-proof) ----------------
     # The exam's absolute UTC deadline is stored on the server (in the DB),

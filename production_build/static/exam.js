@@ -48,6 +48,10 @@
   // force-submitted and the student is redirected to the results page.
   let forcedSubmitRequested = false;
   let redirectScheduled = false;
+  // Two-step inline confirmation for the manual Finish button — replaces the
+  // native confirm() dialog (which steals window focus and fires a synthetic
+  // blur that would be counted as a focus-loss strike).
+  let submitConfirmArmed = false;
   // Debounce / rate-limit for strikes: a single physical action — switching
   // tabs, losing focus, exiting fullscreen — fires blur + visibilitychange +
   // fullscreenchange almost simultaneously. The FIRST event claims a
@@ -143,6 +147,7 @@
     // 3) Hide the camera preview and every lingering proctoring overlay so
     //    only the "Thank You" result screen remains visible.
     hideViolationOverlays();
+    hideSubmitNotice();
     if (cameraGateOverlay) cameraGateOverlay.style.display = "none";
   }
 
@@ -424,14 +429,20 @@
   // Proctoring-only: unproctored exams never force fullscreen.
   if (PROCTORING_ENABLED) {
     document.addEventListener("click", function () {
+      // Fullscreen enforcement only applies during the ACTIVE exam, never
+      // while the student is on the camera gate / pre-exam setup screen.
+      if (!examStarted) return;
       if (!submitting && !submitted && !redirectScheduled) requestFullscreen();
     }, true);
     document.addEventListener("keydown", function () {
+      if (!examStarted) return;
       if (!submitting && !submitted && !redirectScheduled) requestFullscreen();
     }, true);
   }
 
   function onFullscreenChange() {
+    // Exiting fullscreen on the pre-exam setup screen is not a violation.
+    if (!examStarted) return;
     if (submitting || submitted || redirectScheduled) return;
     if (!isFullscreen()) {
       // Exiting fullscreen is a security flag. Report it and block the page
@@ -679,6 +690,7 @@
   // One analysis tick: reads the camera frame, checks for skin + motion, and
   // escalates a sustained absence into a strike.
   function checkFacePresence() {
+    if (!examStarted) return;
     if (submitting || submitted || redirectScheduled) return;
     if (!faceMonitorVideo || !faceMonitorCtx) return;
     if (!faceMonitorVideo.videoWidth || faceMonitorVideo.readyState < 2) return;
@@ -822,6 +834,14 @@
     // Unproctored exams have no strike counting at all (the server also
     // ignores any reports), so nothing to report here.
     if (!PROCTORING_ENABLED) return;
+    // Proctoring only governs the ACTIVE exam (after the camera gate passed
+    // and "Start Exam" was clicked). While the student still sits on the
+    // camera gate / pre-exam setup screen, a window blur, tab switch or
+    // fullscreen change is an ordinary browser action and MUST NOT accrue a
+    // strike. Reporting violations there is what fed the infinite
+    // alert -> blur -> strike -> resubmit loop when a camera permission prompt
+    // was pending or blocked.
+    if (!examStarted) return;
     // Once a submission is underway, stop counting incidents.
     if (submitting || submitted || redirectScheduled) return;
 
@@ -1029,6 +1049,10 @@
 
   function forceSubmitExam() {
     if (submitted || redirectScheduled) return;
+    // A forced submission (strike threshold / server flag) only ever applies
+    // to a session whose clock is already running, so record that locally to
+    // satisfy submitExam()'s examStarted guard on the page-load path too.
+    examStarted = true;
     forcedSubmitRequested = true;
     // Stop the webcam + clear every proctoring interval IMMEDIATELY, before
     // any fetch — the camera light must go off the moment a forced submit is
@@ -1053,6 +1077,7 @@
   // exams, where the student browses and switches tabs normally.
   if (PROCTORING_ENABLED) {
   function onVisibilityChange() {
+    if (!examStarted) return;
     if (document.hidden) {
       focusLost = true;
       if (!submitting && !submitted) {
@@ -1067,6 +1092,9 @@
   document.addEventListener("visibilitychange", onVisibilityChange);
 
   window.addEventListener("blur", function () {
+    // No strikes can accrue while the student is still on the camera gate /
+    // pre-exam screen (this blur-on-dismiss was the trigger for the loop).
+    if (!examStarted) return;
     if (submitting || submitted) return;
     // `blur` fires both when a tab is switched AND when the user clicks into
     // another application while the tab stays visible. Report it either way.
@@ -1077,6 +1105,7 @@
   });
 
   window.addEventListener("focus", function () {
+    if (!examStarted) return;
     focusLost = false;
     if (!submitting && !submitted) requestFullscreen();
   });
@@ -1085,6 +1114,9 @@
   // Right-click -> no context menu, no "inspect element".
   document.addEventListener("contextmenu", function (e) {
     e.preventDefault();
+    // Block the menu even on the pre-exam screen, but never report a strike
+    // until the exam has actually started.
+    if (!examStarted) return false;
     if (!submitting && !submitted) {
       reportViolation("contextmenu", "Right-click / inspect attempt blocked");
     }
@@ -1095,6 +1127,9 @@
   ["copy", "cut", "paste"].forEach(function (evtName) {
     document.addEventListener(evtName, function (e) {
       e.preventDefault();
+      // Until the exam starts, clipboard use is ordinary browsing — block the
+      // operation but never turn it into a security strike.
+      if (!examStarted) return;
       if (!submitting && !submitted) {
         reportViolation("copy_paste", "Clipboard operation blocked: " + evtName);
       }
@@ -1119,6 +1154,9 @@
     if (isDevtoolsKey || isClipboardKey || isSelectAllKey || isFullscreenToggle) {
       e.preventDefault();
       e.stopPropagation();
+      // Block the shortcut keys even on the pre-exam screen, but never report
+      // a violation until the exam actually started.
+      if (!examStarted) return false;
       if (!submitting && !submitted && !e.repeat) {
         const what = isDevtoolsKey
           ? "Developer tools / save / print / refresh shortcut"
@@ -1193,6 +1231,7 @@
   }
 
   function checkDevTools() {
+    if (!examStarted) return;
     if (submitting || submitted || redirectScheduled) return;
     if (devtoolsOpen) return; // already struck for the current open session
 
@@ -1246,7 +1285,7 @@
     requestFullscreen();
     if (supportsFullscreen()) {
       window.setTimeout(function () {
-        if (!isFullscreen() && !submitting && !submitted && !redirectScheduled && !document.hidden) {
+        if (!isFullscreen() && examStarted && !submitting && !submitted && !redirectScheduled && !document.hidden) {
           if (fullscreenBlockOverlay) fullscreenBlockOverlay.style.display = "flex";
         }
       }, 900);
@@ -1267,6 +1306,7 @@
   }
 
   function syncFromServer() {
+    if (!examStarted) return;
     fetch("/exam/" + cfg.sessionId + "/time", { headers: { "Accept": "application/json" } })
       .then(function (res) { return res.json(); })
       .then(function (data) {
@@ -1300,6 +1340,7 @@
   }
 
   function renderTimer() {
+    if (!examStarted) return;
     const remaining = computeRemaining();
     timerEl.textContent = formatTime(remaining);
     if (remaining <= 0) {
@@ -1428,12 +1469,83 @@
     }
   }
 
+  // ------------------------ Inline submission notice -----------------------
+  // Replaces the blocking native alert() on submission failure. A fixed
+  // position, focus-safe toast is used: it never takes window focus, and
+  // dismissing it can never fire a synthetic blur event. (The old alert()
+  // lost focus on close, tripping the window-blur listener -> a strike ->
+  // another auto-submit -> another alert: the infinite loop we are fixing.)
+  let submitNoticeEl = null;
+  let submitNoticeHideTimer = null;
+
+  function hideSubmitNotice() {
+    if (submitNoticeHideTimer) {
+      window.clearTimeout(submitNoticeHideTimer);
+      submitNoticeHideTimer = null;
+    }
+    if (submitNoticeEl) submitNoticeEl.style.display = "none";
+  }
+
+  function showSubmitNotice(message) {
+    if (!message) return;
+    if (!submitNoticeEl) {
+      submitNoticeEl = document.createElement("div");
+      submitNoticeEl.id = "submitNotice";
+      submitNoticeEl.setAttribute("role", "alert");
+      submitNoticeEl.setAttribute("aria-live", "polite");
+      submitNoticeEl.style.cssText =
+        "position:fixed;top:12px;left:50%;transform:translateX(-50%);" +
+        "z-index:99999;max-width:600px;box-sizing:border-box;" +
+        "background:#fff3cd;color:#664d03;border:1px solid #c1a962;" +
+        "border-left:6px solid #e6a700;border-radius:8px;" +
+        "padding:12px 18px;box-shadow:0 4px 12px rgba(0,0,0,.18);" +
+        "font-size:15px;line-height:1.45;text-align:left;";
+      submitNoticeEl.addEventListener("click", hideSubmitNotice);
+      document.body.appendChild(submitNoticeEl);
+    }
+    submitNoticeEl.textContent = message;
+    submitNoticeEl.style.display = "block";
+    // Auto-dismiss after 8 seconds so a stale notice never lingers.
+    hideSubmitNotice();
+    submitNoticeHideTimer = window.setTimeout(function () {
+      if (submitNoticeEl) submitNoticeEl.style.display = "none";
+      submitNoticeHideTimer = null;
+    }, 8000);
+  }
+
   async function submitExam(auto) {
     // Never submit more than once (manual + auto, or repeated auto triggers).
     if (submitted || submitting) return;
+    // The auto-submit routine (countdown tick, server re-sync, forced submit)
+    // MUST be inert while the student is still on the camera gate / pre-exam
+    // setup screen. A session whose clock was never started has no deadline to
+    // expire, so submitting there bounced off the backend with "The exam
+    // has not started yet." and fed the alert -> blur -> strike loop. Every
+    // legitimate entry point sets examStarted = true first (beginExam from the
+    // Start Exam button, or the page-load paths the server already considers a
+    // started session).
+    if (!examStarted) return;
     if (!auto) {
-      const ok = window.confirm("Are you sure you want to submit your test?");
-      if (!ok) return;
+      // Two-step inline confirmation — NEVER a native confirm() dialog. Native
+      // dialogs steal window focus; dismissing them fires a synthetic blur
+      // event that would be counted as a focus-loss strike (the same failure
+      // mode as the old alert() cascade). First click arms the button; a second
+      // click within the 5-second window submits. Auto-submits bypass this.
+      if (!submitConfirmArmed) {
+        submitConfirmArmed = true;
+        submitBtn.textContent = "Click again to confirm submission";
+        submitBtn.classList.add("btn-warning", "text-dark");
+        window.setTimeout(function () {
+          submitConfirmArmed = false;
+          if (!submitting && !submitted) {
+            submitBtn.textContent = "Finish";
+            submitBtn.classList.remove("btn-warning", "text-dark");
+          }
+        }, 5000);
+        return;
+      }
+      submitConfirmArmed = false;
+      submitBtn.classList.remove("btn-warning", "text-dark");
     }
     // The submission is now TRIGGERED: immediately stop every active media
     // track (the webcam light goes off NOW, not after the fetch completes),
@@ -1444,6 +1556,9 @@
     submitBtn.disabled = true;
     submitBtn.textContent = "Submitting...";
     submitting = true;
+    // `data` is hoisted to function scope so the catch block below can read
+    // the server's `not_started` flag and pick a non-blocking remediation.
+    let data = {};
 
     try {
 // Send the student's registration info AND their answers together.
@@ -1461,7 +1576,6 @@
       // (e.g. an HTML error page or a CSRF rejection) throw raw tokens back at
       // the student. If the body isn't valid JSON we fall back to an empty
       // object and rely on the HTTP status code for a friendly message.
-      let data = {};
       try {
         data = await res.json();
       } catch (parseErr) {
@@ -1474,6 +1588,7 @@
       }
       submitted = true;
       hideViolationOverlays();
+      hideSubmitNotice();
       exitFullscreenQuietly();
       showResult(data);
       // A forced submission (3rd security violation) lands the student on the
@@ -1482,15 +1597,38 @@
     } catch (err) {
       submitBtn.disabled = false;
       submitBtn.textContent = "Finish";
-      // Only surface a failure alert if the exam has NOT already been saved.
+      // Only surface a failure notice if the exam has NOT already been saved.
       // If a transient network error happens during auto-submit, the next
       // server sync re-triggers the auto-submit automatically. For a forced
       // (violation) submission we never block behind a dialog — we redirect
       // and let the flagged exam page retry the submit.
       if (!submitted) {
-        if (forcedSubmitRequested) scheduleResultRedirect();
-        else {
-          window.alert("Submission failed: " + err.message);
+        if (forcedSubmitRequested) {
+          scheduleResultRedirect();
+        } else if (data && data.not_started) {
+          // The backend says this session's clock was never started — an
+          // auto-submit escaped the examStarted guard above. Drop quietly back
+          // to the pre-exam state: reset the flag, show a NON-BLOCKING inline
+          // notice (never a native alert, which would steal focus and re-trigger
+          // the window-blur strike loop) and re-open the camera gate instead of
+          // resuming monitors on a session that is not running.
+          examStarted = false;
+          showSubmitNotice(
+            "Your exam has not started yet. " +
+            (PROCTORING_ENABLED
+              ? "Please verify your camera and click \u201cStart Exam\u201d to begin."
+              : "The exam session has not been started yet. Please refresh the page.")
+          );
+          if (PROCTORING_ENABLED) {
+            initCameraGate();
+          } else {
+            window.setTimeout(beginExam, 1500);
+          }
+        } else {
+          // Inline, non-blocking notice replaces the old window.alert() so a
+          // dismissal can never fire a synthetic window blur (which used to
+          // accrue a strike and re-trigger the auto-submit -> alert loop).
+          showSubmitNotice("Submission failed: " + err.message);
           // Restore the countdown + proctoring monitors so an interrupted
           // submission never leaves the student with a frozen timer or an
           // unmonitored (camera-off) exam while they retry.
@@ -1555,6 +1693,10 @@
   } else if (cfg.deadlineUnix && computeRemaining() <= 0) {
     timerEl.textContent = "00:00";
     timerEl.classList.add("time-up");
+    // This session IS started server-side (it has a deadline) but the clock
+    // elapsed before the student got here. Mark it started locally so
+    // submitExam()'s examStarted guard lets this legitimate submit through.
+    examStarted = true;
     submitExam(true); // deadline already passed -> submit immediately
   } else if (PROCTORING_ENABLED) {
     initCameraGate();
