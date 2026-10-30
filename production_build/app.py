@@ -262,9 +262,13 @@ def _resolve_database_uri() -> str:
       4. <BASE_DIR>/instance/exam.db — the portable local fallback for local
          development and non-ephemeral single-instance hosts.
     """
-    explicit_uri = os.environ.get("DATABASE_URL", "").strip()
-    if explicit_uri:
-        return explicit_uri
+    db_url = os.environ.get("DATABASE_URL", "").strip()
+    if db_url:
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+        elif db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
+            db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        return db_url
 
     render_disk = os.environ.get("RENDER_PERSISTENT_DISK_PATH", "").strip()
     # Only fall back to the Render persistent disk when the operator has not
@@ -293,12 +297,13 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 #     ProgrammingError: invalid connection option "check_same_thread"
 #
 # Therefore it is applied ONLY for SQLite URIs and left empty otherwise.
-_engine_options = {"pool_pre_ping": True}
+_engine_options = {"pool_pre_ping": True, "pool_recycle": 300}
 if _is_sqlite:
     _engine_options["connect_args"] = {"check_same_thread": False}
 else:
     _engine_options["connect_args"] = {}
-app.config["SQLALCHEMY_ENGINE_OPTIONS"] = _engine_options
+SQLALCHEMY_ENGINE_OPTIONS = _engine_options
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = SQLALCHEMY_ENGINE_OPTIONS
 
 db.init_app(app)
 
@@ -1204,14 +1209,26 @@ def inject_capacity_context():
 
     The daily count is scoped to the CURRENT logged-in host, so each host sees
     their own independent rolling-24-hour usage.
+
+    Zero-DB optimization: if no authenticated host is logged in, return default
+    values immediately without querying PostgreSQL.
     """
+    host_email = session.get(SESSION_HOST_EMAIL)
+    if not host_email:
+        return {
+            "completed_submissions": 0,
+            "max_capacity": MAX_SUBMISSIONS,
+            "daily_student_registrations": 0,
+            "daily_registration_limit": DAILY_REGISTRATION_LIMIT,
+            "daily_registration_window_hours": DAILY_REGISTRATION_WINDOW_HOURS,
+        }
     return {
         "completed_submissions": completed_submissions_count(
-            _current_host_email()
+            host_email
         ),
         "max_capacity": MAX_SUBMISSIONS,
         "daily_student_registrations": daily_student_registrations_count(
-            _current_host_email()
+            host_email
         ),
         "daily_registration_limit": DAILY_REGISTRATION_LIMIT,
         "daily_registration_window_hours": DAILY_REGISTRATION_WINDOW_HOURS,
@@ -1798,6 +1815,17 @@ def randomize_questions(bank: list, ratio: int) -> list:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+@app.route("/healthz")
+def healthz():
+    """Dedicated zero-DB health endpoint for keep-alive pingers and uptime monitors.
+
+    Never imports models, queries the database, or initiates an SQLAlchemy
+    session. Returns plain text immediately so keep-alive monitors can hit
+    it 24/7 without Neon PostgreSQL compute waking up.
+    """
+    return "OK", 200
+
+
 @app.route("/favicon.ico")
 def favicon():
     """Serve the site logo as /favicon.ico so browsers pick it up correctly.
@@ -1816,9 +1844,15 @@ def favicon():
 
 @app.route("/")
 def index():
-    """Root — if logged in, go to the dashboard; otherwise the welcome page."""
-    if current_host() is not None:
-        return redirect(url_for("host"))
+    """Root — if logged in, go to the dashboard; otherwise the welcome page.
+
+    Optimized for zero-DB overhead on initial GET requests: anonymous visitors
+    and external pingers receive the welcome landing page immediately without
+    triggering database queries or verification checks.
+    """
+    if session.get(SESSION_HOST_EMAIL):
+        if current_host() is not None:
+            return redirect(url_for("host"))
     return render_template("welcome.html")
 
 
