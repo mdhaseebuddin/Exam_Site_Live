@@ -25,6 +25,26 @@
   const lastSavedAnswers = Object.assign({}, cfg.savedAnswers || {});
   let saveTimeout = null;
   let autoSyncInterval = null;
+  const offlineQueue = {};
+
+  // LocalStorage recovery on initial page load:
+  // If server-rendered answer is blank or outdated, pre-fill with local cached draft
+  questions.forEach((q, idx) => {
+    try {
+      const qid = q.id || `pos_${idx}`;
+      const localDraft = localStorage.getItem(`velotest_${cfg.sessionId}_q_${qid}`) ||
+                         localStorage.getItem(`velotest_${cfg.sessionId}_pos_${idx}`);
+      if (localDraft !== null && localDraft !== undefined && localDraft !== "") {
+        const serverAns = answers[idx];
+        if (serverAns === undefined || serverAns === null || serverAns === "" ||
+            (typeof serverAns === "string" && localDraft.length > serverAns.length)) {
+          answers[idx] = localDraft;
+        }
+      }
+    } catch (e) {
+      console.warn("localStorage init recovery error:", e);
+    }
+  });
   // Submission guards: prevent a duplicate auto-submit (timer tick or server
   // sync re-triggering submitExam) from sending a second POST once time runs
   // out. The backend rejects the second as "already submitted", which would
@@ -109,6 +129,8 @@
     if (violationOverlay) violationOverlay.style.display = "none";
     if (fullscreenBlockOverlay) fullscreenBlockOverlay.style.display = "none";
     if (forceSubmitOverlay) forceSubmitOverlay.style.display = "none";
+    const timeExpiredOverlay = document.getElementById("timeExpiredOverlay");
+    if (timeExpiredOverlay) timeExpiredOverlay.style.display = "none";
   }
 
   // Tears down EVERYTHING proctoring-related the moment a submission is
@@ -861,15 +883,44 @@
       });
   }
 
+  function handleTimerExpired() {
+    if (submitted || submitting) return;
+    // 1. Immediately disable all textareas, inputs, and buttons
+    document.querySelectorAll("textarea, input, select, button").forEach(el => {
+      el.disabled = true;
+    });
+    // 2. Show non-dismissible time expired overlay
+    const timeOverlay = document.getElementById("timeExpiredOverlay");
+    if (timeOverlay) {
+      timeOverlay.style.display = "flex";
+    }
+    // 3. Merge any uncommitted drafts from localStorage
+    questions.forEach((q, idx) => {
+      try {
+        const qid = q.id || `pos_${idx}`;
+        const localVal = localStorage.getItem(`velotest_${cfg.sessionId}_q_${qid}`) ||
+                         localStorage.getItem(`velotest_${cfg.sessionId}_pos_${idx}`);
+        if (localVal !== null && localVal !== undefined && (!answers[idx] || (typeof answers[idx] === "string" && localVal.length > answers[idx].length))) {
+          answers[idx] = localVal;
+        }
+      } catch (e) {}
+    });
+    // 4. Fire final submission API payload
+    submitExam(true);
+  }
+
   function renderTimer() {
     if (!examStarted) return;
     const remaining = computeRemaining();
     timerEl.textContent = formatTime(remaining);
     if (remaining <= 0) {
+      timerEl.textContent = "00:00";
       timerEl.classList.add("time-up");
-      clearInterval(timerInterval);
-      timerInterval = null;
-      submitExam(true); // deadline passed -> auto-submit
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+      }
+      handleTimerExpired();
     }
   }
 
@@ -887,22 +938,55 @@
     serverSyncInterval = setInterval(syncFromServer, 30000);
   }
 
-  // ------------------------- Auto-Save & Debounce Engine ------------------
+  // ------------------------- Auto-Save, LocalStorage & Offline Engine ------------------
+  function clearExamLocalStorage() {
+    try {
+      const prefix = `velotest_${cfg.sessionId}_`;
+      const toRemove = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith(prefix)) {
+          toRemove.push(key);
+        }
+      }
+      toRemove.forEach(k => localStorage.removeItem(k));
+    } catch (e) {
+      console.warn("Error clearing localStorage:", e);
+    }
+  }
+
   function setSaveStatus(state, text) {
-    const statusEl = document.getElementById("saveStatus");
-    if (!statusEl) return;
+    const statusBadge = document.getElementById("saveStatusBadge");
+    const statusText = document.getElementById("saveStatusText");
+    const legacyStatus = document.getElementById("saveStatus");
+
     if (state === "saving") {
-      statusEl.className = "badge bg-info-subtle text-info border border-info";
-      statusEl.textContent = text || "Saving...";
+      if (statusBadge) {
+        statusBadge.className = "save-pill save-pill-saving d-inline-flex align-items-center gap-2 rounded-pill border";
+      }
+      if (statusText) statusText.textContent = text || "Saving...";
+      if (legacyStatus) {
+        legacyStatus.className = "badge bg-warning-subtle text-warning-emphasis border border-warning";
+        legacyStatus.textContent = text || "Saving...";
+      }
     } else if (state === "saved") {
-      statusEl.className = "badge bg-success-subtle text-success border border-success";
-      statusEl.textContent = text || "All changes saved";
-    } else if (state === "unsaved") {
-      statusEl.className = "badge bg-warning-subtle text-warning-emphasis border border-warning";
-      statusEl.textContent = text || "Unsaved changes...";
-    } else if (state === "error") {
-      statusEl.className = "badge bg-danger-subtle text-danger border border-danger";
-      statusEl.textContent = text || "Save failed (offline)";
+      if (statusBadge) {
+        statusBadge.className = "save-pill save-pill-saved d-inline-flex align-items-center gap-2 rounded-pill border";
+      }
+      if (statusText) statusText.textContent = text || "Saved to Cloud";
+      if (legacyStatus) {
+        legacyStatus.className = "badge bg-success-subtle text-success border border-success";
+        legacyStatus.textContent = text || "Saved to Cloud";
+      }
+    } else if (state === "offline") {
+      if (statusBadge) {
+        statusBadge.className = "save-pill save-pill-offline d-inline-flex align-items-center gap-2 rounded-pill border";
+      }
+      if (statusText) statusText.textContent = text || "Offline - Saved locally";
+      if (legacyStatus) {
+        legacyStatus.className = "badge bg-warning-subtle text-danger border border-warning";
+        legacyStatus.textContent = text || "Offline - Saved locally";
+      }
     }
   }
 
@@ -925,13 +1009,30 @@
       answerText = answers[position];
     }
 
-    // Skip redundant database write if already saved with the same value
-    if (position !== undefined && lastSavedAnswers[position] === answerText) {
-      if (!hasUnsavedChanges()) setSaveStatus("saved");
+    // Immediately mirror to browser localStorage keyed by exam session and question ID
+    try {
+      if (answerText !== undefined && answerText !== null) {
+        localStorage.setItem(`velotest_${cfg.sessionId}_q_${questionId}`, answerText);
+        localStorage.setItem(`velotest_${cfg.sessionId}_pos_${position}`, answerText);
+      }
+    } catch (e) {}
+
+    // Check if offline
+    if (!navigator.onLine) {
+      offlineQueue[position] = { questionId, answerText, position };
+      setSaveStatus("offline", "Offline - Saved locally");
       return;
     }
 
-    setSaveStatus("saving", "Saving draft...");
+    // Skip redundant database write if already saved to cloud with the same value
+    if (position !== undefined && lastSavedAnswers[position] === answerText) {
+      if (!hasUnsavedChanges() && Object.keys(offlineQueue).length === 0) {
+        setSaveStatus("saved", "Saved to Cloud");
+      }
+      return;
+    }
+
+    setSaveStatus("saving", "Saving...");
     try {
       const res = await fetch("/exam/" + cfg.sessionId + "/save-answer", {
         method: "POST",
@@ -948,21 +1049,72 @@
       if (res.ok) {
         if (position !== undefined) {
           lastSavedAnswers[position] = answerText;
+          delete offlineQueue[position];
         }
-        setSaveStatus("saved", "Draft saved");
+        if (Object.keys(offlineQueue).length === 0) {
+          setSaveStatus("saved", "Saved to Cloud");
+        }
         updateQuestionPalette();
       } else {
-        setSaveStatus("error", "Save failed");
+        offlineQueue[position] = { questionId, answerText, position };
+        setSaveStatus("offline", "Offline - Saved locally");
       }
     } catch (err) {
-      console.warn("Auto-save network warning:", err);
-      setSaveStatus("error", "Save failed (offline)");
+      console.warn("Auto-save network warning (saved locally):", err);
+      offlineQueue[position] = { questionId, answerText, position };
+      setSaveStatus("offline", "Offline - Saved locally");
     }
   }
 
+  // Background retry for offline queued answers when internet connectivity resumes
+  async function flushOfflineQueue() {
+    if (!navigator.onLine || submitting || submitted) return;
+    const pendingKeys = Object.keys(offlineQueue);
+    if (pendingKeys.length === 0) return;
+
+    setSaveStatus("saving", "Saving...");
+    for (const key of pendingKeys) {
+      const item = offlineQueue[key];
+      if (!item) continue;
+      try {
+        const res = await fetch("/exam/" + cfg.sessionId + "/save-answer", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": cfg.csrfToken
+          },
+          body: JSON.stringify({
+            questionId: item.questionId,
+            answerText: item.answerText,
+            position: item.position
+          })
+        });
+        if (res.ok) {
+          lastSavedAnswers[item.position] = item.answerText;
+          delete offlineQueue[key];
+        }
+      } catch (e) {
+        setSaveStatus("offline", "Offline - Saved locally");
+        return;
+      }
+    }
+
+    if (Object.keys(offlineQueue).length === 0) {
+      setSaveStatus("saved", "Saved to Cloud");
+      updateQuestionPalette();
+    }
+  }
+
+  window.addEventListener("online", () => {
+    flushOfflineQueue();
+  });
+  window.addEventListener("offline", () => {
+    setSaveStatus("offline", "Offline - Saved locally");
+  });
+
   // 1. Debounced Auto-Save for Essay/Text Answers (2000ms delay after typing)
   function debounceSaveAnswer(questionId, answerText, position) {
-    setSaveStatus("unsaved", "Unsaved changes...");
+    setSaveStatus("saving", "Saving...");
     if (saveTimeout) clearTimeout(saveTimeout);
     saveTimeout = setTimeout(() => {
       persistAnswerToBackend(questionId, answerText, position);
@@ -988,8 +1140,13 @@
   if (!autoSyncInterval) {
     autoSyncInterval = setInterval(() => {
       if (submitting || submitted) return;
-      if (hasUnsavedChanges()) {
-        saveCurrentAnswerImmediately();
+      if (hasUnsavedChanges() || Object.keys(offlineQueue).length > 0) {
+        if (navigator.onLine) {
+          flushOfflineQueue();
+          saveCurrentAnswerImmediately();
+        } else {
+          setSaveStatus("offline", "Offline - Saved locally");
+        }
       }
     }, 60000);
   }
@@ -1050,6 +1207,10 @@
         }
         input.addEventListener("change", () => {
           answers[index] = oi;
+          try {
+            localStorage.setItem(`velotest_${cfg.sessionId}_q_${q.id}`, oi);
+            localStorage.setItem(`velotest_${cfg.sessionId}_pos_${index}`, oi);
+          } catch (e) {}
           updateQuestionPalette();
           saveCurrentAnswerImmediately();
         });
@@ -1080,11 +1241,26 @@
         ? "// your code here"
         : "Type your answer here...";
       textarea.style.fontFamily = qtype === "coding" ? "monospace" : "";
-      textarea.value = (answers[index] !== undefined && answers[index] !== null) ? answers[index] : "";
 
-      // Debounced on input/typing (2000ms debounce)
+      // Check localStorage first: if server answer is blank or outdated, pre-fill with local draft
+      let currentVal = (answers[index] !== undefined && answers[index] !== null) ? answers[index] : "";
+      try {
+        const localVal = localStorage.getItem(`velotest_${cfg.sessionId}_q_${q.id}`) ||
+                         localStorage.getItem(`velotest_${cfg.sessionId}_pos_${index}`);
+        if (localVal !== null && localVal !== undefined && (!currentVal || (typeof currentVal === "string" && localVal.length > currentVal.length))) {
+          currentVal = localVal;
+          answers[index] = localVal;
+        }
+      } catch (e) {}
+      textarea.value = currentVal;
+
+      // On typing (input): immediately mirror to localStorage, update palette, and debounce save
       textarea.addEventListener("input", () => {
         answers[index] = textarea.value;
+        try {
+          localStorage.setItem(`velotest_${cfg.sessionId}_q_${q.id}`, textarea.value);
+          localStorage.setItem(`velotest_${cfg.sessionId}_pos_${index}`, textarea.value);
+        } catch (e) {}
         updateQuestionPalette();
         debounceSaveAnswer(q.id, textarea.value, index);
       });
@@ -1092,6 +1268,10 @@
       // Immediate save on blur (clicking outside or switching questions)
       textarea.addEventListener("blur", () => {
         answers[index] = textarea.value;
+        try {
+          localStorage.setItem(`velotest_${cfg.sessionId}_q_${q.id}`, textarea.value);
+          localStorage.setItem(`velotest_${cfg.sessionId}_pos_${index}`, textarea.value);
+        } catch (e) {}
         saveCurrentAnswerImmediately();
       });
 
@@ -1270,6 +1450,7 @@
         throw new Error(serverMessage || "Submission failed (HTTP " + res.status + ")");
       }
       submitted = true;
+      clearExamLocalStorage();
       hideViolationOverlays();
       hideSubmitNotice();
       exitFullscreenQuietly();
@@ -1379,7 +1560,7 @@
     // elapsed before the student got here. Mark it started locally so
     // submitExam()'s examStarted guard lets this legitimate submit through.
     examStarted = true;
-    submitExam(true); // deadline already passed -> submit immediately
+    handleTimerExpired(); // deadline already passed -> freeze inputs, show expired modal & submit
   } else if (PROCTORING_ENABLED) {
     initPreExamGate();
   } else {

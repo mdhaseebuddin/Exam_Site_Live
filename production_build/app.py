@@ -297,15 +297,32 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 #     ProgrammingError: invalid connection option "check_same_thread"
 #
 # Therefore it is applied ONLY for SQLite URIs and left empty otherwise.
-_engine_options = {"pool_pre_ping": True, "pool_recycle": 300}
+# Database Connection Pool Safety for 15+ Concurrent Candidates (Neon & SQLite compatible):
+# - pool_size=10, max_overflow=10: absorbs concurrency bursts without exhausting Neon pooler limits.
+# - pool_pre_ping=True: drops stale or closed sockets automatically before issuing queries.
+# - pool_recycle=280: refreshes idle connections under 5 minutes to stay ahead of Neon compute sleep.
+# - pool_timeout=30: bounds blocking wait times under severe traffic spikes.
+SQLALCHEMY_ENGINE_OPTIONS = {
+    "pool_size": 10,
+    "max_overflow": 10,
+    "pool_pre_ping": True,
+    "pool_recycle": 280,
+    "pool_timeout": 30,
+}
 if _is_sqlite:
-    _engine_options["connect_args"] = {"check_same_thread": False}
+    SQLALCHEMY_ENGINE_OPTIONS["connect_args"] = {"check_same_thread": False}
 else:
-    _engine_options["connect_args"] = {}
-SQLALCHEMY_ENGINE_OPTIONS = _engine_options
+    SQLALCHEMY_ENGINE_OPTIONS["connect_args"] = {}
+_engine_options = SQLALCHEMY_ENGINE_OPTIONS
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = SQLALCHEMY_ENGINE_OPTIONS
 
 db.init_app(app)
+
+
+@app.teardown_appcontext
+def shutdown_session(exception=None):
+    """Ensure scoped SQLAlchemy session connections are promptly returned to the pool."""
+    db.session.remove()
 
 
 # Enable WAL mode + busy_timeout for concurrent reads and safe writes.
@@ -4141,9 +4158,9 @@ def _submit_exam(session_id):
         try:
             deadline_dt = datetime.fromisoformat(s.deadline)
             now_utc = datetime.now(timezone.utc)
-            # Allow a small grace period (10s) so a legitimate auto-submit that
-            # crosses the wire right at 00:00 still succeeds.
-            grace = timedelta(seconds=10)
+            # Generous 3-minute grace period (180s) to prevent edge-case rejections
+            # caused by network latency, cellular reconnection, or large payload uploads.
+            grace = timedelta(seconds=180)
             if now_utc > deadline_dt + grace and s.status != "completed":
                 audit(
                     "submit_rejected_deadline",
