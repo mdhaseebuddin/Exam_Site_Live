@@ -95,7 +95,7 @@
               This attempt reached the maximum allowed security violations
               (<strong>strike {{ session.violation_count }} of {{ violation_threshold | default(3) }}</strong>) and was
               <strong>automatically submitted</strong> by the anti-cheating system.
-              Every strike is listed chronologically with its proof snapshot.
+              Every strike is listed chronologically with its type and timestamp.
             </p>
             <div class="mb-3">
               <span class="badge bg-danger">⚠️ Flagged — auto-submitted</span>
@@ -117,17 +117,6 @@
                   {% if v.detail %}
                     <div class="text-muted small mt-1">{{ v.detail }}</div>
                   {% endif %}
-                  <div class="mt-2">
-                    {% if v.snapshot %}
-                      <a href="{{ v.snapshot }}" target="_blank" rel="noopener" title="Open proof snapshot for strike #{{ v.count }}">
-                        <img src="{{ v.snapshot }}" alt="Proof snapshot of strike #{{ v.count }}"
-                             class="img-thumbnail bg-light"
-                             style="max-width: 170px; max-height: 128px; object-fit: cover;">
-                      </a>
-                    {% else %}
-                      <span class="badge bg-light text-muted border">📷 No snapshot captured (camera unavailable or denied)</span>
-                    {% endif %}
-                  </div>
                 </li>
               {% else %}
                 <li class="text-muted small">No detailed violation rows recorded for this attempt.</li>

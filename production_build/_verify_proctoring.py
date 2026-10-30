@@ -133,7 +133,7 @@ assert code == 200, code
 assert '"enableProctoring": true' in html, "missing enableProctoring true"
 assert '"maxViolations": 5' in html, "missing maxViolations 5"
 assert '"violationThreshold": 5' in html, "missing violationThreshold 5"
-assert 'id="cameraGateOverlay"' in html, "camera gate should render for proctored"
+assert 'id="startGateOverlay"' in html, "pre-exam start gate should render for proctored"
 assert 'id="violationModal"' in html
 print("PROCTORED_PAGE_OK")
 
@@ -143,7 +143,7 @@ code, html = fetch_exam_page("UNPROSESS0002")
 assert code == 200, code
 assert '"enableProctoring": false' in html, "missing enableProctoring false"
 assert '"maxViolations": 3' in html
-assert 'id="cameraGateOverlay"' not in html, "camera gate must NOT render for unproctored"
+assert 'id="startGateOverlay"' not in html, "pre-exam start gate must NOT render for unproctored"
 assert 'id="violationModal"' not in html
 assert 'id="fullscreenBlockOverlay"' not in html
 assert 'id="forceSubmitOverlay"' not in html
@@ -194,6 +194,6 @@ with app.test_request_context("/host"):
     )
 assert 'name="enable_proctoring"' in host_html, "missing enable_proctoring checkbox"
 assert 'name="max_violations"' in host_html, "missing max_violations input"
-assert 'webcam verification, tab-switch monitoring, shortcut blocking, and face-presence checks' in host_html, "missing proctoring note"
+assert 'fullscreen lockdown, tab-switch monitoring, shortcut blocking, and developer-tools detection' in host_html, "missing proctoring note"
 print("HOST_FORM_OK")
 print("ALL_CHECKS_PASSED")

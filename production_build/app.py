@@ -125,11 +125,6 @@ DAILY_REGISTRATION_WINDOW_HOURS = int(os.environ.get("DAILY_REGISTRATION_WINDOW_
 # an automatic final submission + redirect to the results page.
 MAX_VIOLATIONS = int(os.environ.get("MAX_VIOLATIONS", "3"))
 
-# Maximum accepted size for a proctoring proof snapshot (base64 data-URL). The
-# client sends a small webcam JPEG (~20-90 KB), so ~480 KB is a generous cap
-# that still blocks abuse of the column as bulk storage.
-SNAPSHOT_MAX_BYTES = int(os.environ.get("SNAPSHOT_MAX_BYTES", "480000"))
-
 
 def _exam_proctoring_policy(ex):
     """Resolve the proctoring policy for an Exam -> (enabled, max_violations).
@@ -3280,13 +3275,12 @@ def exam(session_id):
 
     time_limit_minutes = int((s.config or {}).get("time_limit_minutes", 30) or 30)
 
-    # The exam clock is NOT started on page load. The exam page runs a blocking
-    # camera-verification gate first; only after a live webcam stream is
-    # verified does the client call POST /exam/<session_id>/start, which sets
-    # started_at / deadline / status and starts the official countdown. This
-    # keeps time spent granting camera permission out of the student's exam
-    # budget. Once started, the deadline is persisted server-side so a page
-    # refresh can never reset or extend the timer.
+    # The exam clock is NOT started on page load. Proctored exams show a brief
+    # pre-exam start gate first; the student presses "Start Exam" and the
+    # client then calls POST /exam/<session_id>/start, which sets
+    # started_at / deadline / status and starts the official countdown. Once
+    # started, the deadline is persisted server-side so a page refresh can
+    # never reset or extend the timer.
     now = datetime.now(timezone.utc)
     if s.started_at is not None:
         deadline = datetime.fromisoformat(s.deadline)
@@ -3295,8 +3289,8 @@ def exam(session_id):
         server_now_unix = int(now.timestamp())
     else:
         # Not started yet: send the full limit as the remaining time and a
-        # sentinel deadline_unix of 0 so the client knows to call /start after
-        # the camera check instead of starting the countdown.
+        # sentinel deadline_unix of 0 so the client knows to call /start instead
+        # of starting the countdown.
         remaining_seconds = time_limit_minutes * 60
         deadline_unix = 0
         server_now_unix = int(now.timestamp())
@@ -3319,7 +3313,7 @@ def exam(session_id):
     cfg = s.config or {}
     # Host-configured proctoring policy (from the parent Exam, or the legacy
     # global default for pre-exam attempts). When disabled, the client skips
-    # the camera gate + lockdown entirely and the student takes a normal exam.
+    # the browser lockdown entirely and the student takes a normal exam.
     proctoring_enabled, max_violations = _exam_proctoring_policy(
         s.exam if s.exam_id else None
     )
@@ -3361,11 +3355,12 @@ def exam(session_id):
 def start_exam(session_id):
     """Start the official exam countdown.
 
-    Called by the client ONLY after the blocking camera-verification gate has
-    confirmed a live webcam stream. Starting the clock here — instead of on
-    the first page load — means the time a student spends granting camera
-    access is never charged against their exam time. Idempotent: a session
-    whose clock is already running simply returns its existing deadline.
+    Called by the client when the student presses "Start Exam" (proctored) or
+    immediately on page load (unproctored). Starting the clock here — instead
+    of on the first page load — means the time a student spends reading the
+    pre-exam instructions is never charged against their exam time.
+    Idempotent: a session whose clock is already running simply returns its
+    existing deadline.
     """
     s = db.session.get(Session, session_id)
     if s is None:
@@ -3528,17 +3523,12 @@ def exam_violation(session_id):
     if len(detail) > 255:
         detail = detail[:255]
 
-    # Proctoring proof snapshot (optional). Only accept a base64 data-URL JPEG
-    # within the size cap — anything else (arbitrary URLs, huge blobs) is
-    # dropped so this column can never be abused as general-purpose storage.
-    raw_snapshot = payload.get("snapshot")
+    # No webcam proof snapshots are captured or stored anymore — the platform
+    # relies purely on browser-level security. Violations carry only metadata
+    # (type + detail + client timestamp), so every incident is persisted with
+    # an empty snapshot reference. If a legacy client still posts a snapshot it
+    # is simply ignored (never validated or decoded).
     snapshot = None
-    if (
-        isinstance(raw_snapshot, str)
-        and raw_snapshot.startswith("data:image/")
-        and len(raw_snapshot) <= SNAPSHOT_MAX_BYTES
-    ):
-        snapshot = raw_snapshot
 
     s.violation_count = (s.violation_count or 0) + 1
     count = s.violation_count
