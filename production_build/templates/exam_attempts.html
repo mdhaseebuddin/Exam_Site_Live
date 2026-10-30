@@ -66,13 +66,13 @@
                     {% endfor %}
                     <td>
                       {% if a.status == 'completed' %}
-                        <span class="badge bg-success">Completed</span>
-                      {% elif a.status == 'started' %}
-                        <span class="badge bg-warning text-dark">In Progress</span>
+                        <span class="badge bg-success badge-status-{{ a.session_id }}">Completed</span>
+                      {% elif a.status in ['started', 'in_progress'] %}
+                        <span class="badge bg-warning text-dark badge-status-{{ a.session_id }}">In Progress</span>
                       {% elif a.status == 'registered' %}
-                        <span class="badge bg-info text-dark">Registered</span>
+                        <span class="badge bg-info text-dark badge-status-{{ a.session_id }}">Registered</span>
                       {% else %}
-                        <span class="badge bg-secondary">Pending</span>
+                        <span class="badge bg-secondary badge-status-{{ a.session_id }}">Pending</span>
                       {% endif %}
                     </td>
                     <td>
@@ -85,7 +85,17 @@
                       {% endif %}
                     </td>
                     <td>
-                      <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('session_details', session_id=a.session_id) }}">View</a>
+                      <div class="d-flex align-items-center gap-1">
+                        <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('session_details', session_id=a.session_id) }}">View</a>
+                        {% if a.status == 'completed' or a.flagged or a.auto_submitted %}
+                          <button type="button" class="btn btn-sm btn-outline-warning reopen-table-btn btn-reopen-{{ a.session_id }}"
+                                  data-session-id="{{ a.session_id }}"
+                                  data-exam-id="{{ exam.exam_id }}"
+                                  data-student-name="{{ (a.student or {}).get('name', 'Candidate') }}">
+                            Re-open
+                          </button>
+                        {% endif %}
+                      </div>
                     </td>
                   </tr>
                 {% endfor %}
@@ -107,6 +117,118 @@
           setTimeout(() => (btn.textContent = 'Copy'), 1500);
         });
       });
+    });
+  </script>
+  <!-- Modal for Re-open Exam from Attempts Table -->
+  <div class="modal fade" id="reopenTableModal" tabindex="-1" aria-labelledby="reopenTableModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="reopenTableModalLabel">🔓 Re-open Candidate Exam</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <p class="mb-2">
+            Re-opening exam for <strong id="modalCandidateName">Candidate</strong> will:
+          </p>
+          <ul class="small text-muted mb-3">
+            <li>Change session status back to <strong>In Progress</strong></li>
+            <li>Reset strikes and security violations to <strong>0</strong></li>
+            <li>Preserve all previously saved answers intact</li>
+            <li>Allow the candidate to re-enter and resume their exam cleanly</li>
+          </ul>
+          <div class="mb-3">
+            <label for="tableExtraMinutesSelect" class="form-label fw-semibold">Timer Extension:</label>
+            <select class="form-select" id="tableExtraMinutesSelect">
+              <option value="0">Keep remaining time / Reset to original duration</option>
+              <option value="15" selected>Add +15 minutes</option>
+              <option value="30">Add +30 minutes</option>
+              <option value="45">Add +45 minutes</option>
+              <option value="60">Add +60 minutes</option>
+            </select>
+          </div>
+          <div id="tableReopenErrorAlert" class="alert alert-danger d-none small"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-primary" id="confirmTableReopenBtn">Confirm & Re-open</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", function() {
+      let activeSessionId = null;
+      let activeExamId = null;
+      const modalEl = document.getElementById("reopenTableModal");
+      const modal = modalEl ? new bootstrap.Modal(modalEl) : null;
+      const nameEl = document.getElementById("modalCandidateName");
+      const confirmBtn = document.getElementById("confirmTableReopenBtn");
+      const errAlert = document.getElementById("tableReopenErrorAlert");
+      const csrfToken = "{{ csrf_token() }}";
+
+      document.querySelectorAll(".reopen-table-btn").forEach(btn => {
+        btn.addEventListener("click", function() {
+          activeSessionId = this.dataset.sessionId;
+          activeExamId = this.dataset.examId;
+          if (nameEl) nameEl.textContent = this.dataset.studentName || "Candidate";
+          if (errAlert) errAlert.classList.add("d-none");
+          if (modal) modal.show();
+        });
+      });
+
+      if (confirmBtn) {
+        confirmBtn.addEventListener("click", function() {
+          if (!activeSessionId) return;
+          confirmBtn.disabled = true;
+          confirmBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status"></span> Unlocking...';
+          const extraMinutes = parseInt(document.getElementById("tableExtraMinutesSelect").value, 10) || 0;
+          const unlockUrl = activeExamId
+            ? `/host/exam/${activeExamId}/session/${activeSessionId}/unlock`
+            : `/host/session/${activeSessionId}/unlock`;
+
+          fetch(unlockUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-CSRFToken": csrfToken
+            },
+            body: JSON.stringify({ extra_minutes: extraMinutes })
+          })
+          .then(res => res.json())
+          .then(data => {
+            if (data.success) {
+              if (modal) modal.hide();
+              const badge = document.querySelector(`.badge-status-${activeSessionId}`);
+              if (badge) {
+                badge.className = `badge bg-warning text-dark badge-status-${activeSessionId}`;
+                badge.textContent = "In Progress";
+              }
+              const reopenBtn = document.querySelector(`.btn-reopen-${activeSessionId}`);
+              if (reopenBtn) {
+                reopenBtn.remove();
+              }
+            } else {
+              if (errAlert) {
+                errAlert.textContent = data.error || data.message || "Failed to unlock session.";
+                errAlert.classList.remove("d-none");
+              }
+            }
+          })
+          .catch(err => {
+            if (errAlert) {
+              errAlert.textContent = "Network error: " + err.message;
+              errAlert.classList.remove("d-none");
+            }
+          })
+          .finally(() => {
+            confirmBtn.disabled = false;
+            confirmBtn.textContent = "Confirm & Re-open";
+          });
+        });
+      }
     });
   </script>
 </body>

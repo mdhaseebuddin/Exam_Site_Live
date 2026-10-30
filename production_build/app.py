@@ -297,22 +297,26 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 #     ProgrammingError: invalid connection option "check_same_thread"
 #
 # Therefore it is applied ONLY for SQLite URIs and left empty otherwise.
-# Database Connection Pool Safety for 15+ Concurrent Candidates (Neon & SQLite compatible):
-# - pool_size=10, max_overflow=10: absorbs concurrency bursts without exhausting Neon pooler limits.
-# - pool_pre_ping=True: drops stale or closed sockets automatically before issuing queries.
-# - pool_recycle=280: refreshes idle connections under 5 minutes to stay ahead of Neon compute sleep.
-# - pool_timeout=30: bounds blocking wait times under severe traffic spikes.
-SQLALCHEMY_ENGINE_OPTIONS = {
-    "pool_size": 10,
-    "max_overflow": 10,
-    "pool_pre_ping": True,
-    "pool_recycle": 280,
-    "pool_timeout": 30,
-}
 if _is_sqlite:
-    SQLALCHEMY_ENGINE_OPTIONS["connect_args"] = {"check_same_thread": False}
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        "pool_pre_ping": True,
+        "pool_recycle": 280,
+        "connect_args": {"check_same_thread": False},
+    }
 else:
-    SQLALCHEMY_ENGINE_OPTIONS["connect_args"] = {}
+    # Database Connection Pool Safety for 15+ Concurrent Candidates on Neon PostgreSQL:
+    # - pool_size=10, max_overflow=10: absorbs concurrency bursts without exhausting Neon pooler limits.
+    # - pool_pre_ping=True: drops stale or closed sockets automatically before issuing queries.
+    # - pool_recycle=280: refreshes idle connections under 5 minutes to stay ahead of Neon compute sleep.
+    # - pool_timeout=30: bounds blocking wait times under severe traffic spikes.
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        "pool_size": 10,
+        "max_overflow": 10,
+        "pool_pre_ping": True,
+        "pool_recycle": 280,
+        "pool_timeout": 30,
+        "connect_args": {},
+    }
 _engine_options = SQLALCHEMY_ENGINE_OPTIONS
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = SQLALCHEMY_ENGINE_OPTIONS
 
@@ -506,6 +510,10 @@ def init_db() -> None:
         if "auto_submitted" not in sess_cols:
             db.session.execute(
                 text("ALTER TABLE sessions ADD COLUMN auto_submitted BOOLEAN NOT NULL DEFAULT FALSE")
+            )
+        if "extra_time_seconds" not in sess_cols:
+            db.session.execute(
+                text("ALTER TABLE sessions ADD COLUMN extra_time_seconds INTEGER NOT NULL DEFAULT 0")
             )
         # ExamViolation.snapshot (proctoring proof image captured at strike time)
         viol_cols = [c["name"] for c in insp.get_columns("exam_violations")]
@@ -2706,6 +2714,90 @@ def session_details_pdf(session_id):
     )
 
 
+@app.route("/host/exam/<exam_id>/session/<session_id>/unlock", methods=["POST"])
+@app.route("/host/session/<session_id>/unlock", methods=["POST"])
+@login_required
+def unlock_candidate_session(session_id, exam_id=None):
+    """Host Re-open / Unlock Endpoint.
+
+    Authenticates that current_host() owns the exam.
+    When invoked:
+      - Finds target ExamSession.
+      - Sets session.status = 'in_progress'.
+      - Resets session.violations_count = 0 (and violation_count, flagged, auto_submitted).
+      - Clears session.submitted_at = None (and completed_at, score).
+      - Deletes any associated ExamViolation rows so strikes start completely fresh.
+      - If timer extension requested (extra_minutes / extra_time_seconds),
+        updates session.started_at, session.extra_time_seconds, and session.deadline.
+      - Retains all previously saved Answer rows intact.
+      - Commits to the database and returns JSON:
+        {"success": True, "message": "Candidate session unlocked successfully"}.
+    """
+    host_email = _current_host_email()
+    s = db.session.get(Session, session_id)
+    if s is None:
+        return jsonify({"success": False, "error": "Candidate session not found"}), 404
+
+    target_exam_id = exam_id or s.exam_id
+    if target_exam_id:
+        ex = db.session.get(Exam, target_exam_id)
+        if ex is not None and ex.host_email and ex.host_email != host_email:
+            return jsonify({"success": False, "error": "Unauthorized"}), 403
+
+    if s.host_email and s.host_email != host_email:
+        return jsonify({"success": False, "error": "Unauthorized"}), 403
+
+    payload = request.get_json(silent=True) or request.form or {}
+    extra_minutes = int(payload.get("extra_minutes", 0) or 0)
+    extra_seconds = int(payload.get("extra_time_seconds", 0) or 0)
+    if extra_minutes > 0 and extra_seconds == 0:
+        extra_seconds = extra_minutes * 60
+    elif extra_seconds > 0 and extra_minutes == 0:
+        extra_minutes = extra_seconds // 60
+
+    # Re-open session & reset violation state
+    s.status = "in_progress"
+    s.violation_count = 0
+    s.violations_count = 0
+    s.flagged = False
+    s.auto_submitted = False
+    s.completed_at = None
+    s.submitted_at = None
+    s.score = None
+
+    # Clear proctoring strike audit rows for this attempt
+    ExamViolation.query.filter_by(session_id=session_id).delete()
+
+    now = datetime.now(timezone.utc)
+    s.started_at = now.isoformat()
+
+    if extra_seconds > 0:
+        s.extra_time_seconds = (getattr(s, "extra_time_seconds", 0) or 0) + extra_seconds
+
+    time_limit = int((s.config or {}).get("time_limit_minutes", 30) or 30)
+    try:
+        current_deadline = datetime.fromisoformat(s.deadline) if s.deadline else now
+    except Exception:
+        current_deadline = now
+
+    if extra_minutes > 0:
+        if current_deadline < now:
+            s.deadline = (now + timedelta(minutes=extra_minutes)).isoformat()
+        else:
+            s.deadline = (current_deadline + timedelta(minutes=extra_minutes)).isoformat()
+    else:
+        # If deadline has already elapsed, restore original time limit from now
+        if current_deadline <= now:
+            s.deadline = (now + timedelta(minutes=time_limit)).isoformat()
+
+    db.session.commit()
+    audit("session_unlocked", exam_id=target_exam_id, session_id=session_id, host_email=host_email, extra_minutes=extra_minutes, ip=get_remote_address())
+    if host_email:
+        write_tests_conducted(host_email)
+
+    return jsonify({"success": True, "message": "Candidate session unlocked successfully"})
+
+
 @app.route("/host/exam/<exam_id>/delete", methods=["POST"])
 @login_required
 def delete_exam(exam_id):
@@ -3018,12 +3110,33 @@ def exam_register(exam_id):
             ratio = int(pending.get("ratio", 0) or 0)
             max_cap = int(pending.get("max_cap") or MAX_SUBMISSIONS)
 
+            # Candidate Re-entry & Resume Gate:
+            # If this is a resume for an active / re-opened session (status == 'in_progress' or 'started'),
+            # authorize the candidate without creating duplicate rows or consuming daily capacity.
+            is_resume = pending.get("is_resume", False)
+            resume_session_id = pending.get("resume_session_id")
+            dup = _find_student_duplicate(exam_id, email_val, phone_val)
+            if not resume_session_id and dup:
+                dup_session = dup.session or db.session.get(Session, dup.session_id)
+                if dup_session and dup_session.status in ("in_progress", "started"):
+                    is_resume = True
+                    resume_session_id = dup_session.id
+
+            if is_resume and resume_session_id:
+                target_sess = db.session.get(Session, resume_session_id)
+                if target_sess and target_sess.status in ("in_progress", "started"):
+                    session[f"auth_{target_sess.id}"] = True
+                    session.pop("stu_reg_step", None)
+                    session.pop("stu_reg_pending", None)
+                    session.pop("stu_reg_otp", None)
+                    audit("session_resumed", exam_id=exam_id, session_id=target_sess.id, email=email_val, phone=phone_val, ip=get_remote_address())
+                    return redirect(url_for("exam", session_id=target_sess.id))
+
             # Per-exam uniqueness is re-checked at finalization (after the OTP
             # round-trip): if the same email/phone was registered for THIS exam
             # link in another browser while the code was pending, the OTP is
             # burned and the registration is rejected. Registrations on OTHER
             # exam links never affect this check.
-            dup = _find_student_duplicate(exam_id, email_val, phone_val)
             if dup is not None:
                 audit(
                     "registration_failed",
@@ -3168,17 +3281,24 @@ def exam_register(exam_id):
         phone_val = request.form.get("phone", "").strip()
         email_val = request.form.get("email", "").strip().lower()
         dup = _find_student_duplicate(exam_id, email_val, phone_val)
+        is_resume = False
+        resume_session_id = None
         if dup:
-            if email_val and dup.email == email_val and phone_val and dup.phone == phone_val:
-                err = "This email address and phone number are already registered."
-            elif email_val and dup.email == email_val:
-                err = "This email address is already registered. Please use a different one."
+            dup_session = dup.session or db.session.get(Session, dup.session_id)
+            if dup_session and dup_session.status in ("in_progress", "started"):
+                is_resume = True
+                resume_session_id = dup_session.id
             else:
-                err = "This phone number is already registered. Please use a different one."
-            audit("registration_failed", exam_id=exam_id, email=email_val, phone=phone_val, reason="duplicate_student", ip=get_remote_address())
-            if request.is_json:
-                return jsonify({"error": err}), 400
-            return render_template("register.html", error=err, form=request.form, captcha=captcha_payload(), **template_vars), 400
+                if email_val and dup.email == email_val and phone_val and dup.phone == phone_val:
+                    err = "This email address and phone number are already registered."
+                elif email_val and dup.email == email_val:
+                    err = "This email address is already registered. Please use a different one."
+                else:
+                    err = "This phone number is already registered. Please use a different one."
+                audit("registration_failed", exam_id=exam_id, email=email_val, phone=phone_val, reason="duplicate_student", ip=get_remote_address())
+                if request.is_json:
+                    return jsonify({"error": err}), 400
+                return render_template("register.html", error=err, form=request.form, captcha=captcha_payload(), **template_vars), 400
 
         # --- core fields (name / phone) ---------------------------------
         for field in required_fields:
@@ -3273,6 +3393,8 @@ def exam_register(exam_id):
             "time_limit": time_limit,
             "ratio": ratio,
             "max_cap": max_cap,
+            "is_resume": is_resume,
+            "resume_session_id": resume_session_id,
         }
         _issue_session_otp("stu_reg_otp", email_val, is_email=True, channel="student")
         session["stu_reg_step"] = "verify"
@@ -3757,6 +3879,7 @@ def register(session_id):
     if s.student is not None:
         if s.status == "completed":
             return render_template("result.html", session=session_to_dict(s))
+        session[f"auth_{session_id}"] = True
         return redirect(url_for("exam", session_id=session_id))
 
     # Fields this session collects (set by the host when generating the link).

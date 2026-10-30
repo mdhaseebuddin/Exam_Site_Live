@@ -20,22 +20,43 @@
   // page refreshes can never extend the exam.
   let deadlineUnix = cfg.deadlineUnix;
   let serverNowUnix = cfg.serverNowUnix;
-  // Pre-load any previously saved answers (e.g. from auto-saves before reload)
+  // Pre-load any previously saved answers (e.g. from auto-saves before reload or host session unlock)
   const answers = Object.assign({}, cfg.savedAnswers || {});
   const lastSavedAnswers = Object.assign({}, cfg.savedAnswers || {});
   let saveTimeout = null;
   let autoSyncInterval = null;
   const offlineQueue = {};
 
-  // LocalStorage recovery on initial page load:
-  // If server-rendered answer is blank or outdated, pre-fill with local cached draft
+  // Hydrate both numeric and string keys from server savedAnswers
+  if (cfg.savedAnswers) {
+    Object.keys(cfg.savedAnswers).forEach((k) => {
+      const v = cfg.savedAnswers[k];
+      answers[k] = v;
+      lastSavedAnswers[k] = v;
+      const num = parseInt(k, 10);
+      if (!isNaN(num)) {
+        answers[num] = v;
+        lastSavedAnswers[num] = v;
+      }
+    });
+  }
+
+  // LocalStorage recovery and server answer synchronization on page load:
+  // Pre-fills textarea state and keeps local cache in sync with server state
   questions.forEach((q, idx) => {
     try {
       const qid = q.id || `pos_${idx}`;
       const localDraft = localStorage.getItem(`velotest_${cfg.sessionId}_q_${qid}`) ||
                          localStorage.getItem(`velotest_${cfg.sessionId}_pos_${idx}`);
+      const serverAns = answers[idx] !== undefined ? answers[idx] : answers[String(idx)];
+      if (serverAns !== undefined && serverAns !== null && serverAns !== "") {
+        answers[idx] = serverAns;
+        if (!localDraft) {
+          localStorage.setItem(`velotest_${cfg.sessionId}_q_${qid}`, serverAns);
+          localStorage.setItem(`velotest_${cfg.sessionId}_pos_${idx}`, serverAns);
+        }
+      }
       if (localDraft !== null && localDraft !== undefined && localDraft !== "") {
-        const serverAns = answers[idx];
         if (serverAns === undefined || serverAns === null || serverAns === "" ||
             (typeof serverAns === "string" && localDraft.length > serverAns.length)) {
           answers[idx] = localDraft;
@@ -267,12 +288,15 @@
   }
 
   function initPreExamGate() {
-    // Lock every exam control until "Start Exam" is pressed. No media-device
-    // access is requested — the exam relies purely on browser-level security.
+    // Lock exam controls until "Start/Resume Exam" is pressed.
     if (submitBtn) submitBtn.disabled = true;
     if (prevBtn) prevBtn.disabled = true;
     if (nextBtn) nextBtn.disabled = true;
     if (startGateOverlay) startGateOverlay.style.display = "flex";
+    if (startExamBtn && cfg.savedAnswers && Object.keys(cfg.savedAnswers).length > 0) {
+      startExamBtn.textContent = "Resume Exam";
+    }
+    hideViolationOverlays();
   }
 
   function hidePreExamGate() {
@@ -1562,8 +1586,21 @@
     examStarted = true;
     handleTimerExpired(); // deadline already passed -> freeze inputs, show expired modal & submit
   } else if (PROCTORING_ENABLED) {
+    // Session is active / re-opened: reset any residual warning modals & resume enforcement cleanly
+    hideViolationOverlays();
+    forcedSubmitRequested = false;
+    redirectScheduled = false;
+    submitting = false;
+    submitted = false;
+    document.querySelectorAll("textarea, input").forEach((el) => { el.disabled = false; });
     initPreExamGate();
   } else {
+    hideViolationOverlays();
+    forcedSubmitRequested = false;
+    redirectScheduled = false;
+    submitting = false;
+    submitted = false;
+    document.querySelectorAll("textarea, input").forEach((el) => { el.disabled = false; });
     beginExam(); // no gate — start the clock right away
   }
 })();

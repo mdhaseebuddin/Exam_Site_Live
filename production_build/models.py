@@ -170,6 +170,23 @@ class Session(db.Model):
         nullable=False,
         default=lambda: datetime.now(timezone.utc).isoformat(),
     )
+    extra_time_seconds = db.Column(db.Integer, nullable=False, default=0)
+
+    @property
+    def violations_count(self):
+        return self.violation_count
+
+    @violations_count.setter
+    def violations_count(self, val):
+        self.violation_count = val
+
+    @property
+    def submitted_at(self):
+        return self.completed_at
+
+    @submitted_at.setter
+    def submitted_at(self, val):
+        self.completed_at = val
 
     student = db.relationship(
         "Student",
@@ -448,6 +465,8 @@ def session_to_dict(s: Session) -> dict:
     """Rebuild the legacy ``session`` dict consumed by every template."""
     return {
         "session_id": s.id,
+        "exam_id": s.exam_id,
+        "extra_time_seconds": getattr(s, "extra_time_seconds", 0) or 0,
         "exam_title": (s.config or {}).get("exam_title", ""),
         "time_limit_minutes": (s.config or {}).get("time_limit_minutes", 30),
         "ratio": (s.config or {}).get("ratio", 0),
