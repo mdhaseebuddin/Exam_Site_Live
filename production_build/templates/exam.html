@@ -54,6 +54,24 @@
 
   </header>
 
+  <!-- Question Palette & Auto-Save Toolbar -->
+  <div class="container-fluid px-3 px-md-4 mt-2">
+    <div class="card shadow-sm border-0 bg-white">
+      <div class="card-body py-2 px-3 d-flex flex-wrap align-items-center justify-content-between gap-2">
+        <div class="d-flex flex-wrap align-items-center gap-2">
+          <span class="small fw-bold text-muted text-uppercase me-1">Palette:</span>
+          <div id="questionPalette" class="d-flex flex-wrap gap-1"></div>
+        </div>
+        <div class="d-flex align-items-center gap-2 ms-auto">
+          <span id="saveStatus" class="badge bg-light text-success border">All changes saved</span>
+          <button id="saveDraftBtn" type="button" class="btn btn-sm btn-outline-primary" title="Save current answer immediately">
+            💾 Save Answer
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Single current question only -->
   <main class="exam-main">
     <div class="card question-card shadow">
@@ -155,6 +173,7 @@
 {{ {
     "sessionId": session_id,
     "questions": questions,
+    "savedAnswers": saved_answers,
     "remainingSeconds": remaining_seconds,
     "deadlineUnix": deadline_unix,
     "serverNowUnix": server_now_unix,

@@ -3358,11 +3358,14 @@ def exam(session_id):
     ]
     custom_registration_fields = cfg.get("custom_registration_fields") or []
 
+    saved_answers = {str(a.position): a.response for a in s.answers}
+
     return render_template(
         "exam.html",
         session_id=session_id,
         exam_title=cfg.get("exam_title", ""),
         questions=public_questions,
+        saved_answers=saved_answers,
         remaining_seconds=remaining_seconds,
         deadline_unix=deadline_unix,
         server_now_unix=server_now_unix,
@@ -3604,6 +3607,108 @@ def exam_violation(session_id):
             "will be submitted immediately."
         )
     return jsonify(response)
+
+
+@app.route("/exam/<session_id>/save-answer", methods=["POST"])
+@app.route("/exam/<session_id>/answer", methods=["POST"])
+@limiter.limit("10000 per minute", methods=["POST"])
+def save_exam_answer(session_id):
+    """Auto-save / draft-save answer endpoint for an active exam session.
+
+    Performs an UPSERT (updates if an answer row already exists for this
+    session & question position/ID; inserts only if new) to avoid duplicate rows.
+    """
+    s = db.session.get(Session, session_id)
+    if s is None:
+        return jsonify({"error": "invalid session"}), 404
+    if s.status == "completed":
+        return jsonify({"error": "exam already completed"}), 400
+    if not session.get(f"auth_{session_id}"):
+        return jsonify({"error": "unauthorized"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    session_questions = list(s.questions)
+    pos_to_q = {q.position: q for q in session_questions}
+    qid_to_q = {q.question_id: q for q in session_questions if q.question_id}
+
+    items_to_save = []
+    if "answers" in payload and isinstance(payload["answers"], dict):
+        for key, val in payload["answers"].items():
+            items_to_save.append((key, val))
+    else:
+        qid = payload.get("questionId") or payload.get("question_id")
+        pos = payload.get("position")
+        val = payload.get("answerText") if "answerText" in payload else (
+            payload.get("answer") if "answer" in payload else payload.get("response")
+        )
+        if pos is not None:
+            items_to_save.append((pos, val))
+        elif qid is not None:
+            items_to_save.append((qid, val))
+
+    for key, val in items_to_save:
+        target_q = None
+        target_pos = None
+
+        if isinstance(key, int) or (isinstance(key, str) and key.isdigit()):
+            target_pos = int(key)
+            target_q = pos_to_q.get(target_pos)
+        elif key in qid_to_q:
+            target_q = qid_to_q[key]
+            target_pos = target_q.position
+
+        if not target_q:
+            continue
+
+        qtype = target_q.type or "mcq"
+        correct = None
+        correct_index = None
+
+        if qtype == "mcq":
+            correct_index = target_q.correct_index
+            try:
+                selected = int(val) if val not in (None, "") else None
+            except (TypeError, ValueError):
+                selected = None
+            response_val = selected
+            if selected is not None and correct_index is not None:
+                correct = (selected == correct_index)
+            elif selected is not None:
+                correct = False
+        else:
+            response_val = "" if val is None else str(val)
+
+        # UPSERT: check if an answer row already exists for this (session_id, target_pos)
+        ans_row = Answer.query.filter_by(
+            session_id=session_id, position=target_pos
+        ).first()
+
+        if ans_row:
+            ans_row.question_id = target_q.question_id
+            ans_row.type = qtype
+            ans_row.response = response_val
+            ans_row.correct = correct
+            ans_row.correct_index = correct_index
+        else:
+            db.session.add(
+                Answer(
+                    session_id=session_id,
+                    position=target_pos,
+                    question_id=target_q.question_id,
+                    type=qtype,
+                    response=response_val,
+                    correct=correct,
+                    correct_index=correct_index,
+                )
+            )
+
+    db.session.commit()
+    return jsonify({
+        "ok": True,
+        "saved": True,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
 
 @app.route("/exam/<session_id>/register", methods=["GET", "POST"])
 @app.route("/register/<session_id>", methods=["GET", "POST"])
@@ -4158,17 +4263,29 @@ def _submit_exam(session_id):
             auto_graded_only = False
             response = "" if raw is None else str(raw)
 
-        db.session.add(
-            Answer(
-                session_id=session_id,
-                position=pos,
-                question_id=q.question_id,
-                type=qtype,
-                response=response,
-                correct=correct,
-                correct_index=correct_index,
+        # UPSERT: Update existing Answer row if already saved via auto-save,
+        # otherwise insert a new Answer row to avoid duplicates.
+        ans_row = Answer.query.filter_by(
+            session_id=session_id, position=pos
+        ).first()
+        if ans_row:
+            ans_row.question_id = q.question_id
+            ans_row.type = qtype
+            ans_row.response = response
+            ans_row.correct = correct
+            ans_row.correct_index = correct_index
+        else:
+            db.session.add(
+                Answer(
+                    session_id=session_id,
+                    position=pos,
+                    question_id=q.question_id,
+                    type=qtype,
+                    response=response,
+                    correct=correct,
+                    correct_index=correct_index,
+                )
             )
-        )
 
     s.completed_at = datetime.now(timezone.utc).isoformat()
 

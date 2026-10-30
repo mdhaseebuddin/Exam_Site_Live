@@ -20,7 +20,11 @@
   // page refreshes can never extend the exam.
   let deadlineUnix = cfg.deadlineUnix;
   let serverNowUnix = cfg.serverNowUnix;
-  const answers = {}; // { question_index: selected_option_index }
+  // Pre-load any previously saved answers (e.g. from auto-saves before reload)
+  const answers = Object.assign({}, cfg.savedAnswers || {});
+  const lastSavedAnswers = Object.assign({}, cfg.savedAnswers || {});
+  let saveTimeout = null;
+  let autoSyncInterval = null;
   // Submission guards: prevent a duplicate auto-submit (timer tick or server
   // sync re-triggering submitExam) from sending a second POST once time runs
   // out. The backend rejects the second as "already submitted", which would
@@ -124,6 +128,14 @@
     if (devtoolsInterval) {
       window.clearInterval(devtoolsInterval);
       devtoolsInterval = null;
+    }
+    if (saveTimeout) {
+      window.clearTimeout(saveTimeout);
+      saveTimeout = null;
+    }
+    if (autoSyncInterval) {
+      window.clearInterval(autoSyncInterval);
+      autoSyncInterval = null;
     }
     // 2) Hide every lingering proctoring overlay so only the exam itself
     //    (and later the "Thank You" result screen) remains visible.
@@ -502,6 +514,14 @@
       window.clearInterval(devtoolsInterval);
       devtoolsInterval = null;
     }
+    if (saveTimeout) {
+      window.clearTimeout(saveTimeout);
+      saveTimeout = null;
+    }
+    if (autoSyncInterval) {
+      window.clearInterval(autoSyncInterval);
+      autoSyncInterval = null;
+    }
     if (timerInterval) {
       window.clearInterval(timerInterval);
       timerInterval = null;
@@ -867,6 +887,148 @@
     serverSyncInterval = setInterval(syncFromServer, 30000);
   }
 
+  // ------------------------- Auto-Save & Debounce Engine ------------------
+  function setSaveStatus(state, text) {
+    const statusEl = document.getElementById("saveStatus");
+    if (!statusEl) return;
+    if (state === "saving") {
+      statusEl.className = "badge bg-info-subtle text-info border border-info";
+      statusEl.textContent = text || "Saving...";
+    } else if (state === "saved") {
+      statusEl.className = "badge bg-success-subtle text-success border border-success";
+      statusEl.textContent = text || "All changes saved";
+    } else if (state === "unsaved") {
+      statusEl.className = "badge bg-warning-subtle text-warning-emphasis border border-warning";
+      statusEl.textContent = text || "Unsaved changes...";
+    } else if (state === "error") {
+      statusEl.className = "badge bg-danger-subtle text-danger border border-danger";
+      statusEl.textContent = text || "Save failed (offline)";
+    }
+  }
+
+  function hasUnsavedChanges() {
+    for (const key of Object.keys(answers)) {
+      if (answers[key] !== lastSavedAnswers[key]) return true;
+    }
+    return false;
+  }
+
+  async function persistAnswerToBackend(questionId, answerText, position) {
+    if (submitting || submitted) return;
+    if (position === undefined && currentIndex >= 0 && currentIndex < total) {
+      position = currentIndex;
+    }
+    if (questionId === undefined && position !== undefined && questions[position]) {
+      questionId = questions[position].id;
+    }
+    if (answerText === undefined && position !== undefined) {
+      answerText = answers[position];
+    }
+
+    // Skip redundant database write if already saved with the same value
+    if (position !== undefined && lastSavedAnswers[position] === answerText) {
+      if (!hasUnsavedChanges()) setSaveStatus("saved");
+      return;
+    }
+
+    setSaveStatus("saving", "Saving draft...");
+    try {
+      const res = await fetch("/exam/" + cfg.sessionId + "/save-answer", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": cfg.csrfToken
+        },
+        body: JSON.stringify({
+          questionId: questionId,
+          answerText: answerText,
+          position: position
+        })
+      });
+      if (res.ok) {
+        if (position !== undefined) {
+          lastSavedAnswers[position] = answerText;
+        }
+        setSaveStatus("saved", "Draft saved");
+        updateQuestionPalette();
+      } else {
+        setSaveStatus("error", "Save failed");
+      }
+    } catch (err) {
+      console.warn("Auto-save network warning:", err);
+      setSaveStatus("error", "Save failed (offline)");
+    }
+  }
+
+  // 1. Debounced Auto-Save for Essay/Text Answers (2000ms delay after typing)
+  function debounceSaveAnswer(questionId, answerText, position) {
+    setSaveStatus("unsaved", "Unsaved changes...");
+    if (saveTimeout) clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(() => {
+      persistAnswerToBackend(questionId, answerText, position);
+    }, 2000);
+  }
+
+  // 2. Immediate Triggers (No Data Loss): blur, navigation, palette jump, save button
+  function saveCurrentAnswerImmediately() {
+    if (saveTimeout) {
+      clearTimeout(saveTimeout);
+      saveTimeout = null;
+    }
+    if (currentIndex >= 0 && currentIndex < total) {
+      const q = questions[currentIndex];
+      const curAnswer = answers[currentIndex];
+      if (curAnswer !== undefined && curAnswer !== lastSavedAnswers[currentIndex]) {
+        persistAnswerToBackend(q.id, curAnswer, currentIndex);
+      }
+    }
+  }
+
+  // 3. Background Periodic Sync: every 60s, only if there are unsaved pending changes
+  if (!autoSyncInterval) {
+    autoSyncInterval = setInterval(() => {
+      if (submitting || submitted) return;
+      if (hasUnsavedChanges()) {
+        saveCurrentAnswerImmediately();
+      }
+    }, 60000);
+  }
+
+  function updateQuestionPalette() {
+    const paletteEl = document.getElementById("questionPalette");
+    if (!paletteEl) return;
+    paletteEl.innerHTML = "";
+
+    questions.forEach((q, idx) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = idx + 1;
+      const isAnswered = answers[idx] !== undefined && answers[idx] !== "" && answers[idx] !== null;
+      const isCurrent = idx === currentIndex;
+
+      if (isCurrent) {
+        btn.className = "btn btn-sm btn-primary fw-bold";
+      } else if (isAnswered) {
+        btn.className = "btn btn-sm btn-success";
+      } else {
+        btn.className = "btn btn-sm btn-outline-secondary";
+      }
+
+      btn.style.minWidth = "32px";
+      btn.title = "Jump to Question " + (idx + 1) + (isAnswered ? " (Answered)" : "");
+
+      btn.addEventListener("click", () => {
+        if (idx !== currentIndex) {
+          saveCurrentAnswerImmediately();
+          currentIndex = idx;
+          renderQuestion(currentIndex);
+        }
+      });
+
+      paletteEl.appendChild(btn);
+    });
+  }
+
   // ------------------------- Rendering ---------------------------
   function renderQuestion(index) {
     const q = questions[index];
@@ -883,9 +1045,13 @@
         input.type = "radio";
         input.name = "answer";
         input.value = oi;
-        if (answers[index] === oi) input.checked = true;
+        if (answers[index] !== undefined && String(answers[index]) === String(oi)) {
+          input.checked = true;
+        }
         input.addEventListener("change", () => {
           answers[index] = oi;
+          updateQuestionPalette();
+          saveCurrentAnswerImmediately();
         });
 
         const span = document.createElement("span");
@@ -914,9 +1080,19 @@
         ? "// your code here"
         : "Type your answer here...";
       textarea.style.fontFamily = qtype === "coding" ? "monospace" : "";
-      textarea.value = answers[index] || "";
+      textarea.value = (answers[index] !== undefined && answers[index] !== null) ? answers[index] : "";
+
+      // Debounced on input/typing (2000ms debounce)
       textarea.addEventListener("input", () => {
         answers[index] = textarea.value;
+        updateQuestionPalette();
+        debounceSaveAnswer(q.id, textarea.value, index);
+      });
+
+      // Immediate save on blur (clicking outside or switching questions)
+      textarea.addEventListener("blur", () => {
+        answers[index] = textarea.value;
+        saveCurrentAnswerImmediately();
       });
 
       wrapper.appendChild(hint);
@@ -928,9 +1104,12 @@
     progressText.textContent = "Question " + (index + 1) + " of " + total;
     prevBtn.disabled = index === 0;
     nextBtn.textContent = index === total - 1 ? "Review" : "Next →";
+    updateQuestionPalette();
   }
 
+  // Navigation button immediate saves
   prevBtn.addEventListener("click", () => {
+    saveCurrentAnswerImmediately();
     if (currentIndex > 0) {
       currentIndex -= 1;
       renderQuestion(currentIndex);
@@ -938,11 +1117,20 @@
   });
 
   nextBtn.addEventListener("click", () => {
+    saveCurrentAnswerImmediately();
     if (currentIndex < total - 1) {
       currentIndex += 1;
       renderQuestion(currentIndex);
     }
   });
+
+  // Explicit Save button trigger
+  const saveDraftBtn = document.getElementById("saveDraftBtn");
+  if (saveDraftBtn) {
+    saveDraftBtn.addEventListener("click", () => {
+      saveCurrentAnswerImmediately();
+    });
+  }
 
   // ---------------------------- Submit ---------------------------
   // Rebuilds the countdown ticker + server-time sync and, for proctored exams,
