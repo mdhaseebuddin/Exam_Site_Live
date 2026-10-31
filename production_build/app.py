@@ -1268,6 +1268,9 @@ limiter = Limiter(
     app=app,
     default_limits=["10000 per minute"],  # global safety net per IP
 )
+# Explicitly exempt static assets from rate limits so CSS, JS, fonts, and question palette icons are never throttled
+if "static" in app.view_functions:
+    limiter.exempt(app.view_functions["static"])
 
 
 # ---------------------------------------------------------------------------
@@ -1841,6 +1844,7 @@ def randomize_questions(bank: list, ratio: int) -> list:
 # Routes
 # ---------------------------------------------------------------------------
 @app.route("/healthz")
+@limiter.exempt
 def healthz():
     """Dedicated zero-DB health endpoint for keep-alive pingers and uptime monitors.
 
@@ -1852,6 +1856,7 @@ def healthz():
 
 
 @app.route("/favicon.ico")
+@limiter.exempt
 def favicon():
     """Serve the site logo as /favicon.ico so browsers pick it up correctly.
 
@@ -3417,6 +3422,7 @@ def exam_register(exam_id):
     )
 
 @app.route("/exam/<session_id>")
+@limiter.exempt
 def exam(session_id):
     """
     Candidate Exam Page — dynamic route backed by the session_id in the URL.
@@ -3527,7 +3533,7 @@ def exam(session_id):
 
 
 @app.route("/exam/<session_id>/start", methods=["POST"])
-@limiter.limit("10000 per minute", methods=["POST"])
+@limiter.exempt
 def start_exam(session_id):
     """Start the official exam countdown.
 
@@ -3569,6 +3575,7 @@ def start_exam(session_id):
 
 
 @app.route("/exam/<session_id>/result.pdf")
+@limiter.exempt
 def exam_result_pdf(session_id):
     """
     Download the student's RESULT PDF for a completed exam session.
@@ -3598,7 +3605,7 @@ def exam_result_pdf(session_id):
 
 
 @app.route("/exam/<session_id>/time")
-@limiter.limit("120 per minute")
+@limiter.exempt
 def exam_time(session_id):
     """
     Server-anchored time endpoint.
@@ -3642,7 +3649,7 @@ def exam_time(session_id):
 
 
 @app.route("/exam/<session_id>/violation", methods=["POST"])
-@limiter.limit("10000 per minute", methods=["POST"])
+@limiter.exempt
 def exam_violation(session_id):
     """
     Anti-cheating incident reporter (SERVER-AUTHORITATIVE).
@@ -3750,7 +3757,7 @@ def exam_violation(session_id):
 
 @app.route("/exam/<session_id>/save-answer", methods=["POST"])
 @app.route("/exam/<session_id>/answer", methods=["POST"])
-@limiter.limit("10000 per minute", methods=["POST"])
+@limiter.exempt
 def save_exam_answer(session_id):
     """Auto-save / draft-save answer endpoint for an active exam session.
 
@@ -4467,7 +4474,7 @@ def _submit_exam(session_id):
 
 
 @app.route("/exam/<session_id>/submit", methods=["POST"])
-@limiter.limit("10000 per minute", methods=["POST"])
+@limiter.exempt
 def submit_exam(session_id):
     """
     Route wrapper for POST /exam/<session_id>/submit.

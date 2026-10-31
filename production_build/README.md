@@ -76,13 +76,13 @@ This folder is a self-contained package, but deployment is driven from the
 **repository root** by the `Procfile` (see the root `README.md`):
 
 ```
-web: gunicorn --chdir production_build wsgi:app
+web: gunicorn --chdir production_build --workers 1 --threads 4 --timeout 120 wsgi:app
 ```
 
 1. Push the **whole repository** to GitHub/GitLab and connect it to your host.
 2. **Build command:** `pip install -r production_build/requirements.txt`
 3. **Start command:** leave this empty so the host runs the `Procfile` `web:`
-   line, i.e. `gunicorn --chdir production_build wsgi:app`.
+   line, i.e. `gunicorn --chdir production_build --workers 1 --threads 4 --timeout 120 wsgi:app`.
 4. **Environment:** add the variables from `.env.example` in the host dashboard
    (the app reads them via `load_dotenv()`; no `.env` file is needed on a host).
 

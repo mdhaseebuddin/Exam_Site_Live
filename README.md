@@ -135,8 +135,9 @@ production are:
 1. **Push** this repository to GitHub/GitLab and connect it to your host.
 2. **Build command:** `pip install -r production_build/requirements.txt`
 3. **Start command:** the root `Procfile` runs
-   `gunicorn --chdir production_build wsgi:app` (leave the host's "Start
-   Command" empty so the `Procfile` `web:` line is used).
+   `gunicorn --chdir production_build --workers 1 --threads 4 --timeout 120 wsgi:app` (leave the host's "Start
+   Command" empty so the `Procfile` `web:` line is used). The threaded worker model (`--workers 1 --threads 4`)
+   is optimized for Render's 512MB RAM tier, preventing Out-Of-Memory (OOM) crashes under concurrent candidate traffic.
 4. **Environment:** set the variables from the table above in the host's
    dashboard (no `.env` file is needed on the host).
 

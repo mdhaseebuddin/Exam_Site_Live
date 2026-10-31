@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: exam-site
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --chdir production_build --workers 1 --threads 4 --timeout 120 wsgi:app
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
