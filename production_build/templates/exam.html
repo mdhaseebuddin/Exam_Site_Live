@@ -99,12 +99,12 @@
         <div class="small text-muted text-uppercase">Time Remaining</div>
         <div class="timer-pill" id="timer">--:--</div>
       </div>
-      <div class="d-flex align-items-center gap-2">
+      <div class="header-actions d-flex align-items-center gap-2">
         <div id="saveStatusBadge" class="save-pill save-pill-saved d-inline-flex align-items-center gap-2 rounded-pill border">
           <span class="save-status-dot"></span>
           <span id="saveStatusText">Saved to Cloud</span>
         </div>
-        <button id="submitBtn" class="btn btn-success px-4 w-sm-100">Finish</button>
+        <button id="submitBtn" class="btn btn-success px-4 finish-btn" type="button">Finish</button>
       </div>
     </div>
 
@@ -146,6 +146,29 @@
 
   <!-- Result is injected here after submission -->
   <div class="container" id="resultBox" style="display:none;"></div>
+
+  <!-- Centered Finish & Submit Confirmation Modal -->
+  <div class="modal fade" id="finishConfirmModal" tabindex="-1" aria-labelledby="finishConfirmModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content shadow border-0">
+        <div class="modal-header bg-success text-white">
+          <h5 class="modal-title h6 mb-0" id="finishConfirmModalLabel">🏁 Finish &amp; Submit Exam</h5>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body p-4 text-center">
+          <div class="display-6 mb-3">📝</div>
+          <h5 class="fw-bold mb-2">Ready to submit your exam?</h5>
+          <p class="text-muted small mb-0">
+            Please make sure you have reviewed all your answers. Once submitted, your exam will be finalized and you cannot make further changes.
+          </p>
+        </div>
+        <div class="modal-footer justify-content-center border-top-0 gap-2 pb-4">
+          <button type="button" class="btn btn-outline-secondary px-4" data-bs-dismiss="modal">Continue Exam</button>
+          <button type="button" class="btn btn-success px-4 fw-semibold" id="confirmFinalSubmitBtn">Yes, Submit Now</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- Strict Timer Expiration Overlay (non-dismissible modal) -->
   <div id="timeExpiredOverlay" class="violation-overlay force-submit" style="display:none;" role="alertdialog" aria-modal="true" aria-labelledby="timeExpiredTitle">
@@ -259,6 +282,7 @@
     "flagged": flagged
   } | tojson }}
   </script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
   <script src="{{ url_for('static', filename='exam.js') }}"></script>
 </body>
 </html>

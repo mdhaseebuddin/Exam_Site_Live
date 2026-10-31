@@ -41,6 +41,19 @@
     });
   }
 
+  // Mobile Virtual Keyboard Scroll Adjuster:
+  // When on-screen keyboard resizes visual viewport, scroll focused input/textarea into center view
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => {
+      const activeEl = document.activeElement;
+      if (activeEl && (activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'INPUT')) {
+        setTimeout(() => {
+          activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 150);
+      }
+    });
+  }
+
   // LocalStorage recovery and server answer synchronization on page load:
   // Pre-fills textarea state and keeps local cache in sync with server state
   questions.forEach((q, idx) => {
@@ -143,6 +156,22 @@
   const startGateOverlay = document.getElementById("startGateOverlay");
   const startExamBtn = document.getElementById("startExamBtn");
 
+  // Centered Finish Confirmation Modal setup
+  const finishConfirmModalEl = document.getElementById("finishConfirmModal");
+  let finishConfirmModal = null;
+  if (finishConfirmModalEl && typeof bootstrap !== "undefined" && bootstrap.Modal) {
+    finishConfirmModal = new bootstrap.Modal(finishConfirmModalEl);
+  }
+  const confirmFinalSubmitBtn = document.getElementById("confirmFinalSubmitBtn");
+  if (confirmFinalSubmitBtn) {
+    confirmFinalSubmitBtn.addEventListener("click", () => {
+      if (finishConfirmModal) {
+        finishConfirmModal.hide();
+      }
+      submitExam(true);
+    });
+  }
+
   function hideViolationOverlays() {
     // Any path that hides the overlays (submission, forced submit) also ends
     // the interaction lock so no stale flag lingers.
@@ -152,6 +181,7 @@
     if (forceSubmitOverlay) forceSubmitOverlay.style.display = "none";
     const timeExpiredOverlay = document.getElementById("timeExpiredOverlay");
     if (timeExpiredOverlay) timeExpiredOverlay.style.display = "none";
+    if (finishConfirmModal) finishConfirmModal.hide();
   }
 
   // Tears down EVERYTHING proctoring-related the moment a submission is
@@ -1278,6 +1308,13 @@
       } catch (e) {}
       textarea.value = currentVal;
 
+      // Scroll textarea comfortably into view above virtual keyboard on focus
+      textarea.addEventListener("focus", () => {
+        setTimeout(() => {
+          textarea.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 150);
+      });
+
       // On typing (input): immediately mirror to localStorage, update palette, and debounce save
       textarea.addEventListener("input", () => {
         answers[index] = textarea.value;
@@ -1287,6 +1324,14 @@
         } catch (e) {}
         updateQuestionPalette();
         debounceSaveAnswer(q.id, textarea.value, index);
+
+        // Keep active typing line visible above virtual keyboard on narrow screens
+        if (window.visualViewport && window.innerWidth <= 768) {
+          const rect = textarea.getBoundingClientRect();
+          if (rect.bottom > window.visualViewport.height - 40) {
+            textarea.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }
+        }
       });
 
       // Immediate save on blur (clicking outside or switching questions)
@@ -1414,11 +1459,12 @@
     // started session).
     if (!examStarted) return;
     if (!auto) {
-      // Two-step inline confirmation — NEVER a native confirm() dialog. Native
-      // dialogs steal window focus; dismissing them fires a synthetic blur
-      // event that would be counted as a focus-loss strike (the same failure
-      // mode as the old alert() cascade). First click arms the button; a second
-      // click within the 5-second window submits. Auto-submits bypass this.
+      // If modal is available, open clean centered dialog (never native confirm() which causes blur strikes)
+      if (finishConfirmModal) {
+        finishConfirmModal.show();
+        return;
+      }
+      // Two-step inline confirmation fallback if Bootstrap modal is not initialized
       if (!submitConfirmArmed) {
         submitConfirmArmed = true;
         submitBtn.textContent = "Click again to confirm submission";

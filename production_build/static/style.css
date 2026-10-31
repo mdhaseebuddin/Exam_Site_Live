@@ -664,3 +664,73 @@ code, .question-text, .cf-label, .student-info-value, a, .card-text {
   }
 }
 
+
+
+/* ==========================================================================
+   Mobile Virtual Keyboard & Responsive Action Header Styles
+   ========================================================================== */
+
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.finish-btn,
+#submitBtn,
+#finishBtn,
+.confirm-submit-btn {
+  white-space: normal;
+  text-align: center;
+  max-width: 100%;
+  font-size: 0.9rem;
+  padding: 8px 16px;
+  word-break: break-word;
+  transition: all 0.2s ease-in-out;
+}
+
+@media (max-width: 768px) {
+  /* Dynamic bottom padding to ensure content can scroll well past on-screen virtual keyboard */
+  .exam-body,
+  .exam-main,
+  .exam-container {
+    padding-bottom: 45vh !important;
+    padding-bottom: max(45vh, env(safe-area-inset-bottom, 0px)) !important;
+  }
+
+  /* Flexible mobile textarea height to keep active typing visible above keyboard */
+  .question-card textarea,
+  #optionsList textarea,
+  .essay-textarea {
+    min-height: 180px !important;
+    max-height: 35vh !important;
+    font-size: 16px !important; /* Prevents auto-zoom on iOS Safari */
+    line-height: 1.5 !important;
+    box-sizing: border-box !important;
+  }
+
+  .header-actions {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    gap: 8px !important;
+    align-items: center !important;
+    justify-content: flex-end !important;
+    width: 100% !important;
+  }
+
+  .header-actions #saveStatusBadge {
+    flex-shrink: 0;
+  }
+
+  .finish-btn,
+  #submitBtn,
+  #finishBtn,
+  .confirm-submit-btn {
+    white-space: normal !important;
+    text-align: center !important;
+    max-width: 100% !important;
+    font-size: 0.85rem !important;
+    padding: 8px 12px !important;
+  }
+}
