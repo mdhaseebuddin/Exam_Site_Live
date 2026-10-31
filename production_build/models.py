@@ -338,6 +338,10 @@ class Answer(db.Model):
     correct = db.Column(db.Boolean, nullable=True)
     correct_index = db.Column(db.Integer, nullable=True)
 
+    __table_args__ = (
+        db.UniqueConstraint("session_id", "position", name="uq_session_position_answer"),
+    )
+
 
 class DailyRegistration(db.Model):
     """

@@ -27,7 +27,9 @@ Concurrency Safety
 """
 
 import copy
+import html
 import io
+import json
 import logging
 import logging.handlers
 import os
@@ -62,7 +64,19 @@ from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect, CSRFError
 from sqlalchemy import event, text
 from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.exc import IntegrityError
 from werkzeug.security import check_password_hash, generate_password_hash
+
+
+def _sanitize_null_bytes(val):
+    """Recursively strip null bytes (\\x00 / \\u0000) from incoming strings, dicts, or lists."""
+    if isinstance(val, str):
+        return val.replace("\x00", "").replace("\u0000", "")
+    elif isinstance(val, dict):
+        return {k: _sanitize_null_bytes(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [_sanitize_null_bytes(v) for v in val]
+    return val
 
 from models import (
     Answer,
@@ -530,6 +544,18 @@ def init_db() -> None:
             db.session.execute(
                 text("ALTER TABLE exams ADD COLUMN max_violations INTEGER NOT NULL DEFAULT 3")
             )
+        # Ensure answers table has a unique index on (session_id, position)
+        try:
+            db.session.execute(text(
+                "DELETE FROM answers WHERE id NOT IN ("
+                "  SELECT MAX(id) FROM answers GROUP BY session_id, position"
+                ")"
+            ))
+            db.session.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_session_position_answer ON answers (session_id, position)"
+            ))
+        except Exception as e:
+            app.logger.warning("Could not create unique index on answers: %s", e)
         db.session.commit()
 
         # --- Back-fill the durable daily-registration LEDGER from existing
@@ -1487,15 +1513,19 @@ def _build_result_pdf(session: dict) -> bytes:
         else:
             block.append(Paragraph("Answer:", muted_style))
             answer_txt = g.get("selected") or "⚠️ Not answered"
+            escaped_answer = html.escape(str(answer_txt)).replace("\n", "<br/>")
             block.append(
                 Paragraph(
-                    answer_txt.replace("\n", "<br/>"),
+                    escaped_answer,
                     ParagraphStyle("aw", parent=styles["Normal"], borderPadding=6, backColor=colors.HexColor("#fafafa")),
                 )
             )
             block.append(Paragraph("Awaiting manual review", muted_style))
 
-        story.append(KeepTogether(block))
+        if qtype == "mcq":
+            story.append(KeepTogether(block))
+        else:
+            story.extend(block)
         story.append(Spacer(1, 8))
 
     doc.build(story)
@@ -1618,15 +1648,19 @@ def _build_details_pdf(session: dict, custom_registration_fields: list) -> bytes
             else:
                 block.append(Paragraph("Answer:", muted_style))
                 answer_txt = g.get("selected") or "⚠️ Not answered"
+                escaped_answer = html.escape(str(answer_txt)).replace("\n", "<br/>")
                 block.append(
                     Paragraph(
-                        answer_txt.replace("\n", "<br/>"),
+                        escaped_answer,
                         ParagraphStyle("aw", parent=styles["Normal"], borderPadding=6, backColor=colors.HexColor("#fafafa")),
                     )
                 )
                 block.append(Paragraph("Awaiting manual review", muted_style))
 
-            story.append(KeepTogether(block))
+            if qtype == "mcq":
+                story.append(KeepTogether(block))
+            else:
+                story.extend(block)
             story.append(Spacer(1, 8))
     else:
         story.append(Paragraph("No submission yet.", muted_style))
@@ -2774,26 +2808,26 @@ def unlock_candidate_session(session_id, exam_id=None):
     ExamViolation.query.filter_by(session_id=session_id).delete()
 
     now = datetime.now(timezone.utc)
-    s.started_at = now.isoformat()
+    if not s.started_at:
+        s.started_at = now.isoformat()
 
     if extra_seconds > 0:
         s.extra_time_seconds = (getattr(s, "extra_time_seconds", 0) or 0) + extra_seconds
 
-    time_limit = int((s.config or {}).get("time_limit_minutes", 30) or 30)
     try:
         current_deadline = datetime.fromisoformat(s.deadline) if s.deadline else now
     except Exception:
         current_deadline = now
 
-    if extra_minutes > 0:
+    if extra_seconds > 0:
         if current_deadline < now:
-            s.deadline = (now + timedelta(minutes=extra_minutes)).isoformat()
+            s.deadline = (now + timedelta(seconds=extra_seconds)).isoformat()
         else:
-            s.deadline = (current_deadline + timedelta(minutes=extra_minutes)).isoformat()
+            s.deadline = (current_deadline + timedelta(seconds=extra_seconds)).isoformat()
     else:
-        # If deadline has already elapsed, restore original time limit from now
+        # If extra_seconds == 0 and deadline has already elapsed, grant a 5-minute review/submission buffer
         if current_deadline <= now:
-            s.deadline = (now + timedelta(minutes=time_limit)).isoformat()
+            s.deadline = (now + timedelta(minutes=5)).isoformat()
 
     db.session.commit()
     audit("session_unlocked", exam_id=target_exam_id, session_id=session_id, host_email=host_email, extra_minutes=extra_minutes, ip=get_remote_address())
@@ -2976,8 +3010,13 @@ def generate_session():
 
 
 # --- Student OTP resend (registration, universal + legacy entry points) ------
+def get_student_otp_key():
+    pending = session.get("stu_reg_pending") or {}
+    return (pending.get("email") or "").strip().lower() or get_remote_address()
+
+
 @app.route("/exam/resend-otp", methods=["POST"])
-@limiter.limit("6 per minute", methods=["POST"])
+@limiter.limit("3 per minute", key_func=get_student_otp_key)
 def exam_resend_otp():
     """Re-issue the active student-channel OTP for the in-progress registration.
 
@@ -3767,12 +3806,24 @@ def save_exam_answer(session_id):
     s = db.session.get(Session, session_id)
     if s is None:
         return jsonify({"error": "invalid session"}), 404
-    if s.status == "completed":
-        return jsonify({"error": "exam already completed"}), 400
+    if s.status == "completed" or getattr(s, "flagged", False):
+        return jsonify({"error": "Session is completed or locked"}), 403
     if not session.get(f"auth_{session_id}"):
         return jsonify({"error": "unauthorized"}), 403
 
+    if s.deadline:
+        try:
+            deadline_dt = datetime.fromisoformat(s.deadline)
+            now_utc = datetime.now(timezone.utc)
+            if now_utc > deadline_dt + timedelta(seconds=180):
+                return jsonify({"error": "The exam time has expired."}), 403
+        except (TypeError, ValueError):
+            pass
+
+    if request.data and request.get_json(silent=True) is None:
+        return jsonify({"error": "Malformed or non-UTF8 JSON payload"}), 400
     payload = request.get_json(silent=True) or {}
+    payload = _sanitize_null_bytes(payload)
     session_questions = list(s.questions)
     pos_to_q = {q.position: q for q in session_questions}
     qid_to_q = {q.question_id: q for q in session_questions if q.question_id}
@@ -3836,17 +3887,29 @@ def save_exam_answer(session_id):
             ans_row.correct = correct
             ans_row.correct_index = correct_index
         else:
-            db.session.add(
-                Answer(
-                    session_id=session_id,
-                    position=target_pos,
-                    question_id=target_q.question_id,
-                    type=qtype,
-                    response=response_val,
-                    correct=correct,
-                    correct_index=correct_index,
-                )
-            )
+            try:
+                with db.session.begin_nested():
+                    db.session.add(
+                        Answer(
+                            session_id=session_id,
+                            position=target_pos,
+                            question_id=target_q.question_id,
+                            type=qtype,
+                            response=response_val,
+                            correct=correct,
+                            correct_index=correct_index,
+                        )
+                    )
+            except IntegrityError:
+                ans_row = Answer.query.filter_by(
+                    session_id=session_id, position=target_pos
+                ).first()
+                if ans_row:
+                    ans_row.question_id = target_q.question_id
+                    ans_row.type = qtype
+                    ans_row.response = response_val
+                    ans_row.correct = correct
+                    ans_row.correct_index = correct_index
 
     db.session.commit()
     return jsonify({
@@ -4227,7 +4290,10 @@ def _submit_exam(session_id):
     # Strictly validate the incoming JSON BEFORE any database write. Rejects
     # malformed payloads and unexpected fields with a 400, so untrusted data
     # never reaches the grading/storage logic.
+    if request.data and request.get_json(silent=True) is None:
+        return jsonify({"error": "Malformed or non-UTF8 JSON payload"}), 400
     payload = request.get_json(silent=True) or {}
+    payload = _sanitize_null_bytes(payload)
     validation_error = validate_submit_payload(payload)
     if validation_error:
         audit(
@@ -4422,17 +4488,29 @@ def _submit_exam(session_id):
             ans_row.correct = correct
             ans_row.correct_index = correct_index
         else:
-            db.session.add(
-                Answer(
-                    session_id=session_id,
-                    position=pos,
-                    question_id=q.question_id,
-                    type=qtype,
-                    response=response,
-                    correct=correct,
-                    correct_index=correct_index,
-                )
-            )
+            try:
+                with db.session.begin_nested():
+                    db.session.add(
+                        Answer(
+                            session_id=session_id,
+                            position=pos,
+                            question_id=q.question_id,
+                            type=qtype,
+                            response=response,
+                            correct=correct,
+                            correct_index=correct_index,
+                        )
+                    )
+            except IntegrityError:
+                ans_row = Answer.query.filter_by(
+                    session_id=session_id, position=pos
+                ).first()
+                if ans_row:
+                    ans_row.question_id = q.question_id
+                    ans_row.type = qtype
+                    ans_row.response = response
+                    ans_row.correct = correct
+                    ans_row.correct_index = correct_index
 
     s.completed_at = datetime.now(timezone.utc).isoformat()
 

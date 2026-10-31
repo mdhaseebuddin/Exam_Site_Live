@@ -165,6 +165,8 @@
   const confirmFinalSubmitBtn = document.getElementById("confirmFinalSubmitBtn");
   if (confirmFinalSubmitBtn) {
     confirmFinalSubmitBtn.addEventListener("click", () => {
+      confirmFinalSubmitBtn.disabled = true;
+      confirmFinalSubmitBtn.textContent = "Submitting...";
       if (finishConfirmModal) {
         finishConfirmModal.hide();
       }
@@ -742,8 +744,9 @@
 
     const isDevtoolsKey =
       e.key === "F12" ||
-      (ctrl && e.shiftKey && (key === "i" || key === "j" || key === "c" || key === "e" || key === "k")) ||
+      (ctrl && (e.shiftKey || e.altKey) && (key === "i" || key === "j" || key === "c" || key === "e" || key === "k")) ||
       (ctrl && (key === "u" || key === "s" || key === "p")) ||
+      (ctrl && (key === "t" || key === "n" || key === "l")) ||
       (e.key === "F5" || (ctrl && key === "r"));
     const isClipboardKey = ctrl && (key === "c" || key === "x" || key === "v");
     const isSelectAllKey = ctrl && key === "a";
@@ -1063,6 +1066,11 @@
       answerText = answers[position];
     }
 
+    // Always push to in-memory offlineQueue so answer is safe even if localStorage throws
+    if (position !== undefined && answerText !== undefined && answerText !== null) {
+      offlineQueue[position] = { questionId, answerText, position };
+    }
+
     // Immediately mirror to browser localStorage keyed by exam session and question ID
     try {
       if (answerText !== undefined && answerText !== null) {
@@ -1073,7 +1081,6 @@
 
     // Check if offline
     if (!navigator.onLine) {
-      offlineQueue[position] = { questionId, answerText, position };
       setSaveStatus("offline", "Offline - Saved locally");
       return;
     }
@@ -1529,6 +1536,22 @@
       // server-side results page.
       if (forcedSubmitRequested) scheduleResultRedirect();
     } catch (err) {
+      const errStr = (err && err.message ? err.message : "").toLowerCase();
+      const serverErr = (data && data.error ? data.error : "").toLowerCase();
+      if (errStr.includes("already submitted") || serverErr.includes("already submitted")) {
+        submitted = true;
+        clearExamLocalStorage();
+        hideViolationOverlays();
+        hideSubmitNotice();
+        exitFullscreenQuietly();
+        showResult(data || {});
+        if (forcedSubmitRequested) scheduleResultRedirect();
+        return;
+      }
+      if (confirmFinalSubmitBtn) {
+        confirmFinalSubmitBtn.disabled = false;
+        confirmFinalSubmitBtn.textContent = "Yes, Submit Now";
+      }
       submitBtn.disabled = false;
       submitBtn.textContent = "Finish";
       // Only show a failure notice if the exam has NOT already been saved.
