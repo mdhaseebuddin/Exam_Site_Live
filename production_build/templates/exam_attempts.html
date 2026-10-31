@@ -14,6 +14,7 @@
         <div class="btn-group-wrap">
       <a class="btn btn-outline-light btn-sm" href="/host">← Host Dashboard</a>
       <a class="btn btn-outline-primary btn-sm" href="/exam/register/{{ exam.exam_id }}" target="_blank" rel="noopener">Open Portal</a>
+      <a class="btn btn-success btn-sm" href="{{ url_for('download_all_zip', exam_id=exam.exam_id) }}">📥 Download Submissions (.zip)</a>
     </div>
 
   </nav>

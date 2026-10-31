@@ -2518,152 +2518,135 @@ audited server-side.
     return redirect(url_for("host", msg="submissions_cleared"))
 
 
+def sanitize_filename(name: str) -> str:
+    """Sanitize candidate names and identifiers for safe filesystem/ZIP names."""
+    cleaned = re.sub(r'[^a-zA-Z0-9_\-]', '_', (name or 'Unknown_Candidate').strip())
+    cleaned = re.sub(r'_+', '_', cleaned).strip('_')
+    return cleaned or 'Unknown_Candidate'
+
+
 @app.route("/host/download-all.zip")
+@app.route("/host/exam/<exam_id>/download-all.zip")
+@app.route("/host/exam/<exam_id>/download.zip")
 @login_required
-def download_all_zip():
+def download_all_zip(exam_id=None):
     """
-    Export ALL of this host's student submissions as a single .zip download.
+    Export student submissions as cleanly named individual PDF reports in a ZIP archive.
 
-    Per-host isolation: only submissions belonging to the currently
-    authenticated host are collected (matching every other /host* route).
-
-    For every session that has a registered student, the archive contains:
-      * <student_name>/details.pdf            — ReportLab details PDF
-      * <student_name>/details.html           — print-friendly HTML
-                                                 fallback (only when the PDF
-                                                 tooling is unavailable)
-      * <student_name>/submission.json        — full raw data
-
-    Folders are named directly after each student's name (sanitized for safe
-    folder naming). If two students share the same name, a small numeric
-    suffix is appended so every entry stays unique inside the archive.
-
-    A top-level index.json (submission summary) and README.txt describe the
-    whole export. The archive is built in memory and streamed straight back
-    to the browser (nothing is written to disk), so it is safe under
-    multi-worker deployments.
+    Eliminates redundant JSON dumps, debug logs, and nested subfolders.
+    Submissions are formatted neatly as:
+      Exam_<exam_id>_Submissions/01_John_Doe_7670966268.pdf
     """
-    import json as _json
-
     host_email = _current_host_email()
     if not host_email:
         return redirect(url_for("host_login"))
 
-    # Only attempts that actually have a registered candidate count as a
-    # "submission". Pure pending sessions (no student yet) are excluded.
-    all_sessions = (
-        Session.query.filter_by(host_email=host_email)
-        .order_by(Session.created_at.asc())
-        .all()
-    )
-    sessions = [s for s in all_sessions if s.student is not None]
-
-    summary = []
-    zip_buf = io.BytesIO()
-    used_folders = set()
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as archive:
-        for s in sessions:
-            data = session_to_dict(s)
-            student_name = (
-                _safe_filename((data.get("student") or {}).get("name") or "", "student")
-                or "student"
+    target_exam_id = exam_id or request.args.get("exam_id")
+    if target_exam_id:
+        ex = db.session.get(Exam, target_exam_id)
+        if ex is not None and ex.host_email and ex.host_email != host_email:
+            return redirect(url_for("host", error="Unauthorized"))
+        all_sessions = (
+            Session.query.filter_by(exam_id=target_exam_id)
+            .order_by(Session.created_at.asc())
+            .all()
+        )
+    else:
+        all_sessions = (
+            Session.query.filter(
+                (Session.host_email == host_email)
+                | (Session.exam_id.in_(
+                    db.session.query(Exam.id).filter_by(host_email=host_email)
+                ))
             )
-            # Name the folder directly after the student (sanitized, no numeric
-            # prefix). If two students share the same name, append a small
-            # suffix so every entry stays unique inside the archive.
-            folder = student_name
-            if folder in used_folders:
-                dup = 2
-                candidate = f"{folder}_{dup}"
-                while candidate in used_folders:
-                    dup += 1
-                    candidate = f"{folder}_{dup}"
-                folder = candidate
-            used_folders.add(folder)
+            .order_by(Session.created_at.asc())
+            .all()
+        )
 
-            # 1) Real details PDF (ReportLab) with an HTML fallback.
+    sessions = [s for s in all_sessions if s.student is not None]
+    if not sessions:
+        return redirect(url_for("host", error="No candidate submissions found to download."))
+
+    # Determine a clean root folder name
+    if target_exam_id:
+        root_folder = f"Exam_{target_exam_id[:8]}_Submissions"
+    elif len(sessions) > 0 and all(s.exam_id == sessions[0].exam_id for s in sessions) and sessions[0].exam_id:
+        root_folder = f"Exam_{sessions[0].exam_id[:8]}_Submissions"
+    else:
+        username = sanitize_filename(host_email.split("@", 1)[0])
+        root_folder = f"Exam_Submissions_{username}"
+
+    zip_buf = io.BytesIO()
+    used_filenames = set()
+
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        for idx, s in enumerate(sessions, start=1):
+            data = session_to_dict(s)
+            st = data.get("student") or {}
+            raw_name = (st.get("name") or "Candidate").strip()
+            clean_name = sanitize_filename(raw_name)
+
+            # Retrieve phone or roll number/student ID
+            raw_id = (
+                st.get("roll_number")
+                or st.get("roll_no")
+                or st.get("student_id")
+                or st.get("roll")
+                or st.get("id")
+                or st.get("phone")
+                or s.id[:8]
+            )
+            clean_id = sanitize_filename(str(raw_id))
+
+            base_name = f"{idx:02d}_{clean_name}_{clean_id}"
+            pdf_filename = f"{base_name}.pdf"
+            if pdf_filename in used_filenames:
+                dup = 2
+                candidate_fn = f"{base_name}_{dup}.pdf"
+                while candidate_fn in used_filenames:
+                    dup += 1
+                    candidate_fn = f"{base_name}_{dup}.pdf"
+                pdf_filename = candidate_fn
+            used_filenames.add(pdf_filename)
+
+            # Generate ReportLab details PDF report
             pdf_bytes = _pdf_bytes(
                 "details_pdf.html",
                 session=data,
                 custom_registration_fields=data.get("custom_registration_fields") or [],
             )
+
+            archive_path = f"{root_folder}/{pdf_filename}"
             if pdf_bytes is not None:
-                archive.writestr(f"{folder}/details.pdf", pdf_bytes)
+                archive.writestr(archive_path, pdf_bytes)
             else:
+                html_path = f"{root_folder}/{base_name}.html"
                 archive.writestr(
-                    f"{folder}/details.html",
+                    html_path,
                     render_template(
                         "details_pdf.html",
                         session=data,
-                        custom_registration_fields=(
-                            data.get("custom_registration_fields") or []
-                        ),
+                        custom_registration_fields=data.get("custom_registration_fields") or [],
                     ),
                 )
 
-            # 2) Raw JSON export of the full submission.
-            archive.writestr(
-                f"{folder}/submission.json",
-                _json.dumps(data, indent=2, default=str),
-            )
-
-            summary.append(
-                {
-                    "session_id": s.id,
-                    "exam_title": data.get("exam_title", ""),
-                    "status": data.get("status", ""),
-                    "student": data.get("student"),
-                    "score": data.get("score"),
-                    "total_selected": data.get("total_selected"),
-                    "completed_at": data.get("completed_at"),
-                    "folder": folder,
-                }
-            )
-
-        archive.writestr(
-            "index.json",
-            _json.dumps(
-                {
-                    "exported_at": datetime.now(timezone.utc).isoformat(),
-                    "host_email": host_email,
-                    "submission_count": len(summary),
-                    "submissions": summary,
-                },
-                indent=2,
-                default=str,
-            ),
-        )
-        archive.writestr(
-            "README.txt",
-            (
-                "Exam Platform submission export\n"
-                "================================\n"
-                f"Host: {host_email}\n"
-                f"Export time (UTC): {datetime.now(timezone.utc).isoformat()}\n"
-                f"Submissions: {len(summary)}\n\n"
-                "Each folder contains:\n"
-                "  details.pdf       - session details PDF\n"
-                "  details.html      - print-friendly HTML fallback\n"
-                "  submission.json   - raw submission data\n\n"
-                "index.json summarises every submission in the archive.\n"
-            ),
-        )
-
     zip_buf.seek(0)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    username = host_email.split("@", 1)[0]
-    filename = f"exam_submissions_{username}_{stamp}.zip"
+    download_name = f"{root_folder}_{stamp}.zip"
+
     audit(
         "download_all_zip",
         host_email=host_email,
-        submissions=len(summary),
+        exam_id=target_exam_id,
+        submissions=len(sessions),
         ip=get_remote_address(),
     )
+
     return send_file(
         zip_buf,
         mimetype="application/zip",
         as_attachment=True,
-        download_name=filename,
+        download_name=download_name,
     )
 
 
