@@ -170,6 +170,7 @@ class Session(db.Model):
         nullable=False,
         default=lambda: datetime.now(timezone.utc).isoformat(),
     )
+    submitted_at = db.Column(db.DateTime, nullable=True)
     extra_time_seconds = db.Column(db.Integer, nullable=False, default=0)
 
     @property
@@ -180,13 +181,6 @@ class Session(db.Model):
     def violations_count(self, val):
         self.violation_count = val
 
-    @property
-    def submitted_at(self):
-        return self.completed_at
-
-    @submitted_at.setter
-    def submitted_at(self, val):
-        self.completed_at = val
 
     student = db.relationship(
         "Student",
@@ -212,6 +206,10 @@ class Session(db.Model):
         order_by="ExamViolation.created_at",
         cascade="all, delete-orphan",
     )
+
+
+# Alias ExamAttempt to Session for attempt queries
+ExamAttempt = Session
 
 
 class Student(db.Model):
@@ -260,11 +258,33 @@ class HostUser(db.Model):
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     name = db.Column(db.String(200), nullable=False, default="")
     password_hash = db.Column(db.String(255), nullable=False)
+    status = db.Column(db.String(32), nullable=False, default="active")  # 'active', 'suspended', 'banned'
+    suspended_until = db.Column(db.DateTime, nullable=True)
+    is_banned = db.Column(db.Boolean, nullable=False, default=False)
     created_at = db.Column(
         db.String(64),
         nullable=False,
         default=lambda: datetime.now(timezone.utc).isoformat(),
     )
+
+    def is_suspended(self) -> bool:
+        """Return True if the host is currently banned or actively suspended."""
+        if self.is_banned or self.status == "banned":
+            return True
+        if self.status == "suspended":
+            if self.suspended_until is not None:
+                now = datetime.now(timezone.utc)
+                su = self.suspended_until
+                if su.tzinfo is None:
+                    su = su.replace(tzinfo=timezone.utc)
+                if now < su:
+                    return True
+                else:
+                    self.status = "active"
+                    self.suspended_until = None
+                    return False
+            return True
+        return False
 
 
 class OtpToken(db.Model):
@@ -406,6 +426,87 @@ class ExamViolation(db.Model):
         db.String(64),
         nullable=False,
         default=lambda: datetime.now(timezone.utc).isoformat(),
+    )
+
+
+
+class AdminLockout(db.Model):
+    """
+    Persisted brute-force protection for the /mdvelo emergency console.
+    Tracks failed master-password attempts and lockout expiration in Neon DB / SQLite.
+    """
+
+    __tablename__ = "admin_lockouts"
+
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(64), unique=True, nullable=False, default="master")
+    failed_attempts = db.Column(db.Integer, nullable=False, default=0)
+    locked_until = db.Column(db.DateTime, nullable=True)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=True,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class SystemSetting(db.Model):
+    """
+    Persistent key-value system settings for emergency overrides
+    (force_agent_otp, master_universal_otp, candidate_session_purged_at, etc.).
+    """
+
+    __tablename__ = "system_settings"
+
+    key = db.Column(db.String(64), primary_key=True)
+    value = db.Column(db.Text, nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=True)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=True,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class BlacklistEntry(db.Model):
+    """
+    Roll number and IP blacklist to block malicious candidates from initiating attempts.
+    """
+
+    __tablename__ = "blacklist_entries"
+
+    id = db.Column(db.Integer, primary_key=True)
+    entry_type = db.Column(db.String(32), nullable=True)  # 'roll' | 'ip'
+    type = db.Column(db.String(32), nullable=True)  # 'roll_number' | 'ip'
+    value = db.Column(db.String(255), nullable=False, index=True)
+    reason = db.Column(db.String(255), nullable=True)
+    created_at = db.Column(
+        db.String(64),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc).isoformat(),
+    )
+
+    def get_kind(self) -> str:
+        """Normalized entry kind: 'roll' or 'ip'."""
+        val = (self.entry_type or self.type or "roll").lower()
+        return "roll" if "roll" in val else "ip"
+
+
+class OtpLog(db.Model):
+    """
+    Audit log for OTP dispatching and resend queue flush via Tier 3.
+    """
+    __tablename__ = "otp_logs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    recipient_email = db.Column(db.String(255), nullable=False, index=True)
+    otp_code = db.Column(db.String(32), nullable=False)
+    channel = db.Column(db.String(32), nullable=False, default="student")
+    status = db.Column(db.String(32), nullable=False, default="FAILED")  # 'SENT', 'FAILED', 'RESENT'
+    error = db.Column(db.Text, nullable=True)
+    created_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
     )
 
 

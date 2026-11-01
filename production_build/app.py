@@ -27,6 +27,8 @@ Concurrency Safety
 """
 
 import copy
+import hashlib
+import hmac
 import html
 import io
 import json
@@ -56,6 +58,7 @@ from flask import (
     jsonify,
     redirect,
     render_template,
+    render_template_string,
     request,
     send_file,
     session,
@@ -81,17 +84,22 @@ def _sanitize_null_bytes(val):
     return val
 
 from models import (
+    AdminLockout,
     Answer,
+    BlacklistEntry,
     DailyRegistration,
     Exam,
+    ExamAttempt,
     ExamQuestion,
     ExamViolation,
     HostUser,
+    OtpLog,
     OtpToken,
     Question,
     Session,
     SessionQuestion,
     Student,
+    SystemSetting,
     bank_question_to_dict,
     db,
     exam_to_dict,
@@ -491,6 +499,12 @@ def init_db() -> None:
         host_cols = [c["name"] for c in insp.get_columns("host_users")]
         if "name" not in host_cols:
             db.session.execute(text("ALTER TABLE host_users ADD COLUMN name VARCHAR(200) NOT NULL DEFAULT ''"))
+        if "status" not in host_cols:
+            db.session.execute(text("ALTER TABLE host_users ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'active'"))
+        if "suspended_until" not in host_cols:
+            db.session.execute(text("ALTER TABLE host_users ADD COLUMN suspended_until TIMESTAMP"))
+        if "is_banned" not in host_cols:
+            db.session.execute(text("ALTER TABLE host_users ADD COLUMN is_banned BOOLEAN NOT NULL DEFAULT FALSE"))
         # Question.host_email (per-host question-bank isolation)
         q_cols = [c["name"] for c in insp.get_columns("questions")]
         if "host_email" not in q_cols:
@@ -531,6 +545,16 @@ def init_db() -> None:
             db.session.execute(
                 text("ALTER TABLE sessions ADD COLUMN extra_time_seconds INTEGER NOT NULL DEFAULT 0")
             )
+        if "submitted_at" not in sess_cols:
+            db.session.execute(
+                text("ALTER TABLE sessions ADD COLUMN submitted_at TIMESTAMP")
+            )
+        if "blacklist_entries" in insp.get_table_names():
+            bl_cols = [c["name"] for c in insp.get_columns("blacklist_entries")]
+            if "entry_type" not in bl_cols:
+                db.session.execute(text("ALTER TABLE blacklist_entries ADD COLUMN entry_type VARCHAR(32)"))
+                if "type" in bl_cols:
+                    db.session.execute(text("UPDATE blacklist_entries SET entry_type = type WHERE entry_type IS NULL"))
         # ExamViolation.snapshot (proctoring proof image captured at strike time)
         viol_cols = [c["name"] for c in insp.get_columns("exam_violations")]
         if "snapshot" not in viol_cols:
@@ -750,6 +774,305 @@ def _generate_otp() -> str:
     return f"{secrets.randbelow(1000000):06d}"
 
 
+
+# --- Emergency Ops System Settings, Lockout & Blacklist Helpers -------------
+def get_system_setting(key: str, default=None) -> str | None:
+    """Retrieve a persistent setting value from SystemSetting, checking expiry."""
+    try:
+        setting = db.session.get(SystemSetting, key)
+        if not setting:
+            return default
+        if setting.expires_at is not None:
+            now = datetime.now(timezone.utc)
+            exp = setting.expires_at
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if now > exp:
+                return default
+        return setting.value
+    except Exception:
+        return default
+
+
+def set_system_setting(key: str, value: str, expires_at: datetime | None = None) -> None:
+    """Persist a setting value in SystemSetting."""
+    try:
+        setting = db.session.get(SystemSetting, key)
+        if not setting:
+            setting = SystemSetting(key=key)
+            db.session.add(setting)
+        setting.value = str(value)
+        setting.expires_at = expires_at
+        setting.updated_at = datetime.now(timezone.utc)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        print(f"[SystemSetting ERROR] Failed to set {key}: {exc}")
+
+
+def is_force_agent_otp_enabled() -> bool:
+    """True when email_dispatcher must skip Brevo and route directly to Render OTP Agent."""
+    val = get_system_setting("force_agent_otp", "false")
+    return str(val).lower() in ("true", "1", "yes")
+
+
+def is_master_universal_otp_active() -> tuple[bool, str, int]:
+    """Returns (is_active, universal_otp_code, remaining_minutes)."""
+    try:
+        now = datetime.now(timezone.utc)
+        code = get_system_setting("master_universal_otp_code", "999888") or "999888"
+
+        # Check master_otp_active & master_otp_expires
+        act_val = get_system_setting("master_otp_active")
+        if act_val and str(act_val).lower() in ("true", "1", "yes"):
+            exp_str = get_system_setting("master_otp_expires")
+            if exp_str:
+                exp = datetime.fromisoformat(exp_str)
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if now <= exp:
+                    rem_min = max(1, int(((exp - now).total_seconds() + 59) // 60))
+                    return True, code, rem_min
+                else:
+                    set_system_setting("master_otp_active", "false")
+                    return False, code, 0
+
+        # Check master_universal_otp row
+        setting = db.session.get(SystemSetting, "master_universal_otp")
+        if not setting or str(setting.value).lower() not in ("true", "1", "yes"):
+            return False, code, 0
+        rem_min = 0
+        if setting.expires_at is not None:
+            exp = setting.expires_at
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if now > exp:
+                return False, code, 0
+            rem_min = max(1, int(((exp - now).total_seconds() + 59) // 60))
+        return True, code, rem_min
+    except Exception:
+        return False, "999888", 0
+
+
+def is_blacklisted(b_type: str, value: str) -> bool:
+    """Check if a roll number or IP is actively blacklisted."""
+    if not value:
+        return False
+    try:
+        clean = str(value).strip().lower()
+        kinds = ["roll", "roll_number"] if "roll" in str(b_type).lower() else ["ip"]
+        entry = db.session.query(BlacklistEntry).filter(
+            db.or_(
+                BlacklistEntry.entry_type.in_(kinds),
+                BlacklistEntry.type.in_(kinds)
+            ),
+            db.func.lower(BlacklistEntry.value) == clean
+        ).first()
+        return entry is not None
+    except Exception:
+        return False
+
+
+def check_candidate_blacklist(ip: str, student_data: dict) -> str | None:
+    """Check both IP and roll number against the BlacklistEntry table."""
+    if is_blacklisted("ip", ip):
+        return "Access denied: Your IP address has been restricted from participating in exams."
+    for k, v in student_data.items():
+        if not v or not isinstance(v, (str, int)):
+            continue
+        v_str = str(v).strip()
+        k_lower = str(k).lower()
+        if any(term in k_lower for term in ("roll", "rollno", "roll_no", "reg_no", "regno")):
+            if is_blacklisted("roll", v_str):
+                return f"Access denied: Roll number '{v_str}' has been restricted."
+        if is_blacklisted("roll", v_str):
+            return f"Access denied: Identifier '{v_str}' has been restricted."
+    return None
+
+
+def log_otp_dispatch(recipient_email: str, otp_code: str, channel: str = "student", status: str = "SENT", error: str | None = None) -> None:
+    """Record an OTP dispatch event in the otp_logs table for audit & resend queue flush."""
+    try:
+        log_entry = OtpLog(
+            recipient_email=(recipient_email or "").strip().lower(),
+            otp_code=str(otp_code or "").strip(),
+            channel=channel,
+            status=status,
+            error=str(error) if error else None,
+            created_at=datetime.now(timezone.utc),
+        )
+        db.session.add(log_entry)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        print(f"[OtpLog ERROR] Failed to record OTP dispatch: {exc}")
+
+
+def is_candidate_session_revoked(session_id: str, student_email: str | None = None, student_data: dict | None = None) -> bool:
+    """Check if an active candidate's attempt token has been revoked by roll number, email, or global purge."""
+    try:
+        # Global purge check
+        purge_time_str = get_system_setting("candidate_session_purged_at")
+        if purge_time_str:
+            purge_time = datetime.fromisoformat(purge_time_str)
+            if purge_time.tzinfo is None:
+                purge_time = purge_time.replace(tzinfo=timezone.utc)
+            auth_time_str = session.get(f"auth_time_{session_id}")
+            if not auth_time_str:
+                return True
+            auth_time = datetime.fromisoformat(auth_time_str)
+            if auth_time.tzinfo is None:
+                auth_time = auth_time.replace(tzinfo=timezone.utc)
+            if auth_time < purge_time:
+                return True
+
+        # Targeted purge check
+        purged_raw = get_system_setting("purged_candidates_json", "[]")
+        if purged_raw:
+            import json as _json
+            purged_list = _json.loads(purged_raw)
+            if isinstance(purged_list, list) and len(purged_list) > 0:
+                purged_set = {str(item).strip().lower() for item in purged_list if item}
+                if student_email and str(student_email).strip().lower() in purged_set:
+                    return True
+                if student_data and isinstance(student_data, dict):
+                    for v in student_data.values():
+                        if v and str(v).strip().lower() in purged_set:
+                            return True
+        return False
+    except Exception:
+        return False
+
+
+def purge_candidate_identifier(identifier: str) -> int:
+    """Revoke candidate attempt sessions by roll number or email."""
+    if not identifier:
+        return 0
+    clean_id = str(identifier).strip().lower()
+    import json as _json
+    try:
+        purged_raw = get_system_setting("purged_candidates_json", "[]")
+        purged_list = _json.loads(purged_raw) if purged_raw else []
+        if clean_id not in purged_list:
+            purged_list.append(clean_id)
+            set_system_setting("purged_candidates_json", _json.dumps(purged_list))
+    except Exception as exc:
+        print(f"[Purge List ERROR] {exc}")
+
+    # Mark corresponding active sessions as SUBMITTED / completed
+    affected = 0
+    try:
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
+        students = Student.query.all()
+        for st in students:
+            match = False
+            if st.email and st.email.strip().lower() == clean_id:
+                match = True
+            elif st.custom_fields and isinstance(st.custom_fields, dict):
+                for val in st.custom_fields.values():
+                    if val and str(val).strip().lower() == clean_id:
+                        match = True
+                        break
+            if match and st.session and st.session.status not in ("completed", "SUBMITTED"):
+                st.session.status = "SUBMITTED"
+                st.session.completed_at = now_iso
+                st.session.auto_submitted = True
+                if hasattr(st.session, "submitted_at"):
+                    st.session.submitted_at = now_utc
+                affected += 1
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        print(f"[Purge Session ERROR] {e}")
+    return affected
+
+
+def get_admin_lockout() -> AdminLockout:
+    """Fetch or initialize the singleton AdminLockout row."""
+    lockout = db.session.query(AdminLockout).filter_by(key="master").first()
+    if not lockout:
+        lockout = AdminLockout(key="master", failed_attempts=0, locked_until=None)
+        db.session.add(lockout)
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            lockout = db.session.query(AdminLockout).filter_by(key="master").first()
+    return lockout
+
+
+def check_admin_lockout() -> tuple[bool, int]:
+    """Returns (is_locked, remaining_minutes)."""
+    try:
+        lockout = get_admin_lockout()
+        if lockout and lockout.locked_until:
+            now = datetime.now(timezone.utc)
+            lu = lockout.locked_until
+            if lu.tzinfo is None:
+                lu = lu.replace(tzinfo=timezone.utc)
+            if now < lu:
+                rem_seconds = (lu - now).total_seconds()
+                rem_minutes = max(1, int((rem_seconds + 59) // 60))
+                return True, rem_minutes
+            else:
+                lockout.failed_attempts = 0
+                lockout.locked_until = None
+                lockout.updated_at = now
+                db.session.commit()
+                return False, 0
+    except Exception as exc:
+        print(f"[AdminLockout ERROR] {exc}")
+    return False, 0
+
+
+def record_failed_admin_attempt() -> tuple[bool, int]:
+    """Increments failed attempts; locks for 30 minutes if reaches 3. Returns (is_locked, remaining_attempts_or_minutes)."""
+    lockout = get_admin_lockout()
+    now = datetime.now(timezone.utc)
+    lockout.failed_attempts += 1
+    lockout.updated_at = now
+    if lockout.failed_attempts >= 3:
+        lockout.locked_until = now + timedelta(minutes=30)
+        db.session.commit()
+        return True, 30
+    db.session.commit()
+    return False, max(0, 3 - lockout.failed_attempts)
+
+
+def record_successful_admin_login():
+    """Reset failed attempts on successful authorization."""
+    lockout = get_admin_lockout()
+    now = datetime.now(timezone.utc)
+    lockout.failed_attempts = 0
+    lockout.locked_until = None
+    lockout.updated_at = now
+    db.session.commit()
+
+
+def is_ops_authenticated() -> bool:
+    """Check if the current session has an encrypted ops authorization valid for 60 minutes."""
+    if not session.get("ops_authenticated"):
+        return False
+    auth_time_str = session.get("ops_auth_time")
+    if not auth_time_str:
+        return False
+    try:
+        auth_time = datetime.fromisoformat(auth_time_str)
+        if auth_time.tzinfo is None:
+            auth_time = auth_time.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - auth_time > timedelta(minutes=60):
+            session.pop("ops_authenticated", None)
+            session.pop("ops_auth_time", None)
+            return False
+        return True
+    except Exception:
+        session.pop("ops_authenticated", None)
+        session.pop("ops_auth_time", None)
+        return False
+
+
+
 def _trigger_tier3_webhook(recipient_email: str, otp_code: str) -> bool:
     """
     Tier 3 failover: If both Tier 1 and Tier 2 fail, trigger Tier 3 by making
@@ -820,6 +1143,13 @@ def _send_otp_email(email: str, code: str) -> bool:
         print("[OTP ERROR] Host recipient email is empty; OTP cannot be sent.")
         audit("otp_email_failed", email=recipient_email, error="empty_recipient", ip=get_remote_address(), channel="host")
         return False
+
+    if is_force_agent_otp_enabled():
+        print(f"[OTP OVERRIDE] force_agent_otp enabled; skipping Brevo and routing directly to Render OTP Agent for {recipient_email}")
+        res = _trigger_tier3_webhook(recipient_email=recipient_email, otp_code=otp_code)
+        audit("otp_force_agent_dispatched", email=recipient_email, channel="host", success=res)
+        log_otp_dispatch(recipient_email, otp_code, channel="host", status="SENT" if res else "FAILED")
+        return res
 
     tier1_key = (
         os.environ.get("BREVO_HOST_API_KEY_1", "").strip()
@@ -951,6 +1281,13 @@ def _send_student_otp(email: str, code: str) -> bool:
         audit("otp_email_failed", email=recipient_email, error="missing_sender", ip=get_remote_address(), channel="student")
         return False
 
+    if is_force_agent_otp_enabled():
+        print(f"[OTP OVERRIDE] force_agent_otp enabled; skipping Brevo and routing directly to Render OTP Agent for {recipient_email}")
+        res = _trigger_tier3_webhook(recipient_email=recipient_email, otp_code=otp_code)
+        audit("otp_force_agent_dispatched", email=recipient_email, channel="student", success=res)
+        log_otp_dispatch(recipient_email, otp_code, channel="student", status="SENT" if res else "FAILED")
+        return res
+
     tier1_key = (
         os.environ.get("BREVO_STUDENT_API_KEY_1", "").strip()
         or os.environ.get("BREVO_API_KEY_1", "").strip()
@@ -1069,13 +1406,20 @@ def _send_student_otp(email: str, code: str) -> bool:
 def email_dispatcher(recipient_email: str, otp_code: str, channel: str = "student") -> bool:
     """
     Unified email dispatcher failover:
-      1. Try Tier 1 Brevo API key.
-      2. If it fails, try Tier 2 Brevo API key.
-      3. If both Tier 1 and Tier 2 fail, trigger Tier 3 by making an HTTP POST request to:
+      1. If force_agent_otp is enabled in SystemSetting, skips Brevo entirely and routes to Render OTP Agent.
+      2. Try Tier 1 Brevo API key.
+      3. If it fails, try Tier 2 Brevo API key.
+      4. If both Tier 1 and Tier 2 fail, trigger Tier 3 by making an HTTP POST request to:
          https://render-otp-agent.onrender.com/webhook/render-logs
          Send the data as: f"OTP sent to {recipient_email}: {otp_code}" with header {"Content-Type": "text/plain"}.
-      4. Wrap Tier 3 in a try-except block so it doesn't crash the server, and log any error.
+      5. Wrap Tier 3 in a try-except block so it doesn't crash the server, and log any error.
     """
+    if is_force_agent_otp_enabled():
+        print(f"[OTP OVERRIDE] force_agent_otp enabled; skipping Brevo and routing directly to Render OTP Agent for {recipient_email}")
+        res = _trigger_tier3_webhook(recipient_email=recipient_email, otp_code=otp_code)
+        audit("otp_force_agent_dispatched", email=recipient_email, channel=channel, success=res)
+        log_otp_dispatch(recipient_email, otp_code, channel=channel, status="SENT" if res else "FAILED")
+        return res
     if channel == "host":
         return _send_otp_email(recipient_email, otp_code)
     return _send_student_otp(recipient_email, otp_code)
@@ -1111,11 +1455,18 @@ def issue_otp(email: str, purpose="reset") -> str:
 def verify_otp(email: str, code: str, purpose="reset") -> bool:
     """
     Validate a submitted OTP. Succeeds only if:
+      * Master Universal OTP is active and matches, OR
       * a matching token exists for the email,
       * it is not already used,
       * it has not expired.
     A successful match marks the token as used (single-use).
     """
+    sub_code = (code or "").strip()
+    is_univ_active, univ_code, _ = is_master_universal_otp_active()
+    if is_univ_active and sub_code == univ_code:
+        audit("universal_otp_accepted", email=email, purpose=purpose, ip=get_remote_address())
+        return True
+
     email = email.strip().lower()
     token = (
 
@@ -1187,7 +1538,15 @@ def verify_session_otp(storage_key: str, submitted: str) -> str | None:
     Returns None when the code is valid, otherwise an error message. If the
     OTP has expired it is cleared from the session, matching the required
     "OTP has expired. Please request a new one." behaviour.
+    Accepts Universal OTP when active.
     """
+    sub_clean = (submitted or "").strip()
+    is_univ_active, univ_code, _ = is_master_universal_otp_active()
+    if is_univ_active and sub_clean == univ_code:
+        session.pop(storage_key, None)
+        audit("universal_otp_session_accepted", storage_key=storage_key, ip=get_remote_address())
+        return None
+
     data = session.get(storage_key)
     if not data or not isinstance(data, dict):
         return "Invalid or expired verification code."
@@ -2164,6 +2523,9 @@ def host_login():
             if auth_host is None:
                 error = "Invalid email or password."
                 audit("host_login_failed", email=email, ip=get_remote_address())
+            elif getattr(auth_host, "is_suspended", lambda: False)():
+                error = f"This account is {auth_host.status}. Access denied."
+                audit("host_login_blocked_suspended", email=email, status=auth_host.status, ip=get_remote_address())
             elif not verify_captcha(captcha):
                 error = "Incorrect CAPTCHA answer. Please try again."
             elif request.form.get("agree") != "1":
@@ -2190,6 +2552,16 @@ def host_login():
             code = request.form.get("otp", "").strip()
             otp_err = verify_session_otp("login_otp", code)
             if otp_err is None:
+                host = find_host(email)
+                if host and getattr(host, "is_suspended", lambda: False)():
+                    session.pop("login_step", None)
+                    session.pop("login_pending", None)
+                    error = f"This account is {host.status}. Access denied."
+                    return render_template(
+                        "host_login.html",
+                        error=error,
+                        captcha=captcha_payload(),
+                    )
                 session[SESSION_HOST_EMAIL] = email
                 session.pop("login_step", None)
                 session.pop("login_pending", None)
@@ -2936,6 +3308,11 @@ def generate_session():
     the snapshot + Exam creation are atomically persisted.
     """
     host_email = _current_host_email()
+    host_user = find_host(host_email)
+    if host_user and getattr(host_user, "is_suspended", lambda: False)():
+        audit("exam_generation_blocked_suspended", email=host_email, status=host_user.status, ip=get_remote_address())
+        flash(f"Your host account has been {host_user.status}. You cannot generate new exams.", "error")
+        return redirect(url_for("host"))
     bank_questions = (
             Question.query.filter_by(host_email=host_email)
             .order_by(Question.created_at.desc())
@@ -3118,6 +3495,21 @@ def exam_register(exam_id):
     if ex is None:
         return redirect(url_for("host", error="session_not_found"))
 
+    if ex.host_email:
+        exam_host = find_host(ex.host_email)
+        if exam_host and getattr(exam_host, "is_suspended", lambda: False)():
+            err_msg = f"This exam is currently unavailable because the organizer account has been {exam_host.status}."
+            if request.method == "POST" and request.is_json:
+                return jsonify({"error": err_msg}), 403
+            return render_template("register.html", error=err_msg, form={}, captcha=captcha_payload()), 403
+
+    client_ip = get_remote_address()
+    if is_blacklisted("ip", client_ip):
+        err_msg = "Access denied: Your IP address has been restricted from participating in exams."
+        if request.method == "POST" and request.is_json:
+            return jsonify({"error": err_msg}), 403
+        return render_template("register.html", error=err_msg, form={}, captcha=captcha_payload()), 403
+
     cfg = ex.config or {}
     base_required = cfg.get("required_fields") or DEFAULT_REQUIRED_FIELDS
     required_fields = [
@@ -3221,6 +3613,7 @@ def exam_register(exam_id):
                 target_sess = db.session.get(Session, resume_session_id)
                 if target_sess and target_sess.status in ("in_progress", "started"):
                     session[f"auth_{target_sess.id}"] = True
+                    session[f"auth_time_{target_sess.id}"] = datetime.now(timezone.utc).isoformat()
                     session.pop("stu_reg_step", None)
                     session.pop("stu_reg_pending", None)
                     session.pop("stu_reg_otp", None)
@@ -3358,6 +3751,7 @@ def exam_register(exam_id):
 
             # Authorize this browser so the exam page opens directly afterwards.
             session[f"auth_{session_id}"] = True
+            session[f"auth_time_{session_id}"] = datetime.now(timezone.utc).isoformat()
 
             # Clear the pending OTP registration data.
             session.pop("stu_reg_step", None)
@@ -3468,6 +3862,18 @@ def exam_register(exam_id):
                     "register.html", error=err, form=request.form, captcha=captcha_payload(), **template_vars
                 ),
                 400,
+            )
+
+        bl_err = check_candidate_blacklist(client_ip, {**request.form.to_dict(), **student_data})
+        if bl_err:
+            audit("registration_blacklisted", exam_id=exam_id, error=bl_err, ip=client_ip)
+            if request.is_json:
+                return jsonify({"error": bl_err}), 403
+            return (
+                render_template(
+                    "register.html", error=bl_err, form=request.form, captcha=captcha_payload(), **template_vars
+                ),
+                403,
             )
 
         # --- Build the custom_fields JSON blob ---
@@ -4624,6 +5030,1327 @@ def submit_exam(session_id):
             ip=get_remote_address(),
         )
         return jsonify({"error": "An unexpected error occurred. Please try again."}), 500
+
+
+# ===========================================================================
+# EMERGENCY OPERATIONS CONSOLE (/mdvelo)
+# Mobile-optimized, dark-themed (#0b0f19, #1e293b cards).
+# Protected by master password + persisted brute-force lockout (AdminLockout).
+# Strictly NO email/SMS OTP verification.
+# Divided into 4 clean sections:
+#   1. Failover & OTP
+#   2. Host Moderation
+#   3. Live Exam Operations
+#   4. Blacklist / Security
+# ===========================================================================
+
+MDVELO_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#0b0f19">
+    <title>Emergency Operations Console</title>
+    <style>
+        :root {
+            --bg: #0b0f19;
+            --card-bg: #1e293b;
+            --border: #334155;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --danger: #ef4444;
+            --danger-bg: rgba(239, 68, 68, 0.15);
+            --danger-border: rgba(239, 68, 68, 0.4);
+            --radius: 14px;
+        }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            -webkit-tap-highlight-color: transparent;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            width: 100%;
+            max-width: 420px;
+        }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 34px 26px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.65);
+        }
+        .shield-icon {
+            width: 58px;
+            height: 58px;
+            background: linear-gradient(135deg, rgba(59, 130, 246, 0.25), rgba(37, 99, 235, 0.08));
+            border: 1px solid rgba(59, 130, 246, 0.4);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 16px auto;
+            color: var(--primary);
+            font-size: 28px;
+        }
+        h1 {
+            font-size: 21px;
+            font-weight: 700;
+            text-align: center;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+        .subtitle {
+            font-size: 13px;
+            color: var(--text-muted);
+            text-align: center;
+            margin-bottom: 24px;
+        }
+        .alert {
+            padding: 14px 16px;
+            border-radius: 10px;
+            font-size: 14px;
+            line-height: 1.45;
+            margin-bottom: 20px;
+        }
+        .alert-danger {
+            background: var(--danger-bg);
+            border: 1px solid var(--danger-border);
+            color: #fca5a5;
+        }
+        .alert-lockout {
+            background: rgba(239, 68, 68, 0.22);
+            border: 1px solid var(--danger);
+            color: #fecaca;
+            text-align: center;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        input[type="password"] {
+            width: 100%;
+            height: 50px;
+            background: #0f172a;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 0 16px;
+            color: #fff;
+            font-size: 16px;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        input[type="password"]:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+        }
+        .btn-submit {
+            width: 100%;
+            height: 50px;
+            background: var(--primary);
+            border: none;
+            border-radius: 10px;
+            color: #fff;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: background 0.2s, transform 0.1s;
+        }
+        .btn-submit:active {
+            transform: scale(0.98);
+        }
+        .btn-submit:hover {
+            background: var(--primary-hover);
+        }
+        .footer-note {
+            margin-top: 24px;
+            font-size: 12px;
+            color: var(--text-muted);
+            text-align: center;
+            line-height: 1.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <div class="shield-icon">⚡</div>
+            <h1>EMERGENCY OPS</h1>
+            <div class="subtitle">Operational Master Key Authorization</div>
+
+            {% if is_locked %}
+                <div class="alert alert-lockout">
+                    <strong style="display:block; font-size:15px; margin-bottom:4px;">🔒 Security Lockout Active</strong>
+                    Maximum failed attempts reached. Access is locked for 30 minutes.
+                    <div style="margin-top: 10px; font-weight:700; font-size: 18px; color:#fff;">
+                        Remaining: {{ rem_minutes }} min
+                    </div>
+                </div>
+            {% else %}
+                {% if error %}
+                    <div class="alert alert-danger">{{ error }}</div>
+                {% endif %}
+
+                <form method="POST" action="/mdvelo">
+                    <input type="hidden" name="action" value="login">
+                    <div class="form-group">
+                        <label for="master_password">Master Password</label>
+                        <input type="password" id="master_password" name="master_password" placeholder="Enter master key" required autofocus autocomplete="off">
+                    </div>
+                    <button type="submit" class="btn-submit">
+                        <span>Authorize Console</span> →
+                    </button>
+                </form>
+            {% endif %}
+
+            <div class="footer-note">
+                Strict master-key protocol. Strictly zero SMS/Email OTP.<br>
+                3 incorrect attempts trigger an immediate 30-minute lock.
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+MDVELO_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#0b0f19">
+    <title>MDVELO Emergency Ops Console</title>
+    <style>
+        :root {
+            --bg: #0b0f19;
+            --card-bg: #1e293b;
+            --card-sub: #131f33;
+            --border: #334155;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
+            --danger-bg: rgba(239, 68, 68, 0.16);
+            --warning: #f59e0b;
+            --warning-hover: #d97706;
+            --warning-bg: rgba(245, 158, 11, 0.16);
+            --success: #10b981;
+            --success-hover: #059669;
+            --success-bg: rgba(16, 185, 129, 0.16);
+            --radius: 12px;
+        }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            -webkit-tap-highlight-color: transparent;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding-bottom: 40px;
+        }
+        header {
+            background: #111827;
+            border-bottom: 1px solid var(--border);
+            padding: 14px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        .header-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .header-brand h1 {
+            font-size: 16px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+        }
+        .session-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: var(--success-bg);
+            border: 1px solid rgba(16, 185, 129, 0.35);
+            color: #6ee7b7;
+            padding: 4px 10px;
+            border-radius: 9999px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .dot {
+            width: 7px;
+            height: 7px;
+            background: #10b981;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .btn-logout {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            padding: 8px 14px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-logout:hover {
+            color: #fff;
+            border-color: #64748b;
+        }
+        .content {
+            max-width: 1000px;
+            margin: 20px auto;
+            padding: 0 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 22px;
+        }
+        .flash-messages {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .flash {
+            padding: 14px 16px;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 500;
+            line-height: 1.4;
+        }
+        .flash-success {
+            background: var(--success-bg);
+            border: 1px solid rgba(16, 185, 129, 0.35);
+            color: #a7f3d0;
+        }
+        .flash-warning {
+            background: var(--warning-bg);
+            border: 1px solid rgba(245, 158, 11, 0.35);
+            color: #fde68a;
+        }
+        .flash-danger {
+            background: var(--danger-bg);
+            border: 1px solid rgba(239, 68, 68, 0.35);
+            color: #fecaca;
+        }
+        .flash-info {
+            background: rgba(59, 130, 246, 0.16);
+            border: 1px solid rgba(59, 130, 246, 0.35);
+            color: #bfdbfe;
+        }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 22px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
+        }
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+        .section-tag {
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--primary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 4px;
+        }
+        .card-title {
+            font-size: 17px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card-subtitle {
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-bottom: 18px;
+            line-height: 1.45;
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 9px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .badge-active, .badge-success {
+            background: var(--success-bg);
+            color: #6ee7b7;
+            border: 1px solid rgba(16, 185, 129, 0.35);
+        }
+        .badge-inactive, .badge-secondary {
+            background: rgba(148, 163, 184, 0.16);
+            color: #cbd5e1;
+            border: 1px solid rgba(148, 163, 184, 0.3);
+        }
+        .badge-suspended, .badge-warning {
+            background: var(--warning-bg);
+            color: #fde68a;
+            border: 1px solid rgba(245, 158, 11, 0.35);
+        }
+        .badge-banned, .badge-danger {
+            background: var(--danger-bg);
+            color: #fca5a5;
+            border: 1px solid rgba(239, 68, 68, 0.35);
+        }
+        .controls-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+            gap: 16px;
+        }
+        .subcard {
+            background: var(--card-sub);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            gap: 14px;
+        }
+        .subcard-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .subcard-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: #fff;
+        }
+        .subcard-desc {
+            font-size: 12px;
+            color: var(--text-muted);
+            line-height: 1.4;
+        }
+        .btn {
+            min-height: 48px;
+            padding: 0 16px;
+            border-radius: 8px;
+            border: none;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            text-decoration: none;
+            transition: all 0.2s;
+            width: 100%;
+        }
+        .btn:active {
+            transform: scale(0.98);
+        }
+        .btn-primary {
+            background: var(--primary);
+            color: #fff;
+        }
+        .btn-primary:hover {
+            background: var(--primary-hover);
+        }
+        .btn-danger {
+            background: var(--danger);
+            color: #fff;
+        }
+        .btn-danger:hover {
+            background: var(--danger-hover);
+        }
+        .btn-warning {
+            background: var(--warning);
+            color: #111827;
+        }
+        .btn-warning:hover {
+            background: var(--warning-hover);
+        }
+        .btn-success {
+            background: var(--success);
+            color: #fff;
+        }
+        .btn-success:hover {
+            background: var(--success-hover);
+        }
+        .btn-outline {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-main);
+        }
+        .btn-sm {
+            min-height: 38px;
+            font-size: 12px;
+            padding: 0 12px;
+            width: auto;
+        }
+        input[type="text"], select {
+            height: 48px;
+            background: #0f172a;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0 12px;
+            color: #fff;
+            font-size: 15px;
+            width: 100%;
+        }
+        input[type="text"]:focus, select:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+        .table-responsive {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            margin-top: 10px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+            text-align: left;
+        }
+        th {
+            background: #0f172a;
+            color: var(--text-muted);
+            padding: 12px 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+            border-bottom: 1px solid var(--border);
+        }
+        td {
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--border);
+            color: var(--text-main);
+            vertical-align: middle;
+        }
+        tr:last-child td {
+            border-bottom: none;
+        }
+        .actions-cell {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+        .grid-form {
+            display: grid;
+            grid-template-columns: 140px 1fr 1fr auto;
+            gap: 10px;
+        }
+        @media (max-width: 640px) {
+            .grid-form {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="header-brand">
+            <span style="font-size: 20px;">⚡</span>
+            <h1>MDVELO OPS CONSOLE</h1>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="session-badge">
+                <span class="dot"></span>
+                <span>Session Active ({{ session_remaining_minutes }}m)</span>
+            </div>
+            <form method="POST" action="/mdvelo" style="margin: 0;">
+                <input type="hidden" name="action" value="logout">
+                <button type="submit" class="btn-logout">Exit</button>
+            </form>
+        </div>
+    </header>
+
+    <div class="content">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="flash-messages">
+                    {% for category, message in messages %}
+                        <div class="flash flash-{{ category }}">{{ message }}</div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        <!-- ================================================================ -->
+        <!-- SECTION 1: FAILOVER & OTP DISPATCH                               -->
+        <!-- ================================================================ -->
+        <div class="card">
+            <div class="section-tag">Section 1</div>
+            <div class="card-header">
+                <div class="card-title">📡 Email & OTP Dispatch Failover</div>
+            </div>
+            <div class="card-subtitle">
+                Emergency communications failover overrides. Bypass Brevo API directly to the Render OTP Agent webhook, activate universal 15-minute emergency OTP, or flush failed queues.
+            </div>
+            <div class="controls-grid">
+                <!-- Force Agent Toggle -->
+                <div class="subcard">
+                    <div>
+                        <div class="subcard-head">
+                            <span class="subcard-title">Force Render Agent Webhook</span>
+                            {% if force_agent_active %}
+                                <span class="badge badge-active">Active</span>
+                            {% else %}
+                                <span class="badge badge-inactive">Inactive</span>
+                            {% endif %}
+                        </div>
+                        <div class="subcard-desc" style="margin-top: 8px;">
+                            Bypasses all Brevo API calls completely and pushes every host/candidate verification code directly to the Render OTP Agent webhook.
+                        </div>
+                    </div>
+                    <form method="POST" action="/mdvelo">
+                        <input type="hidden" name="action" value="toggle_force_agent_otp">
+                        {% if force_agent_active %}
+                            <button type="submit" class="btn btn-warning">Restore Standard Brevo API</button>
+                        {% else %}
+                            <button type="submit" class="btn btn-primary">⚡ Force Direct Render Webhook</button>
+                        {% endif %}
+                    </form>
+                </div>
+
+                <!-- Master Universal OTP -->
+                <div class="subcard">
+                    <div>
+                        <div class="subcard-head">
+                            <span class="subcard-title">Master Universal OTP (999888)</span>
+                            {% if universal_otp_active %}
+                                <span class="badge badge-active">{{ universal_otp_remaining_minutes }}m left</span>
+                            {% else %}
+                                <span class="badge badge-inactive">Inactive</span>
+                            {% endif %}
+                        </div>
+                        <div class="subcard-desc" style="margin-top: 8px;">
+                            {% if universal_otp_active %}
+                                Code <strong>{{ universal_otp_code }}</strong> is currently accepted for all candidate and host verification checks (expires in {{ universal_otp_remaining_minutes }}m).
+                            {% else %}
+                                Enables a universal OTP "999888" accepted for 15 minutes by all candidate/host verification handlers in case email delivery fails completely.
+                            {% endif %}
+                        </div>
+                    </div>
+                    <form method="POST" action="/mdvelo">
+                        <input type="hidden" name="action" value="toggle_universal_otp">
+                        {% if universal_otp_active %}
+                            <button type="submit" class="btn btn-danger">Deactivate Universal OTP</button>
+                        {% else %}
+                            <input type="hidden" name="universal_code" value="999888">
+                            <button type="submit" class="btn btn-success">Activate Master OTP (15 Min)</button>
+                        {% endif %}
+                    </form>
+                </div>
+
+                <!-- Resend Queue Flush -->
+                <div class="subcard">
+                    <div>
+                        <div class="subcard-head">
+                            <span class="subcard-title">Resend Queue Flush</span>
+                            {% if failed_otp_count > 0 %}
+                                <span class="badge badge-danger">{{ failed_otp_count }} Failed</span>
+                            {% else %}
+                                <span class="badge badge-success">0 Failed</span>
+                            {% endif %}
+                        </div>
+                        <div class="subcard-desc" style="margin-top: 8px;">
+                            Queries all OTP logs recorded with status 'FAILED' in the last 30 minutes and re-dispatches them immediately via the Tier 3 Render OTP Agent webhook.
+                        </div>
+                    </div>
+                    <form method="POST" action="/mdvelo">
+                        <input type="hidden" name="action" value="resend_queue_flush">
+                        <button type="submit" class="btn btn-primary">⚡ Flush Resend Queue (Tier 3)</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- SECTION 2: HOST ACCOUNT MODERATION & BLOCKING                    -->
+        <!-- ================================================================ -->
+        <div class="card">
+            <div class="section-tag">Section 2</div>
+            <div class="card-header">
+                <div class="card-title">👤 Host Account Moderation & Blocking</div>
+                <span class="badge badge-secondary">{{ hosts|length }} Hosts</span>
+            </div>
+            <div class="card-subtitle">
+                Account moderation controls. Suspended or banned host accounts cannot log in, generate exams, and their active exams are blocked from launching.
+            </div>
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Host Email</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for h in hosts %}
+                            <tr>
+                                <td>
+                                    <strong>{{ h.email }}</strong>
+                                    {% if h.name %}
+                                        <div style="font-size: 11px; color: var(--text-muted);">{{ h.name }}</div>
+                                    {% endif %}
+                                    {% if h.status == 'suspended' and h.suspended_until %}
+                                        <div style="font-size: 11px; color: #fde68a;">Suspended until: {{ h.suspended_until.strftime('%Y-%m-%d %H:%M') }} UTC</div>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    {% if h.is_banned or h.status == 'banned' %}
+                                        <span class="badge badge-banned">Banned</span>
+                                    {% elif h.status == 'suspended' %}
+                                        <span class="badge badge-suspended">Suspended</span>
+                                    {% else %}
+                                        <span class="badge badge-active">Active</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <div class="actions-cell">
+                                        {% if h.status != 'active' or h.is_banned %}
+                                            <form method="POST" action="/mdvelo" style="display:inline;">
+                                                <input type="hidden" name="action" value="host_action">
+                                                <input type="hidden" name="host_id" value="{{ h.id }}">
+                                                <input type="hidden" name="action_type" value="restore">
+                                                <button type="submit" class="btn btn-sm btn-success">Restore Active</button>
+                                            </form>
+                                        {% endif %}
+                                        {% if not h.is_banned and h.status != 'banned' %}
+                                            <form method="POST" action="/mdvelo" style="display:inline;">
+                                                <input type="hidden" name="action" value="host_action">
+                                                <input type="hidden" name="host_id" value="{{ h.id }}">
+                                                <input type="hidden" name="action_type" value="suspend_24h">
+                                                <button type="submit" class="btn btn-sm btn-warning">Suspend 24h</button>
+                                            </form>
+                                            <form method="POST" action="/mdvelo" style="display:inline;">
+                                                <input type="hidden" name="action" value="host_action">
+                                                <input type="hidden" name="host_id" value="{{ h.id }}">
+                                                <input type="hidden" name="action_type" value="suspend_7d">
+                                                <button type="submit" class="btn btn-sm btn-warning">Suspend 7d</button>
+                                            </form>
+                                            <form method="POST" action="/mdvelo" style="display:inline;" onsubmit="return confirm('PERMANENTLY BAN host ' + {{ h.email|tojson }} + '? All their active exams will be unpublished and attempts revoked.');">
+                                                <input type="hidden" name="action" value="host_action">
+                                                <input type="hidden" name="host_id" value="{{ h.id }}">
+                                                <input type="hidden" name="action_type" value="ban">
+                                                <button type="submit" class="btn btn-sm btn-danger">Permanent Ban</button>
+                                            </form>
+                                        {% endif %}
+                                    </div>
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr>
+                                <td colspan="3" style="text-align: center; color: var(--text-muted); padding: 20px;">No registered host accounts found.</td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- SECTION 3: LIVE EXAM & ATTEMPT CONTROLS                          -->
+        <!-- ================================================================ -->
+        <div class="card">
+            <div class="section-tag">Section 3</div>
+            <div class="card-header">
+                <div class="card-title">📝 Live Exam & Attempt Controls</div>
+            </div>
+            <div class="card-subtitle">
+                Manage ongoing exams. Force-submit active attempts currently in progress, or re-trigger / download bulk submission PDF/ZIP bundles.
+            </div>
+
+            <!-- Force Submit Input Form -->
+            <form method="POST" action="/mdvelo" style="margin-bottom: 20px;" onsubmit="return confirm('Force submit all active in-progress attempts for this exam?');">
+                <input type="hidden" name="action" value="force_submit_exam">
+                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                    <div style="flex: 1; min-width: 240px;">
+                        <input type="text" name="exam_id" placeholder="Enter Exam ID (e.g. e08e9c0c...)" required>
+                    </div>
+                    <button type="submit" class="btn btn-warning" style="width: auto; padding: 0 24px;">⚡ Force-Submit Active Attempts</button>
+                </div>
+            </form>
+
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Exam ID / Title</th>
+                            <th>Organizer</th>
+                            <th>Submissions / Attempts</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for ex in recent_exams %}
+                            <tr>
+                                <td>
+                                    <strong>{{ ex.config.get('exam_title', 'Untitled') }}</strong>
+                                    <div style="font-family: monospace; font-size: 11px; color: var(--text-muted);">{{ ex.id }}</div>
+                                </td>
+                                <td>
+                                    <div style="font-size: 12px;">{{ ex.host_email }}</div>
+                                </td>
+                                <td>
+                                    <span class="badge badge-secondary">{{ ex.sessions|length }} total</span>
+                                    {% set active_cnt = ex.sessions|selectattr("status", "ne", "completed")|list|length %}
+                                    {% if active_cnt > 0 %}
+                                        <span class="badge badge-warning">{{ active_cnt }} active</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <div class="actions-cell">
+                                        <form method="POST" action="/mdvelo" style="display:inline;" onsubmit="return confirm('Force submit all in-progress attempts for exam: ' + {{ ex.id|tojson }} + '?');">
+                                            <input type="hidden" name="action" value="force_submit_exam">
+                                            <input type="hidden" name="exam_id" value="{{ ex.id }}">
+                                            <button type="submit" class="btn btn-sm btn-warning">Force Submit</button>
+                                        </form>
+                                        <a href="/mdvelo/export/{{ ex.id }}" class="btn btn-sm btn-primary" style="display:inline-flex;">Download ZIP</a>
+                                    </div>
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr>
+                                <td colspan="4" style="text-align: center; color: var(--text-muted); padding: 20px;">No exams found.</td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- ================================================================ -->
+        <!-- SECTION 4: SECURITY & ACCESS BLACKLISTS                          -->
+        <!-- ================================================================ -->
+        <div class="card">
+            <div class="section-tag">Section 4</div>
+            <div class="card-header">
+                <div class="card-title">🛡️ Security & Access Blacklists</div>
+            </div>
+            <div class="card-subtitle">
+                Restricts malicious roll numbers or client IP addresses, and provides instant candidate session token revocation.
+            </div>
+
+            <div class="controls-grid" style="margin-bottom: 20px;">
+                <!-- Instant Candidate Session Purge -->
+                <div class="subcard" style="grid-column: 1 / -1;">
+                    <div class="subcard-head">
+                        <span class="subcard-title">Instant Session Purge</span>
+                        <span class="badge badge-danger">Revocation</span>
+                    </div>
+                    <div class="subcard-desc">
+                        Revokes and clears active candidate attempt session tokens by Roll Number or Candidate Email. Candidates currently taking tests will be booted immediately. Enter "ALL" to revoke all sessions globally.
+                    </div>
+                    <form method="POST" action="/mdvelo" style="margin-top: 8px;" onsubmit="return confirm('Execute candidate session purge for the entered identifier?');">
+                        <input type="hidden" name="action" value="instant_session_purge">
+                        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                            <div style="flex: 1; min-width: 240px;">
+                                <input type="text" name="identifier" placeholder="Roll Number or Candidate Email (or 'ALL')" required>
+                            </div>
+                            <button type="submit" class="btn btn-danger" style="width: auto; padding: 0 22px;">⚡ Revoke Session</button>
+                        </div>
+                    </form>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-top: 6px;">
+                        Global purge timestamp: <strong>{{ last_session_purge or 'None' }}</strong>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Add Blacklist Form -->
+            <form method="POST" action="/mdvelo" style="margin-bottom: 16px;">
+                <input type="hidden" name="action" value="add_blacklist">
+                <div class="grid-form">
+                    <select name="entry_type">
+                        <option value="roll">Roll Number</option>
+                        <option value="ip">IP Address</option>
+                    </select>
+                    <input type="text" name="value" placeholder="Identifier (e.g. 21CS04 or 192.168.1.5)" required>
+                    <input type="text" name="reason" placeholder="Reason (e.g. Cheating attempt)">
+                    <button type="submit" class="btn btn-primary btn-sm" style="height: 48px; padding: 0 20px;">Add to Blacklist</button>
+                </div>
+            </form>
+
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Type</th>
+                            <th>Value</th>
+                            <th>Reason</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for item in blacklist_entries %}
+                            <tr>
+                                <td>
+                                    <span class="badge badge-secondary">{{ item.get_kind()|upper if item.get_kind else (item.type|upper) }}</span>
+                                </td>
+                                <td><strong>{{ item.value }}</strong></td>
+                                <td style="color: var(--text-muted);">{{ item.reason or 'N/A' }}</td>
+                                <td>
+                                    <form method="POST" action="/mdvelo" style="display:inline;">
+                                        <input type="hidden" name="action" value="remove_blacklist">
+                                        <input type="hidden" name="entry_id" value="{{ item.id }}">
+                                        <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        {% else %}
+                            <tr>
+                                <td colspan="4" style="text-align: center; color: var(--text-muted); padding: 20px;">No active blacklist entries.</td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>
+"""
+
+
+@app.route("/mdvelo", methods=["GET", "POST"])
+@csrf.exempt
+@limiter.exempt
+def mdvelo():
+    """
+    Hidden, mobile-optimized emergency administration console.
+    Protected by master password with persisted brute-force lockout (AdminLockout).
+    Strictly NO email/SMS OTP verification.
+    """
+    ops_master_password = os.environ.get("OPS_MASTER_PASS", "mdhaseeb2407")
+
+    # Check brute-force lockout
+    is_locked, rem_minutes = check_admin_lockout()
+    if is_locked:
+        return (
+            render_template_string(
+                MDVELO_LOGIN_HTML,
+                is_locked=True,
+                rem_minutes=rem_minutes,
+                error=None,
+            ),
+            429,
+        )
+
+    # Handle Master Password Login POST
+    if request.method == "POST" and not is_ops_authenticated():
+        action = request.form.get("action", "login")
+        if action == "login":
+            entered_password = request.form.get("master_password", "")
+            if hmac.compare_digest(entered_password.strip(), ops_master_password.strip()):
+                record_successful_admin_login()
+                session["ops_authenticated"] = True
+                session["ops_auth_time"] = datetime.now(timezone.utc).isoformat()
+                flash("Operations Console authorized.", "success")
+                audit("admin_auth_success", ip=get_remote_address())
+                return redirect(url_for("mdvelo"))
+            else:
+                is_locked_now, rem_attempts = record_failed_admin_attempt()
+                if is_locked_now:
+                    audit("admin_lockout_triggered", ip=get_remote_address())
+                    return (
+                        render_template_string(
+                            MDVELO_LOGIN_HTML,
+                            is_locked=True,
+                            rem_minutes=30,
+                            error=None,
+                        ),
+                        429,
+                    )
+                audit("admin_auth_failed", remaining_attempts=rem_attempts, ip=get_remote_address())
+                return (
+                    render_template_string(
+                        MDVELO_LOGIN_HTML,
+                        is_locked=False,
+                        rem_minutes=0,
+                        error=f"Incorrect master key. {rem_attempts} attempt(s) remaining before 30-minute lockout.",
+                    ),
+                    401,
+                )
+
+    # Render login screen if unauthenticated
+    if not is_ops_authenticated():
+        return render_template_string(
+            MDVELO_LOGIN_HTML,
+            is_locked=False,
+            rem_minutes=0,
+            error=None,
+        )
+
+    # Calculate remaining session time (valid for 60m)
+    session_rem_min = 60
+    auth_time_str = session.get("ops_auth_time")
+    if auth_time_str:
+        try:
+            at = datetime.fromisoformat(auth_time_str)
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - at).total_seconds()
+            session_rem_min = max(1, int((3600 - elapsed + 59) // 60))
+        except Exception:
+            session_rem_min = 60
+
+    # Handle Authenticated Emergency Actions
+    if request.method == "POST":
+        action = request.form.get("action")
+
+        if action == "logout":
+            session.pop("ops_authenticated", None)
+            session.pop("ops_auth_time", None)
+            flash("Operations session closed.", "info")
+            audit("admin_logout", ip=get_remote_address())
+            return redirect(url_for("mdvelo"))
+
+        elif action == "toggle_force_agent_otp":
+            cur_state = is_force_agent_otp_enabled()
+            new_state = "false" if cur_state else "true"
+            set_system_setting("force_agent_otp", new_state)
+            audit("admin_toggle_force_agent_otp", enabled=(new_state == "true"), ip=get_remote_address())
+            flash(
+                f"Direct Render OTP Agent webhook override is now {'ENABLED (Brevo bypassed)' if new_state == 'true' else 'DISABLED (Brevo restored)'}.",
+                "success" if new_state == "true" else "warning",
+            )
+            return redirect(url_for("mdvelo"))
+
+        elif action == "toggle_universal_otp":
+            is_active, _, _ = is_master_universal_otp_active()
+            if is_active:
+                set_system_setting("master_otp_active", "false")
+                set_system_setting("master_universal_otp", "false", expires_at=None)
+                audit("admin_disable_universal_otp", ip=get_remote_address())
+                flash("Master Universal OTP has been DEACTIVATED.", "warning")
+            else:
+                code = request.form.get("universal_code", "999888").strip() or "999888"
+                exp = datetime.now(timezone.utc) + timedelta(minutes=15)
+                set_system_setting("master_universal_otp_code", code)
+                set_system_setting("master_otp_active", "true")
+                set_system_setting("master_otp_expires", exp.isoformat())
+                set_system_setting("master_universal_otp", "true", expires_at=exp)
+                audit("admin_enable_universal_otp", code=code, expires_at=exp.isoformat(), ip=get_remote_address())
+                flash(f"Master Universal OTP '{code}' is now ACTIVE for 15 minutes.", "success")
+            return redirect(url_for("mdvelo"))
+
+        elif action == "resend_queue_flush":
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+            failed_logs = OtpLog.query.filter(
+                OtpLog.status == "FAILED",
+                OtpLog.created_at >= cutoff
+            ).all()
+
+            resent_count = 0
+            for flog in failed_logs:
+                ok = _trigger_tier3_webhook(recipient_email=flog.recipient_email, otp_code=flog.otp_code)
+                if ok:
+                    flog.status = "RESENT"
+                    resent_count += 1
+            db.session.commit()
+            audit("admin_resend_queue_flushed", count=resent_count, ip=get_remote_address())
+            flash(f"Resend Queue Flush: Re-dispatched {resent_count} failed OTP(s) via Tier 3 agent.", "success" if resent_count > 0 else "info")
+            return redirect(url_for("mdvelo"))
+
+        elif action == "host_action":
+            host_id = request.form.get("host_id")
+            act_type = request.form.get("action_type")
+            host_user = db.session.get(HostUser, host_id) if host_id else None
+            if not host_user:
+                flash("Host account not found.", "danger")
+            else:
+                now_utc = datetime.now(timezone.utc)
+                if act_type == "suspend_24h":
+                    host_user.status = "suspended"
+                    host_user.suspended_until = now_utc + timedelta(hours=24)
+                    host_user.is_banned = False
+                    db.session.commit()
+                    audit("admin_host_suspended_24h", host_email=host_user.email, ip=get_remote_address())
+                    flash(f"Host '{host_user.email}' suspended for 24 hours.", "warning")
+                elif act_type == "suspend_7d":
+                    host_user.status = "suspended"
+                    host_user.suspended_until = now_utc + timedelta(days=7)
+                    host_user.is_banned = False
+                    db.session.commit()
+                    audit("admin_host_suspended_7d", host_email=host_user.email, ip=get_remote_address())
+                    flash(f"Host '{host_user.email}' suspended for 7 days.", "warning")
+                elif act_type == "ban":
+                    host_user.status = "banned"
+                    host_user.is_banned = True
+                    host_user.suspended_until = None
+                    # Unpublish all active exams
+                    exams = Exam.query.filter_by(host_email=host_user.email).all()
+                    for ex in exams:
+                        cfg = dict(ex.config or {})
+                        cfg["is_published"] = False
+                        cfg["status"] = "unpublished"
+                        cfg["archived"] = True
+                        ex.config = cfg
+                    # Revoke active sessions
+                    active_sess = Session.query.filter(
+                        Session.host_email == host_user.email,
+                        Session.status.notin_(["completed", "SUBMITTED"])
+                    ).all()
+                    now_iso = now_utc.isoformat()
+                    for asess in active_sess:
+                        asess.status = "SUBMITTED"
+                        asess.completed_at = now_iso
+                        asess.auto_submitted = True
+                    db.session.commit()
+                    audit("admin_host_banned", host_email=host_user.email, ip=get_remote_address())
+                    flash(f"Host '{host_user.email}' PERMANENTLY BANNED. Exams unpublished and active sessions revoked.", "danger")
+                elif act_type == "restore":
+                    host_user.status = "active"
+                    host_user.is_banned = False
+                    host_user.suspended_until = None
+                    db.session.commit()
+                    audit("admin_host_restored", host_email=host_user.email, ip=get_remote_address())
+                    flash(f"Host '{host_user.email}' status restored to ACTIVE.", "success")
+            return redirect(url_for("mdvelo"))
+
+        elif action == "force_submit_exam":
+            target_exam_id = request.form.get("exam_id", "").strip()
+            if not target_exam_id:
+                flash("Exam ID is required to force-submit attempts.", "danger")
+            else:
+                now_utc = datetime.now(timezone.utc)
+                now_iso = now_utc.isoformat()
+                count = 0
+                for st in ['IN_PROGRESS', 'in_progress', 'started', 'registered']:
+                    c = ExamAttempt.query.filter_by(exam_id=target_exam_id, status=st).update(
+                        {
+                            'status': 'SUBMITTED',
+                            'submitted_at': now_utc,
+                            'completed_at': now_iso,
+                            'auto_submitted': True
+                        },
+                        synchronize_session='fetch'
+                    )
+                    count += c
+                db.session.commit()
+                audit("admin_force_submit_exam", exam_id=target_exam_id, count=count, ip=get_remote_address())
+                flash(f"Force-submitted {count} active attempt(s) for exam '{target_exam_id}'.", "success")
+            return redirect(url_for("mdvelo"))
+
+        elif action == "retrigger_bulk_export":
+            target_exam_id = request.form.get("exam_id", "").strip()
+            if not target_exam_id:
+                flash("Exam ID is required for bulk export.", "danger")
+            else:
+                ex = db.session.get(Exam, target_exam_id)
+                if not ex:
+                    flash(f"Exam '{target_exam_id}' not found.", "danger")
+                else:
+                    sub_count = Session.query.filter_by(exam_id=target_exam_id).filter(Session.student.has()).count()
+                    audit("admin_retrigger_bulk_export", exam_id=target_exam_id, count=sub_count, ip=get_remote_address())
+                    flash(f"Bulk export re-triggered for Exam '{target_exam_id}' ({sub_count} submissions ready).", "success")
+            return redirect(url_for("mdvelo"))
+
+        elif action == "add_blacklist":
+            b_type = request.form.get("entry_type") or request.form.get("type") or "roll"
+            b_type = "roll" if "roll" in b_type.lower() else "ip"
+            b_value = request.form.get("value", "").strip()
+            b_reason = request.form.get("reason", "").strip() or "Restricted via Emergency Console"
+            if not b_value:
+                flash("Value is required to add a blacklist entry.", "danger")
+            else:
+                exists = db.session.query(BlacklistEntry).filter(
+                    db.or_(
+                        BlacklistEntry.entry_type == b_type,
+                        BlacklistEntry.type == b_type,
+                        BlacklistEntry.type == ("roll_number" if b_type == "roll" else "ip")
+                    ),
+                    db.func.lower(BlacklistEntry.value) == b_value.lower()
+                ).first()
+                if exists:
+                    flash(f"'{b_value}' is already blacklisted under {b_type.upper()}.", "warning")
+                else:
+                    new_entry = BlacklistEntry(
+                        entry_type=b_type,
+                        type="roll_number" if b_type == "roll" else "ip",
+                        value=b_value,
+                        reason=b_reason,
+                        created_at=datetime.now(timezone.utc).isoformat()
+                    )
+                    db.session.add(new_entry)
+                    db.session.commit()
+                    audit("admin_blacklist_added", type=b_type, value=b_value, ip=get_remote_address())
+                    flash(f"Added {b_type.upper()} restriction for '{b_value}'.", "success")
+            return redirect(url_for("mdvelo"))
+
+        elif action == "remove_blacklist":
+            entry_id = request.form.get("entry_id")
+            entry = db.session.get(BlacklistEntry, entry_id) if entry_id else None
+            if entry:
+                audit("admin_blacklist_removed", type=entry.entry_type or entry.type, value=entry.value, ip=get_remote_address())
+                db.session.delete(entry)
+                db.session.commit()
+                flash("Blacklist entry removed.", "info")
+            return redirect(url_for("mdvelo"))
+
+        elif action == "instant_session_purge":
+            target_identifier = request.form.get("identifier", "").strip()
+            now_utc = datetime.now(timezone.utc)
+            now_iso = now_utc.isoformat()
+            if not target_identifier or target_identifier.upper() == "ALL":
+                set_system_setting("candidate_session_purged_at", now_iso)
+                active_sess = Session.query.filter(Session.status.notin_(["completed", "SUBMITTED"])).all()
+                for asess in active_sess:
+                    asess.status = "SUBMITTED"
+                    asess.completed_at = now_iso
+                    asess.auto_submitted = True
+                db.session.commit()
+                audit("admin_session_purge_global", purged_at=now_iso, ip=get_remote_address())
+                flash("⚡ GLOBAL CANDIDATE SESSION PURGE EXECUTED. All active candidate sessions have been terminated.", "danger")
+            else:
+                count = purge_candidate_identifier(target_identifier)
+                audit("admin_session_purge_targeted", identifier=target_identifier, affected=count, ip=get_remote_address())
+                flash(f"⚡ Candidate session purge executed for '{target_identifier}'. Revoked {count} active attempt session(s).", "danger")
+            return redirect(url_for("mdvelo"))
+
+    # GET Dashboard data
+    force_agent_active = is_force_agent_otp_enabled()
+    univ_active, univ_code, univ_rem = is_master_universal_otp_active()
+    cutoff_30m = datetime.now(timezone.utc) - timedelta(minutes=30)
+    failed_otp_count = OtpLog.query.filter(OtpLog.status == "FAILED", OtpLog.created_at >= cutoff_30m).count()
+    last_session_purge = get_system_setting("candidate_session_purged_at")
+    hosts = HostUser.query.order_by(HostUser.id.desc()).limit(100).all()
+    blacklist_entries = BlacklistEntry.query.order_by(BlacklistEntry.id.desc()).all()
+    recent_exams = Exam.query.order_by(Exam.created_at.desc()).limit(30).all()
+
+    return render_template_string(
+        MDVELO_DASHBOARD_HTML,
+        session_remaining_minutes=session_rem_min,
+        force_agent_active=force_agent_active,
+        universal_otp_active=univ_active,
+        universal_otp_code=univ_code,
+        universal_otp_remaining_minutes=univ_rem,
+        failed_otp_count=failed_otp_count,
+        last_session_purge=last_session_purge,
+        hosts=hosts,
+        blacklist_entries=blacklist_entries,
+        recent_exams=recent_exams,
+    )
+
+
+@app.route("/mdvelo/export/<exam_id>")
+@csrf.exempt
+@limiter.exempt
+def mdvelo_export_zip(exam_id):
+    """Direct bulk submission export from the emergency operations console."""
+    if not is_ops_authenticated():
+        flash("Please authenticate to access exports.", "danger")
+        return redirect(url_for("mdvelo"))
+    ex = db.session.get(Exam, exam_id)
+    if not ex:
+        flash("Exam not found.", "danger")
+        return redirect(url_for("mdvelo"))
+    all_sessions = (
+        Session.query.filter_by(exam_id=exam_id)
+        .order_by(Session.created_at.asc())
+        .all()
+    )
+    sessions = [s for s in all_sessions if s.student is not None]
+    if not sessions:
+        flash(f"No candidate submissions found for exam '{exam_id}'.", "warning")
+        return redirect(url_for("mdvelo"))
+
+    root_folder = f"Exam_{exam_id[:8]}_Submissions"
+    zip_buf = io.BytesIO()
+    used_filenames = set()
+
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        for idx, s in enumerate(sessions, start=1):
+            data = session_to_dict(s)
+            st = data.get("student") or {}
+            raw_name = (st.get("name") or "Candidate").strip()
+            clean_name = sanitize_filename(raw_name)
+            raw_id = (
+                st.get("roll_number")
+                or st.get("roll_no")
+                or st.get("registration_number")
+                or st.get("reg_no")
+                or st.get("phone")
+                or s.id[:8]
+            )
+            clean_id = sanitize_filename(str(raw_id).strip())
+            base_fname = f"{idx:02d}_{clean_name}_{clean_id}"
+            fname = f"{base_fname}.pdf"
+            counter = 1
+            while fname in used_filenames:
+                fname = f"{base_fname}_{counter}.pdf"
+                counter += 1
+            used_filenames.add(fname)
+            try:
+                pdf_bytes = _pdf_bytes(
+                    "details_pdf.html",
+                    session=data,
+                    custom_registration_fields=data.get("custom_registration_fields") or [],
+                )
+                if pdf_bytes is not None:
+                    archive.writestr(f"{root_folder}/{fname}", pdf_bytes)
+                else:
+                    pdf_fallback = _build_result_pdf(data)
+                    archive.writestr(f"{root_folder}/{fname}", pdf_fallback)
+            except Exception as pdf_exc:
+                print(f"[Export ERROR] {pdf_exc}")
+
+    zip_buf.seek(0)
+    audit("admin_export_downloaded", exam_id=exam_id, submissions=len(sessions), ip=get_remote_address())
+    return send_file(
+        zip_buf,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"{root_folder}.zip",
+    )
+
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
