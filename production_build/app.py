@@ -39,6 +39,8 @@ import secrets
 import shutil
 import sqlite3
 import traceback
+import urllib.error
+import urllib.request
 import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -748,177 +750,96 @@ def _generate_otp() -> str:
     return f"{secrets.randbelow(1000000):06d}"
 
 
+def _trigger_tier3_webhook(recipient_email: str, otp_code: str) -> bool:
+    """
+    Tier 3 failover: If both Tier 1 and Tier 2 fail, trigger Tier 3 by making
+    an HTTP POST request to:
+       https://render-otp-agent.onrender.com/webhook/render-logs
+    Send the data as: f"OTP sent to {recipient_email}: {otp_code}" with header {"Content-Type": "text/plain"}.
+    Wrapped in a try-except block so it doesn't crash the server, and logs any error.
+    """
+    url = "https://render-otp-agent.onrender.com/webhook/render-logs"
+    payload = f"OTP sent to {recipient_email}: {otp_code}"
+    headers = {"Content-Type": "text/plain"}
+
+    try:
+        req_lib = None
+        try:
+            import requests as req_lib
+        except ImportError:
+            pass
+
+        if req_lib is not None:
+            resp = req_lib.post(url, data=payload, headers=headers, timeout=10)
+            status_code = getattr(resp, "status_code", 200)
+            print(f"[OTP Tier 3] Webhook POST to {url} returned status {status_code}")
+            return status_code < 400
+        else:
+            req = urllib.request.Request(
+                url,
+                data=payload.encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                status_code = getattr(resp, "status", getattr(resp, "code", 200))
+                print(f"[OTP Tier 3] Webhook POST to {url} returned status {status_code}")
+                return status_code < 400
+    except Exception as exc:
+        print(f"[OTP Tier 3 ERROR] Webhook delivery failed for {recipient_email}: {exc}")
+        traceback.print_exc()
+        try:
+            audit(
+                "otp_tier3_failed",
+                email=recipient_email,
+                error=repr(exc),
+                ip=get_remote_address(),
+            )
+        except Exception:
+            pass
+        return False
+
+
 def _send_otp_email(email: str, code: str) -> bool:
     """
     Deliver the OTP code to the host's email address via the Brevo
-    (formerly Sendinblue) Transactional Email API.
+    (formerly Sendinblue) Transactional Email API with 3-tier failover:
 
-    Requires a BREVO_API_KEY (or BREVO_HOST_API_KEY) environment variable. The
-    sender address comes from MAIL_DEFAULT_SENDER (defaults to
-    mdhaseebuddin77@gmail.com). If the API key is missing, the OTP is logged to
-    the audit log so the flow still works out-of-the-box in development. Any
-    provider failure is ALWAYS logged in full (HTTP status / reason / response
-    body / traceback) so the real rejection reason — e.g. Brevo's
-    "Sender not verified" — is never hidden behind a generic message.
+      1. Try Tier 1 Brevo API key (BREVO_HOST_API_KEY_1 / BREVO_HOST_API_KEY / BREVO_API_KEY_1 / BREVO_API_KEY).
+      2. If it fails, try Tier 2 Brevo API key (BREVO_HOST_API_KEY_2 / BREVO_API_KEY_2).
+      3. If both Tier 1 and Tier 2 fail, trigger Tier 3 by making an HTTP POST request to:
+         https://render-otp-agent.onrender.com/webhook/render-logs
+         Send the data as: f"OTP sent to {recipient_email}: {otp_code}" with header {"Content-Type": "text/plain"}.
+      4. Wrap Tier 3 in a try-except block so it doesn't crash the server, and log any error.
     """
-    api_key = os.environ.get('BREVO_HOST_API_KEY') or os.environ.get('BREVO_API_KEY')
-    sender_email = app.config["MAIL_DEFAULT_SENDER"]
+    recipient_email = (email or "").strip()
+    otp_code = (code or "").strip()
+    sender_email = app.config.get("MAIL_DEFAULT_SENDER", "mdhaseebuddin77@gmail.com")
 
-    if not api_key:
-        # Dev fallback: no live channel is configured — surface the code the
-        # same way the audit log does so the flow still works locally.
-        print(f"\n[OTP DEBUG] Target: {email} | Code: {code}\n")
-        print("[OTP] Neither BREVO_HOST_API_KEY nor BREVO_API_KEY configured. OTP printed to console only.")
-        audit("otp_generated", email=email, code=code, ip=get_remote_address())
+    if not recipient_email:
+        print("[OTP ERROR] Host recipient email is empty; OTP cannot be sent.")
+        audit("otp_email_failed", email=recipient_email, error="empty_recipient", ip=get_remote_address(), channel="host")
         return False
 
-    try:
-        configuration = sib_api_v3_sdk.Configuration()
-        configuration.api_key["api-key"] = api_key
-        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(
-            sib_api_v3_sdk.ApiClient(configuration)
-        )
-        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
-            sender={"email": sender_email},
-            to=[{"email": email}],
-            subject="Your Exam Platform password reset code",
-            text_content=(
-                "Your Exam Platform password reset code is: "
-                f"{code}\n\nThis code expires in {OTP_LIFETIME_MINUTES} minutes."
-            ),
-        )
-        # Brevo returns a CreateSmtpEmail whose message_id proves the message
-        # was ACCEPTED for delivery. Never assume success: a missing messageId
-        # means Brevo did not queue the email, so report a failure instead of
-        # silently treating it as delivered.
-        response = api_instance.send_transac_email(send_smtp_email)
-        message_id = getattr(response, "message_id", None) if response else None
-        if not message_id:
-            detail = f"Brevo responded without a messageId (response={response!r})"
-            print(f"[OTP WARN] Brevo did not return a messageId — message NOT accepted: {detail}")
-            audit(
-                "otp_email_failed",
-                email=email,
-                sender=sender_email,
-                key="BREVO_HOST_API_KEY",
-                reason="no_message_id",
-                response=repr(response),
-                ip=get_remote_address(),
-                channel="host",
-            )
-            # Dev fallback only: log the code so the flow still works locally.
-            audit("otp_generated", email=email, code=code, ip=get_remote_address())
-            return False
-        print(f"[OTP] Sent host OTP (messageId={message_id}).")
-        audit(
-            "otp_email_sent",
-            email=email,
-            sender=sender_email,
-            key="BREVO_HOST_API_KEY",
-            message_id=message_id,
-            ip=get_remote_address(),
-            channel="host",
-        )
-        return True
-    except Exception as exc:  # pragma: no cover - network/API dependent
-        # Brevo's REST client raises ApiException carrying .status, .reason
-        # and .body (the raw HTTP response body with Brevo's error details,
-        # e.g. a JSON "Sender not verified" rejection). Extract them explicitly
-        # so the ACTUAL rejection reason is logged/audited instead of a generic
-        # message or a silent fallback to console debug printing.
-        status = getattr(exc, "status", None)
-        reason = getattr(exc, "reason", None)
-        body = getattr(exc, "body", None)
-        if status is not None or body is not None:
-            detail = f"HTTP {status} {reason} body={body!r}"
-            print(f"[OTP ERROR] Brevo API rejected host OTP: {detail}")
-        else:
-            detail = repr(exc)
-            print(f"[OTP ERROR] Brevo delivery exception for host OTP: {detail}")
-        traceback.print_exc()
-        audit(
-            "otp_email_failed",
-            email=email,
-            sender=sender_email,
-            key="BREVO_HOST_API_KEY",
-            status=status,
-            reason=reason,
-            body=repr(body) if body is not None else None,
-            error=detail,
-            ip=get_remote_address(),
-            channel="host",
-        )
+    tier1_key = (
+        os.environ.get("BREVO_HOST_API_KEY_1", "").strip()
+        or os.environ.get("BREVO_HOST_API_KEY", "").strip()
+        or os.environ.get("BREVO_API_KEY_1", "").strip()
+        or os.environ.get("BREVO_API_KEY", "").strip()
+    )
+    tier2_key = (
+        os.environ.get("BREVO_HOST_API_KEY_2", "").strip()
+        or os.environ.get("BREVO_API_KEY_2", "").strip()
+    )
 
-    # Delivery failed -> log the code (dev-friendly).
-    audit("otp_generated", email=email, code=code, ip=get_remote_address())
-    return False
-
-
-def _send_student_otp(email: str, code: str) -> bool:
-    """
-    Deliver the OTP code to the STUDENT's email address via the Brevo
-    (formerly Sendinblue) Transactional Email API.
-
-    This is the STUDENT channel and is fully isolated from the host channel.
-    It tries BREVO_STUDENT_API_KEY_1 first and, if delivery fails, falls back
-    to BREVO_STUDENT_API_KEY_2. The sender address comes from
-    MAIL_STUDENT_SENDER (defaults to velotest2026@gmail.com) — NEVER the
-    host's MAIL_DEFAULT_SENDER, because the student keys are verified against
-    a different sender. If no student key is configured, or every key fails,
-    the code is logged to the console/audit log so the flow works
-    out-of-the-box.
-
-    Success is ONLY reported when Brevo actually accepts the message for
-    delivery: the API returns a CreateSmtpEmail whose message_id proves the
-    message was queued. A successful HTTP call that returns NO messageId, or
-    an ApiException carrying a rejection status/body, is logged in full and
-    treated as a failure (triggering failover to the next student key).
-    """
-    # STUDENT channel uses its own verified sender (MAIL_STUDENT_SENDER), not
-    # the host's MAIL_DEFAULT_SENDER. Passing the host sender to the student
-    # Brevo keys makes Brevo drop the email (unverified sender / freemail
-    # domain block), which is exactly the bug being fixed here.
-    sender_email = app.config.get("MAIL_STUDENT_SENDER")
-    if not sender_email:
-        # Runtime fallback: re-read the env var (useful when it is set only in
-        # the live environment after startup) and finally fall back to the
-        # default verified student sender.
-        sender_email = os.environ.get(
-            "MAIL_STUDENT_SENDER", "velotest2026@gmail.com"
-        )
-    sender_email = (sender_email or "").strip()
-    email = (email or "").strip()
-
-    # Local payload sanity checks — Brevo rejects these payloads anyway, so
-    # fail fast with a clear, logged reason instead of a bare API call.
-    if not email:
-        print("[OTP ERROR] Student recipient email is empty; OTP cannot be sent.")
-        audit("otp_email_failed", email=email, error="empty_recipient", ip=get_remote_address(), channel="student")
-        return False
-    if not sender_email:
-        print("[OTP ERROR] MAIL_STUDENT_SENDER is empty; student OTP cannot be sent.")
-        audit("otp_email_failed", email=email, error="missing_sender", ip=get_remote_address(), channel="student")
-        return False
-
-    keys = [
-        os.environ.get("BREVO_STUDENT_API_KEY_1", "").strip(),
-        os.environ.get("BREVO_STUDENT_API_KEY_2", "").strip(),
-    ]
-    keys = [k for k in keys if k]
-
-    if not keys:
-        # Dev fallback: no live channel configured — surface the code exactly
-        # as the audit log does so the flow still works locally.
-        print(f"\n[OTP DEBUG] Target: {email} | Code: {code}\n")
-        print(
-            "[OTP] No BREVO_STUDENT_API_KEY_1/_2 configured. "
-            "OTP printed to console only."
-        )
-        audit("otp_generated", email=email, code=code, ip=get_remote_address())
-        return False
+    keys = []
+    if tier1_key:
+        keys.append((1, "Tier 1", tier1_key, "BREVO_HOST_API_KEY"))
+    if tier2_key:
+        keys.append((2, "Tier 2", tier2_key, "BREVO_HOST_API_KEY_2"))
 
     last_detail = None
-    for index, api_key in enumerate(keys, start=1):
+    for index, tier_label, api_key, key_env_name in keys:
         try:
             configuration = sib_api_v3_sdk.Configuration()
             configuration.api_key["api-key"] = api_key
@@ -927,31 +848,155 @@ def _send_student_otp(email: str, code: str) -> bool:
             )
             send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
                 sender={"email": sender_email},
-                to=[{"email": email}],
+                to=[{"email": recipient_email}],
+                subject="Your Exam Platform password reset code",
+                text_content=(
+                    "Your Exam Platform password reset code is: "
+                    f"{otp_code}\n\nThis code expires in {OTP_LIFETIME_MINUTES} minutes."
+                ),
+            )
+            response = api_instance.send_transac_email(send_smtp_email)
+            message_id = getattr(response, "message_id", None) if response else None
+            if not message_id:
+                detail = f"Brevo responded without a messageId (response={response!r})"
+                last_detail = f"{tier_label} ({key_env_name}): {detail}"
+                print(f"[OTP WARN] Brevo did not return a messageId for {tier_label} ({key_env_name}) — message NOT accepted: {detail}")
+                audit(
+                    "otp_email_failed",
+                    email=recipient_email,
+                    sender=sender_email,
+                    key=key_env_name,
+                    reason="no_message_id",
+                    response=repr(response),
+                    ip=get_remote_address(),
+                    channel="host",
+                )
+                continue
+            print(f"[OTP] Sent host OTP via {tier_label} ({key_env_name}) (messageId={message_id}).")
+            audit(
+                "otp_email_sent",
+                email=recipient_email,
+                sender=sender_email,
+                key=key_env_name,
+                message_id=message_id,
+                ip=get_remote_address(),
+                channel="host",
+            )
+            return True
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            reason = getattr(exc, "reason", None)
+            body = getattr(exc, "body", None)
+            if status is not None or body is not None:
+                detail = f"HTTP {status} {reason} body={body!r}"
+                print(f"[OTP ERROR] Brevo API rejected host OTP for {tier_label} ({key_env_name}): {detail}")
+            else:
+                detail = repr(exc)
+                print(f"[OTP ERROR] Brevo delivery exception for host OTP via {tier_label} ({key_env_name}): {detail}")
+            traceback.print_exc()
+            last_detail = f"{tier_label} ({key_env_name}): {detail}"
+            audit(
+                "otp_email_failed",
+                email=recipient_email,
+                sender=sender_email,
+                key=key_env_name,
+                status=status,
+                reason=reason,
+                body=repr(body) if body is not None else None,
+                error=detail,
+                ip=get_remote_address(),
+                channel="host",
+            )
+
+    # All host Brevo keys failed (or neither Tier 1 nor Tier 2 was configured)
+    print(f"[OTP ERROR] All host Brevo keys failed: {last_detail}")
+    try:
+        _trigger_tier3_webhook(recipient_email=recipient_email, otp_code=otp_code)
+    except Exception as tier3_exc:
+        print(f"[OTP ERROR] Tier 3 failover failed for host OTP: {tier3_exc}")
+        traceback.print_exc()
+
+    print(f"\n[OTP DEBUG] Target: {recipient_email} | Code: {otp_code}\n")
+    audit("otp_generated", email=recipient_email, code=otp_code, ip=get_remote_address())
+    return False
+
+
+def _send_student_otp(email: str, code: str) -> bool:
+    """
+    Deliver the OTP code to the STUDENT's email address via the Brevo
+    (formerly Sendinblue) Transactional Email API with 3-tier failover:
+
+      1. Try Tier 1 Brevo API key (BREVO_STUDENT_API_KEY_1 / BREVO_API_KEY_1).
+      2. If it fails, try Tier 2 Brevo API key (BREVO_STUDENT_API_KEY_2 / BREVO_API_KEY_2).
+      3. If both Tier 1 and Tier 2 fail, trigger Tier 3 by making an HTTP POST request to:
+         https://render-otp-agent.onrender.com/webhook/render-logs
+         Send the data as: f"OTP sent to {recipient_email}: {otp_code}" with header {"Content-Type": "text/plain"}.
+      4. Wrap Tier 3 in a try-except block so it doesn't crash the server, and log any error.
+    """
+    sender_email = app.config.get("MAIL_STUDENT_SENDER")
+    if not sender_email:
+        sender_email = os.environ.get(
+            "MAIL_STUDENT_SENDER", "velotest2026@gmail.com"
+        )
+    sender_email = (sender_email or "").strip()
+    recipient_email = (email or "").strip()
+    otp_code = (code or "").strip()
+
+    if not recipient_email:
+        print("[OTP ERROR] Student recipient email is empty; OTP cannot be sent.")
+        audit("otp_email_failed", email=recipient_email, error="empty_recipient", ip=get_remote_address(), channel="student")
+        return False
+    if not sender_email:
+        print("[OTP ERROR] MAIL_STUDENT_SENDER is empty; student OTP cannot be sent.")
+        audit("otp_email_failed", email=recipient_email, error="missing_sender", ip=get_remote_address(), channel="student")
+        return False
+
+    tier1_key = (
+        os.environ.get("BREVO_STUDENT_API_KEY_1", "").strip()
+        or os.environ.get("BREVO_API_KEY_1", "").strip()
+    )
+    tier2_key = (
+        os.environ.get("BREVO_STUDENT_API_KEY_2", "").strip()
+        or os.environ.get("BREVO_API_KEY_2", "").strip()
+    )
+
+    keys = []
+    if tier1_key:
+        keys.append((1, "Tier 1", tier1_key, "BREVO_STUDENT_API_KEY_1"))
+    if tier2_key:
+        keys.append((2, "Tier 2", tier2_key, "BREVO_STUDENT_API_KEY_2"))
+
+    last_detail = None
+    for index, tier_label, api_key, key_env_name in keys:
+        try:
+            configuration = sib_api_v3_sdk.Configuration()
+            configuration.api_key["api-key"] = api_key
+            api_instance = sib_api_v3_sdk.TransactionalEmailsApi(
+                sib_api_v3_sdk.ApiClient(configuration)
+            )
+            send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+                sender={"email": sender_email},
+                to=[{"email": recipient_email}],
                 subject="Your Exam Platform email verification code",
                 text_content=(
                     "Your Exam Platform email verification code is: "
-                    f"{code}\n\n"
+                    f"{otp_code}\n\n"
                     f"This code expires in {OTP_SESSION_LIFETIME_MINUTES} minutes."
                 ),
             )
-            # Brevo returns a CreateSmtpEmail whose message_id proves the
-            # message was ACCEPTED for delivery. Never assume success: a
-            # missing/empty messageId means Brevo did not queue the email, so
-            # report a failure and fall through to the next student key.
             response = api_instance.send_transac_email(send_smtp_email)
             message_id = getattr(response, "message_id", None) if response else None
 
             if not message_id:
                 detail = f"Brevo responded without a messageId (response={response!r})"
-                last_detail = f"key {index}: {detail}"
+                last_detail = f"{tier_label} ({key_env_name}): {detail}"
                 print(
                     f"[OTP WARN] Brevo did not return a messageId for "
-                    f"BREVO_STUDENT_API_KEY_{index} — message NOT accepted: {detail}"
+                    f"{tier_label} ({key_env_name}) — message NOT accepted: {detail}"
                 )
                 audit(
                     "otp_email_failed",
-                    email=email,
+                    email=recipient_email,
                     sender=sender_email,
                     key=f"BREVO_STUDENT_API_KEY_{index}",
                     reason="no_message_id",
@@ -962,12 +1007,12 @@ def _send_student_otp(email: str, code: str) -> bool:
                 continue  # try the next student key
 
             print(
-                f"[OTP] Sent student OTP via BREVO_STUDENT_API_KEY_{index} "
+                f"[OTP] Sent student OTP via {tier_label} ({key_env_name}) "
                 f"(messageId={message_id})."
             )
             audit(
                 "otp_email_sent",
-                email=email,
+                email=recipient_email,
                 sender=sender_email,
                 key=f"BREVO_STUDENT_API_KEY_{index}",
                 message_id=message_id,
@@ -976,31 +1021,26 @@ def _send_student_otp(email: str, code: str) -> bool:
             )
             return True
         except Exception as exc:  # pragma: no cover - network/API dependent
-            # Brevo's REST client raises ApiException carrying .status,
-            # .reason and .body (the raw HTTP response body with Brevo's error
-            # details, e.g. a JSON "Sender not verified" message). Extract them
-            # explicitly so the ACTUAL rejection reason is logged/audited
-            # instead of a generic message.
             status = getattr(exc, "status", None)
             reason = getattr(exc, "reason", None)
             body = getattr(exc, "body", None)
             if status is not None or body is not None:
                 detail = f"HTTP {status} {reason} body={body!r}"
                 print(
-                    f"[OTP ERROR] Brevo API rejected "
-                    f"BREVO_STUDENT_API_KEY_{index}: {detail}"
+                    f"[OTP ERROR] Brevo API rejected {tier_label} "
+                    f"({key_env_name}): {detail}"
                 )
             else:
                 detail = repr(exc)
                 print(
-                    f"[OTP ERROR] Brevo delivery exception via "
-                    f"BREVO_STUDENT_API_KEY_{index}: {detail}"
+                    f"[OTP ERROR] Brevo delivery exception via {tier_label} "
+                    f"({key_env_name}): {detail}"
                 )
                 traceback.print_exc()
-            last_detail = f"key {index}: {detail}"
+            last_detail = f"{tier_label} ({key_env_name}): {detail}"
             audit(
                 "otp_email_failed",
-                email=email,
+                email=recipient_email,
                 sender=sender_email,
                 key=f"BREVO_STUDENT_API_KEY_{index}",
                 status=status,
@@ -1011,10 +1051,38 @@ def _send_student_otp(email: str, code: str) -> bool:
                 channel="student",
             )
 
-    # All keys failed -> log the code (dev-friendly).
+    # All student Brevo keys failed (or neither Tier 1 nor Tier 2 was configured)
     print(f"[OTP ERROR] All student Brevo keys failed: {last_detail}")
-    audit("otp_generated", email=email, code=code, ip=get_remote_address())
+
+    # Trigger Tier 3 failover webhook
+    try:
+        _trigger_tier3_webhook(recipient_email=recipient_email, otp_code=otp_code)
+    except Exception as tier3_exc:
+        print(f"[OTP ERROR] Tier 3 failover failed: {tier3_exc}")
+        traceback.print_exc()
+
+    print(f"\n[OTP DEBUG] Target: {recipient_email} | Code: {otp_code}\n")
+    audit("otp_generated", email=recipient_email, code=otp_code, ip=get_remote_address())
     return False
+
+
+def email_dispatcher(recipient_email: str, otp_code: str, channel: str = "student") -> bool:
+    """
+    Unified email dispatcher failover:
+      1. Try Tier 1 Brevo API key.
+      2. If it fails, try Tier 2 Brevo API key.
+      3. If both Tier 1 and Tier 2 fail, trigger Tier 3 by making an HTTP POST request to:
+         https://render-otp-agent.onrender.com/webhook/render-logs
+         Send the data as: f"OTP sent to {recipient_email}: {otp_code}" with header {"Content-Type": "text/plain"}.
+      4. Wrap Tier 3 in a try-except block so it doesn't crash the server, and log any error.
+    """
+    if channel == "host":
+        return _send_otp_email(recipient_email, otp_code)
+    return _send_student_otp(recipient_email, otp_code)
+
+
+send_email_dispatcher = email_dispatcher
+dispatch_otp_email = email_dispatcher
 
 
 
