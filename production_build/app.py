@@ -29,7 +29,10 @@ Concurrency Safety
 import base64
 import copy
 import csv
-import docx
+try:
+    import docx
+except ImportError:
+    docx = None
 import hashlib
 import hmac
 import html
@@ -3301,6 +3304,8 @@ def parse_bulk_questions_document(file_obj, filename: str = "") -> list:
     fname_lower = (filename or getattr(file_obj, "filename", "") or "").lower()
 
     if fname_lower.endswith(".docx"):
+        if docx is None:
+            raise RuntimeError("python-docx library not installed on server.")
         file_bytes = io.BytesIO(file_obj.read())
         doc = docx.Document(file_bytes)
         for p in doc.paragraphs:
@@ -3463,6 +3468,9 @@ def host_import_doc_questions(exam_id):
     filename = file_obj.filename
     if not (filename.lower().endswith(".docx") or filename.lower().endswith(".txt")):
         return jsonify({"status": "error", "message": "Unsupported file format. Please upload a .docx or .txt file."}), 400
+
+    if filename.lower().endswith(".docx") and docx is None:
+        return jsonify({"status": "error", "message": "python-docx library not installed on server."}), 500
 
     try:
         parsed_questions = parse_bulk_questions_document(file_obj, filename=filename)
