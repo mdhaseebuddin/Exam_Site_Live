@@ -75,6 +75,13 @@ class Exam(db.Model):
         cascade="all, delete-orphan",
     )
 
+    @property
+    def title(self) -> str:
+        """Convenience property to access exam title from config JSON."""
+        if isinstance(self.config, dict):
+            return self.config.get("exam_title") or self.config.get("title") or f"Exam #{self.id}"
+        return f"Exam #{self.id}"
+
 
 class ExamQuestion(db.Model):
     """
@@ -98,6 +105,7 @@ class ExamQuestion(db.Model):
     text = db.Column(db.Text, nullable=False)
     options = db.Column(db.JSON, nullable=True)  # shuffled (mcq)
     correct_index = db.Column(db.Integer, nullable=True)
+    marks = db.Column(db.Integer, nullable=True, default=5)
 
 
 class Question(db.Model):
@@ -111,6 +119,7 @@ class Question(db.Model):
     text = db.Column(db.Text, nullable=False)
     options = db.Column(db.JSON, nullable=True)  # list[str] (mcq only)
     correct_index = db.Column(db.Integer, nullable=True)  # mcq only
+    marks = db.Column(db.Integer, nullable=True, default=5)
     created_at = db.Column(
         db.String(64),
         nullable=False,

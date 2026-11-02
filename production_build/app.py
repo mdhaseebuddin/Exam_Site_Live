@@ -26,7 +26,10 @@ Concurrency Safety
     serializing writers.
 """
 
+import base64
 import copy
+import csv
+import docx
 import hashlib
 import hmac
 import html
@@ -40,6 +43,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import threading
 import traceback
 import urllib.error
 import urllib.request
@@ -505,10 +509,16 @@ def init_db() -> None:
             db.session.execute(text("ALTER TABLE host_users ADD COLUMN suspended_until TIMESTAMP"))
         if "is_banned" not in host_cols:
             db.session.execute(text("ALTER TABLE host_users ADD COLUMN is_banned BOOLEAN NOT NULL DEFAULT FALSE"))
-        # Question.host_email (per-host question-bank isolation)
+        # Question.host_email, marks (per-host question-bank isolation)
         q_cols = [c["name"] for c in insp.get_columns("questions")]
         if "host_email" not in q_cols:
             db.session.execute(text("ALTER TABLE questions ADD COLUMN host_email VARCHAR(255)"))
+        if "marks" not in q_cols:
+            db.session.execute(text("ALTER TABLE questions ADD COLUMN marks INTEGER DEFAULT 5"))
+        if "exam_questions" in insp.get_table_names():
+            eq_cols = [c["name"] for c in insp.get_columns("exam_questions")]
+            if "marks" not in eq_cols:
+                db.session.execute(text("ALTER TABLE exam_questions ADD COLUMN marks INTEGER DEFAULT 5"))
 # Session.host_email
         sess_cols = [c["name"] for c in insp.get_columns("sessions")]
         if "host_email" not in sess_cols:
@@ -3282,6 +3292,300 @@ def delete_exam(exam_id):
     return redirect(url_for("host", msg="exam_deleted"))
 
 
+def parse_bulk_questions_document(file_obj, filename: str = "") -> list:
+    """
+    Extract paragraphs/lines from an uploaded .docx or .txt file in-memory
+    (without saving temporary files to disk) and parse them into MCQ and Essay questions.
+    """
+    raw_lines = []
+    fname_lower = (filename or getattr(file_obj, "filename", "") or "").lower()
+
+    if fname_lower.endswith(".docx"):
+        file_bytes = io.BytesIO(file_obj.read())
+        doc = docx.Document(file_bytes)
+        for p in doc.paragraphs:
+            txt = (p.text or "").strip()
+            if txt:
+                raw_lines.append(txt)
+        if not raw_lines:
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for p in cell.paragraphs:
+                            txt = (p.text or "").strip()
+                            if txt:
+                                raw_lines.append(txt)
+    else:
+        content = file_obj.read()
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+        raw_lines = [l.strip() for l in content.splitlines() if l.strip()]
+
+    # Question boundary patterns: '1. ', 'Q1. ', 'Question 1:', etc.
+    question_start_re = re.compile(
+        r'^(?:'
+        r'question\s*(\d+)[\.\:\)\-\s]+|'
+        r'q(?:uestion)?[\.\s]*(\d+)[\.\:\)\-\s]+|'
+        r'(\d+)[\.\:\)\-\s]+'
+        r')(.*)$',
+        re.IGNORECASE
+    )
+
+    option_re = re.compile(
+        r'^(?:\(?([A-Da-d])\)|\(?([A-Da-d])[\.\:\]\-])\s*(.*)$'
+    )
+
+    answer_re = re.compile(
+        r'^(?:(?:correct\s+)?ans(?:wer)?|key)[\s\:\.\-\=]+(.*)$',
+        re.IGNORECASE
+    )
+
+    marks_re = re.compile(
+        r'(?:(?:marks?|points?|score)\s*[\:\.\-\=]*\s*(\d+)|[\(\[]\s*(\d+)\s*(?:marks?|points?|pts?)\s*[\)\]])',
+        re.IGNORECASE
+    )
+
+    blocks = []
+    current_block = []
+
+    for line in raw_lines:
+        if question_start_re.match(line):
+            if current_block:
+                blocks.append(current_block)
+            current_block = [line]
+        else:
+            if current_block:
+                current_block.append(line)
+            else:
+                current_block = [line]
+
+    if current_block:
+        blocks.append(current_block)
+
+    questions = []
+    for block in blocks:
+        if not block:
+            continue
+        first_line = block[0]
+        m_start = question_start_re.match(first_line)
+        cleaned_first = m_start.group(4).strip() if m_start else first_line
+
+        prompt_lines = [cleaned_first] if cleaned_first else []
+        options = {}
+        ans_str = None
+        marks = None
+
+        for line in block[1:]:
+            m_ans = answer_re.match(line)
+            if m_ans:
+                ans_str = m_ans.group(1).strip()
+                continue
+
+            m_marks = marks_re.search(line)
+            if m_marks:
+                val = m_marks.group(1) or m_marks.group(2)
+                if val:
+                    try:
+                        marks = int(val)
+                    except ValueError:
+                        pass
+                clean_line = marks_re.sub("", line).strip(" ()[]:-.")
+                if not clean_line:
+                    continue
+
+            m_opt = option_re.match(line)
+            if m_opt:
+                opt_letter = (m_opt.group(1) or m_opt.group(2)).upper()
+                opt_text = m_opt.group(3).strip()
+                options[opt_letter] = opt_text
+                continue
+
+            if not options:
+                prompt_lines.append(line)
+
+        prompt = " ".join(prompt_lines).strip()
+        if not prompt and options:
+            prompt = "Question"
+
+        if len(options) >= 2:
+            # MCQ
+            sorted_keys = sorted(options.keys())
+            opts_list = [options[k] for k in sorted_keys]
+
+            correct_index = 0
+            if ans_str:
+                ans_upper = ans_str.upper()
+                letter_match = re.search(r'\b([A-D])\b', ans_upper)
+                if letter_match and letter_match.group(1) in sorted_keys:
+                    correct_index = sorted_keys.index(letter_match.group(1))
+                else:
+                    for idx, o in enumerate(opts_list):
+                        if o.lower() == ans_str.lower():
+                            correct_index = idx
+                            break
+            questions.append({
+                "type": "mcq",
+                "text": prompt,
+                "options": opts_list,
+                "correct_index": correct_index,
+                "marks": marks if marks is not None else 1
+            })
+        else:
+            # Essay / Descriptive
+            questions.append({
+                "type": "essay",
+                "text": prompt,
+                "options": None,
+                "correct_index": None,
+                "marks": marks if marks is not None else 5
+            })
+
+    return questions
+
+
+@app.route("/host/exam/<int:exam_id>/import-doc", methods=["POST"])
+@app.route("/host/exam/<exam_id>/import-doc", methods=["POST"])
+@csrf.exempt
+def host_import_doc_questions(exam_id):
+    """
+    Word Document (.docx) and text (.txt) bulk question importer preview route.
+    Accepts uploaded file in memory, iterates doc.paragraphs, parses question boundary
+    patterns (1., Q1., Question 1:) for MCQ and Essay formats, and returns preview JSON.
+    """
+    file_obj = (
+        request.files.get("file")
+        or request.files.get("doc")
+        or request.files.get("document")
+    )
+    if not file_obj or not file_obj.filename:
+        return jsonify({"status": "error", "message": "No file uploaded. Please upload a .docx or .txt file."}), 400
+
+    filename = file_obj.filename
+    if not (filename.lower().endswith(".docx") or filename.lower().endswith(".txt")):
+        return jsonify({"status": "error", "message": "Unsupported file format. Please upload a .docx or .txt file."}), 400
+
+    try:
+        parsed_questions = parse_bulk_questions_document(file_obj, filename=filename)
+        audit("host_bulk_questions_parsed", exam_id=str(exam_id), count=len(parsed_questions), filename=filename, ip=get_remote_address())
+        return jsonify({
+            "status": "success",
+            "count": len(parsed_questions),
+            "questions": parsed_questions
+        }), 200
+    except Exception as exc:
+        app.logger.exception("Failed to parse document for exam %s: %s", exam_id, exc)
+        return jsonify({"status": "error", "message": f"Error parsing document: {str(exc)}"}), 500
+
+
+@app.route("/host/exam/<int:exam_id>/confirm-bulk-questions", methods=["POST"])
+@app.route("/host/exam/<exam_id>/confirm-bulk-questions", methods=["POST"])
+@csrf.exempt
+def host_confirm_bulk_questions(exam_id):
+    """
+    Receives JSON list of parsed questions and saves them to the database
+    using db.session.bulk_insert_mappings(Question, questions_list).
+    """
+    payload = request.get_json(silent=True)
+    if payload is None:
+        raw_q = request.form.get("questions")
+        if raw_q:
+            try:
+                payload = json.loads(raw_q)
+            except Exception:
+                payload = {}
+        else:
+            payload = {}
+
+    if isinstance(payload, list):
+        questions_raw = payload
+    else:
+        questions_raw = payload.get("questions") or payload.get("data") or []
+
+    if not questions_raw:
+        return jsonify({"status": "error", "message": "No questions provided in request."}), 400
+
+    host_email = _current_host_email()
+    ex = db.session.get(Exam, str(exam_id))
+    if not host_email and ex and ex.host_email:
+        host_email = ex.host_email
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    questions_list = []
+
+    for q in questions_raw:
+        text_val = (q.get("text") or q.get("prompt") or "").strip()
+        if not text_val:
+            continue
+        qid = q.get("id") or f"q_{uuid.uuid4().hex[:12]}"
+        qtype = q.get("type", "mcq")
+        if qtype not in ("mcq", "essay", "coding"):
+            qtype = "mcq"
+
+        opts = q.get("options")
+        if qtype == "mcq":
+            if isinstance(opts, list):
+                opts = [str(o).strip() for o in opts if str(o).strip()]
+            else:
+                opts = []
+            try:
+                c_idx = int(q.get("correct_index", 0))
+            except (ValueError, TypeError):
+                c_idx = 0
+        else:
+            opts = None
+            c_idx = None
+
+        try:
+            marks_val = int(q.get("marks", 5 if qtype == "essay" else 1))
+        except (ValueError, TypeError):
+            marks_val = 5 if qtype == "essay" else 1
+
+        questions_list.append({
+            "id": qid,
+            "host_email": host_email,
+            "type": qtype,
+            "text": text_val,
+            "options": opts,
+            "correct_index": c_idx,
+            "marks": marks_val,
+            "created_at": now_iso
+        })
+
+    if not questions_list:
+        return jsonify({"status": "error", "message": "No valid questions to save."}), 400
+
+    # Save to Question table via db.session.bulk_insert_mappings
+    db.session.bulk_insert_mappings(Question, questions_list)
+
+    # If exam exists, also snapshot into ExamQuestion
+    if ex:
+        cur_max_pos = db.session.query(db.func.max(ExamQuestion.position)).filter_by(exam_id=str(exam_id)).scalar()
+        start_pos = (cur_max_pos + 1) if cur_max_pos is not None else 0
+        exam_q_mappings = []
+        for idx, q_item in enumerate(questions_list):
+            exam_q_mappings.append({
+                "exam_id": str(exam_id),
+                "position": start_pos + idx,
+                "question_id": q_item["id"],
+                "type": q_item["type"],
+                "text": q_item["text"],
+                "options": q_item["options"],
+                "correct_index": q_item["correct_index"],
+                "marks": q_item["marks"]
+            })
+        if exam_q_mappings:
+            db.session.bulk_insert_mappings(ExamQuestion, exam_q_mappings)
+
+    db.session.commit()
+    audit("host_bulk_questions_confirmed", exam_id=str(exam_id), count=len(questions_list), host_email=host_email, ip=get_remote_address())
+
+    return jsonify({
+        "status": "success",
+        "count": len(questions_list),
+        "message": f"Successfully imported {len(questions_list)} question(s)."
+    }), 200
+
+
 @app.route("/host/generate", methods=["POST"])
 @limiter.limit("10000 per minute", methods=["POST"])
 @login_required
@@ -5211,6 +5515,14 @@ MDVELO_LOGIN_HTML = """<!DOCTYPE html>
                     </div>
                 </div>
             {% else %}
+                {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, msg in messages %}
+                        <div class="alert alert-danger">{{ msg }}</div>
+                    {% endfor %}
+                {% endif %}
+                {% endwith %}
+
                 {% if error %}
                     <div class="alert alert-danger">{{ error }}</div>
                 {% endif %}
@@ -5853,6 +6165,7 @@ MDVELO_DASHBOARD_HTML = """<!DOCTYPE html>
                                             <button type="submit" class="btn btn-sm btn-warning">Force Submit</button>
                                         </form>
                                         <a href="/mdvelo/export/{{ ex.id }}" class="btn btn-sm btn-primary" style="display:inline-flex;">Download ZIP</a>
+                                        <a href="/admin/email-results-csv/{{ ex.id }}" class="btn btn-sm btn-success" style="display:inline-flex;" onclick="return confirm('Email results CSV report for exam: ' + {{ ex.id|tojson }} + '?');">✉ Email Results CSV</a>
                                     </div>
                                 </td>
                             </tr>
@@ -6350,6 +6663,212 @@ def mdvelo_export_zip(exam_id):
         as_attachment=True,
         download_name=f"{root_folder}.zip",
     )
+
+
+def dispatch_results_csv_email(
+    recipient_email: str,
+    subject: str,
+    csv_b64: str,
+    attachment_filename: str,
+    exam_id: str,
+    exam_title: str,
+    total_submissions: int,
+) -> bool:
+    """
+    Deliver results CSV email with base64 attachment via Brevo API failover.
+    Attempts Tier 1 then Tier 2 Brevo API key.
+    """
+    sender_email = (
+        app.config.get("MAIL_STUDENT_SENDER")
+        or os.environ.get("MAIL_STUDENT_SENDER")
+        or app.config.get("MAIL_SENDER")
+        or os.environ.get("MAIL_SENDER", "velotest2026@gmail.com")
+    ).strip()
+
+    body_text = (
+        f"Hello Admin,\n\n"
+        f"Attached is the results CSV report for Exam #{exam_id} - {exam_title}.\n\n"
+        f"Report Summary:\n"
+        f"• Exam ID: {exam_id}\n"
+        f"• Exam Title: {exam_title}\n"
+        f"• Total Submissions / Attempts: {total_submissions}\n"
+        f"• Generated At: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+        f"— VeloTest Automated Reporting"
+    )
+
+    tier1_key = (
+        os.environ.get("BREVO_STUDENT_API_KEY_1", "").strip()
+        or os.environ.get("BREVO_API_KEY_1", "").strip()
+        or os.environ.get("BREVO_API_KEY", "").strip()
+    )
+    tier2_key = (
+        os.environ.get("BREVO_STUDENT_API_KEY_2", "").strip()
+        or os.environ.get("BREVO_API_KEY_2", "").strip()
+    )
+
+    keys = []
+    if tier1_key:
+        keys.append((1, "Tier 1", tier1_key, "BREVO_API_KEY_1"))
+    if tier2_key:
+        keys.append((2, "Tier 2", tier2_key, "BREVO_API_KEY_2"))
+
+    sent = False
+    for index, tier_label, api_key, key_env_name in keys:
+        try:
+            configuration = sib_api_v3_sdk.Configuration()
+            configuration.api_key["api-key"] = api_key
+            api_instance = sib_api_v3_sdk.TransactionalEmailsApi(
+                sib_api_v3_sdk.ApiClient(configuration)
+            )
+            attachment = sib_api_v3_sdk.SendSmtpEmailAttachment(
+                content=csv_b64,
+                name=attachment_filename,
+            )
+            send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+                sender={"email": sender_email, "name": "VeloTest Ops"},
+                to=[{"email": recipient_email}],
+                subject=subject,
+                text_content=body_text,
+                attachment=[attachment],
+            )
+            resp = api_instance.send_transac_email(send_smtp_email)
+            msg_id = getattr(resp, "message_id", None) if resp else None
+            print(f"[REPORT EMAIL] Sent results CSV for exam #{exam_id} to {recipient_email} via {tier_label} (messageId={msg_id})")
+            audit("admin_results_csv_emailed", exam_id=exam_id, recipient=recipient_email, tier=tier_label, message_id=msg_id)
+            sent = True
+            break
+        except Exception as exc:
+            print(f"[REPORT EMAIL ERROR] Failed to send results CSV via {tier_label} ({key_env_name}): {exc}")
+            audit("admin_results_csv_failed", exam_id=exam_id, recipient=recipient_email, tier=tier_label, error=str(exc))
+
+    if not sent:
+        print(f"[REPORT EMAIL WARN] Results CSV for exam #{exam_id} logged. Recipient: {recipient_email} (no external Brevo provider succeeded)")
+        audit("admin_results_csv_fallback", exam_id=exam_id, recipient=recipient_email)
+
+    return sent
+
+
+def dispatch_results_csv_email_background(*args, **kwargs) -> bool:
+    """Dispatches the email in a background daemon thread, or synchronously if in TESTING mode."""
+    if app.config.get("TESTING"):
+        return dispatch_results_csv_email(*args, **kwargs)
+    t = threading.Thread(
+        target=dispatch_results_csv_email,
+        args=args,
+        kwargs=kwargs,
+        daemon=True,
+    )
+    t.start()
+    return True
+
+
+@app.route("/admin/email-results-csv/<int:exam_id>", methods=["GET", "POST"])
+@app.route("/admin/email-results-csv/<exam_id>", methods=["GET", "POST"])
+@csrf.exempt
+@limiter.exempt
+def admin_email_results_csv(exam_id):
+    """
+    1-click feature to generate in-memory CSV of exam results and email it
+    to ADMIN_NOTIFICATION_EMAIL via the background email dispatcher.
+    Protected by admin authentication.
+    """
+    if not is_ops_authenticated():
+        flash("Please authenticate to access admin actions.", "danger")
+        return redirect(url_for("mdvelo"))
+
+    eid = str(exam_id).strip()
+    ex = db.session.get(Exam, eid)
+    if not ex:
+        flash(f"Exam '{eid}' not found.", "danger")
+        return redirect(url_for("mdvelo"))
+
+    exam_title = getattr(ex, "title", None) or (ex.config.get("exam_title") if isinstance(ex.config, dict) else "") or f"Exam #{eid}"
+    recipient_email = os.environ.get("ADMIN_NOTIFICATION_EMAIL", "mdhaseebuddin889@gmail.com").strip()
+    subject = f"[VeloTest Report] Results for Exam #{eid} - {exam_title}"
+    attachment_filename = f"results_exam_{eid}.csv"
+
+    # Query all attempts for exam_id
+    all_sessions = (
+        Session.query.filter_by(exam_id=eid)
+        .order_by(Session.created_at.asc())
+        .all()
+    )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Roll Number",
+        "Candidate Name",
+        "Candidate Email",
+        "Score",
+        "Percentage",
+        "Submitted At"
+    ])
+
+    for s in all_sessions:
+        st = s.student
+        cust = dict(st.custom_fields or {}) if (st and st.custom_fields) else {}
+
+        roll_number = ""
+        for r_key in ("roll_number", "roll_no", "roll", "reg_no", "regno", "student_id", "id"):
+            if cust.get(r_key):
+                roll_number = str(cust.get(r_key)).strip()
+                break
+        if not roll_number and st:
+            for k, v in cust.items():
+                if any(term in k.lower() for term in ("roll", "reg")):
+                    roll_number = str(v).strip()
+                    break
+
+        candidate_name = (st.name if st and st.name else "").strip() or "Candidate"
+        candidate_email = (st.email if st and st.email else "").strip() or (cust.get("email") or "").strip()
+
+        if s.score is not None:
+            score_val = str(s.score)
+        else:
+            score_val = "N/A"
+
+        total_q = s.total_selected if (s.total_selected and s.total_selected > 0) else len(s.questions)
+        if s.score is not None and total_q > 0:
+            percentage_val = f"{(s.score / total_q) * 100:.2f}%"
+        elif s.score is not None:
+            percentage_val = f"{s.score}%"
+        else:
+            percentage_val = "N/A"
+
+        if getattr(s, "submitted_at", None):
+            sub_dt = s.submitted_at
+            submitted_at_val = sub_dt.strftime("%Y-%m-%d %H:%M:%S") if isinstance(sub_dt, datetime) else str(sub_dt)
+        elif s.completed_at:
+            submitted_at_val = str(s.completed_at)
+        else:
+            submitted_at_val = s.status or "In Progress"
+
+        writer.writerow([
+            roll_number,
+            candidate_name,
+            candidate_email,
+            score_val,
+            percentage_val,
+            submitted_at_val
+        ])
+
+    csv_content = output.getvalue()
+    csv_b64 = base64.b64encode(csv_content.encode("utf-8")).decode("utf-8")
+
+    dispatch_results_csv_email_background(
+        recipient_email=recipient_email,
+        subject=subject,
+        csv_b64=csv_b64,
+        attachment_filename=attachment_filename,
+        exam_id=eid,
+        exam_title=exam_title,
+        total_submissions=len(all_sessions)
+    )
+
+    audit("admin_results_csv_requested", exam_id=eid, recipient=recipient_email, submissions=len(all_sessions), ip=get_remote_address())
+    flash(f"✉ Results CSV for Exam #{eid} ({exam_title}) is being emailed to {recipient_email}.", "success")
+    return redirect(url_for("mdvelo"))
 
 
 if __name__ == "__main__":
