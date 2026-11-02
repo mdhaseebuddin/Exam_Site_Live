@@ -30,3 +30,5 @@ waitress==3.0.2     # Windows / local dev fallback
 psycopg2-binary>=2.9.9
 psycopg[binary]>=3.1.18
 
+
+python-docx
