@@ -3299,7 +3299,7 @@ def delete_exam(exam_id):
     return redirect(url_for("host", msg="exam_deleted"))
 
 
-def parse_bulk_questions_document(file_obj, filename: str = "") -> list:
+def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str = "auto") -> list:
     """
     Extract paragraphs/lines from an uploaded .docx, .pdf, or .txt file in-memory
     (without saving temporary files to disk) and parse them into MCQ and Essay questions.
@@ -3337,22 +3337,75 @@ def parse_bulk_questions_document(file_obj, filename: str = "") -> list:
             content = content.decode("utf-8", errors="replace")
         raw_lines = [l.strip() for l in content.splitlines() if l.strip()]
 
-    # Question boundary patterns: '1. ', 'Q1. ', 'Question 1:', etc.
+    # -------------------------------------------------------------------------
+    # Bulk Question Importer Parsing Logic:
+    # 1. Essay Keyword Guard: descriptive/action verbs -> strictly essay, subpoints in text body
+    # 2. Strict MCQ Identification: only if explicit answer or standard uppercase options
+    # 3. Clean Question Headers & Page Footers (e.g. Page X of Y, WEEK X, Lab headers)
+    # -------------------------------------------------------------------------
+    essay_action_verbs = {
+        "explain", "draw", "create", "write", "practice",
+        "define", "describe", "design", "discuss", "illustrate", "develop"
+    }
+
+    # Question boundary patterns: '1. ', 'Q1. ', 'Question 1:', 'Task 1:', etc.
     question_start_re = re.compile(
         r'^(?:'
-        r'question\s*(\d+)[\.\:\)\-\s]+|'
+        r'(?:question|task|exercise|problem|experiment)\s*(\d+)[\.\:\)\-\s]+|'
         r'q(?:uestion)?[\.\s]*(\d+)[\.\:\)\-\s]+|'
         r'(\d+)[\.\:\)\-\s]+'
         r')(.*)$',
         re.IGNORECASE
     )
 
-    option_re = re.compile(
-        r'^(?:\(?([A-Da-d])\)|\(?([A-Da-d])[\.\:\]\-])\s*(.*)$'
+    header_patterns = [
+        # Page numbers and page footers: "Page 1 of 5", "Page 2", "Page X of Y", "DBMS Lab Assignment Questions Page X of Y", "Page - 3"
+        re.compile(r'^.*?\bpage\s*[-:#]?\s*(?:\d+|[ivxlcdm]+|[a-z])(?:\s*(?:of|\/)\s*(?:\d+|[ivxlcdm]+|[a-z]))?\s*$', re.IGNORECASE),
+        # Standalone dash page numbers: "- 1 -", "-- 2 --", "— 3 —"
+        re.compile(r'^\s*[-–—]{1,2}\s*\d+\s*[-–—]{1,2}\s*$'),
+        # Standalone week headers: "WEEK 1", "WEEK X", "Week - 2", "WEEK 03: Normalization", "WEEK IV"
+        re.compile(r'^\s*week\s*[-–—:#]*\s*(?:\d+|[ivxlcdm]+|[a-z])\b.*$', re.IGNORECASE),
+        # Repeated document / lab headers: "DBMS Lab Assignment Questions", "Lab Assignment Questions", "Lab Assignment 1", "Lab Manual"
+        re.compile(r'^\s*(?:[A-Za-z0-9_\-\s]+)?(?:lab\s+assignment|lab\s+manual|assignment\s+questions?|lab\s+experiment|lab\s+session)\s*(?:questions?)?\s*[-–—:#\d\s]*$', re.IGNORECASE),
+        # General document metadata headers: Course, Subject, Branch, Total Marks, etc.
+        re.compile(r'^\s*(?:course|subject|branch|semester|exam|test|duration|time\s*allowed|total\s*marks?)\s*[\:\-].*$', re.IGNORECASE),
+    ]
+
+    def _is_header_or_page_line(line_str: str) -> bool:
+        s = line_str.strip()
+        if not s:
+            return True
+        if question_start_re.match(s):
+            return False
+        for hp in header_patterns:
+            if hp.match(s):
+                return True
+        return False
+
+    def _starts_with_essay_verb(text_str: str) -> bool:
+        if not text_str:
+            return False
+        cleaned = re.sub(r'^[\s\d\.\:\)\-\(\[\]\"\'`#*]+', '', text_str).strip()
+        m_verb = re.match(
+            r'^(?:(?:briefly|clearly|please|kindly)\s+)?([a-z]+)\b',
+            cleaned,
+            re.IGNORECASE
+        )
+        if m_verb:
+            return m_verb.group(1).lower() in essay_action_verbs
+        return False
+
+    uppercase_opt_re = re.compile(
+        r'^(?:\(([A-D])\)|\(?([A-D])[\.\:\)\-\]])\s*(.*)$'
     )
 
+    lowercase_opt_re = re.compile(
+        r'^(?:\(([a-d])\)|\(?([a-d])[\.\:\)\-\]])\s*(.*)$'
+    )
+
+    # Recognize answer key lines: Answer: B, Ans: (c), Correct Answer: Option A, Key: D, Correct Option: C
     answer_re = re.compile(
-        r'^(?:(?:correct\s+)?ans(?:wer)?|key)[\s\:\.\-\=]+(.*)$',
+        r'^(?:(?:correct\s+)?(?:ans(?:wer)?|opt(?:ion)?)|key)\s*[\:\.\-\=]+\s*(.*)$',
         re.IGNORECASE
     )
 
@@ -3361,10 +3414,65 @@ def parse_bulk_questions_document(file_obj, filename: str = "") -> list:
         re.IGNORECASE
     )
 
+    def _extract_answer_index(ans_str: str, sorted_keys: list, opts_list: list) -> int:
+        """Parse answer key string (e.g. 'Option A', '(c)', 'B', 'Key: D') into zero-based option index."""
+        if not ans_str:
+            return 0
+        s = ans_str.strip()
+        # 1. Option A, Option (B), Option [C], Option 1
+        m_opt = re.search(r'option\s*[\(\[]?\s*([A-Da-d\d])', s, re.IGNORECASE)
+        if m_opt:
+            token = m_opt.group(1).upper()
+            if token in sorted_keys:
+                return sorted_keys.index(token)
+            if token.isdigit() and 1 <= int(token) <= len(opts_list):
+                return int(token) - 1
+
+        # 2. (c), [B], (A)
+        m_bracket = re.search(r'[\(\[]\s*([A-Da-d\d])\s*[\)\]]', s)
+        if m_bracket:
+            token = m_bracket.group(1).upper()
+            if token in sorted_keys:
+                return sorted_keys.index(token)
+            if token.isdigit() and 1 <= int(token) <= len(opts_list):
+                return int(token) - 1
+
+        # 3. Direct letter: B, c, D
+        m_let = re.search(r'\b([A-Da-d])\b', s)
+        if m_let:
+            token = m_let.group(1).upper()
+            if token in sorted_keys:
+                return sorted_keys.index(token)
+
+        # 4. Direct digit: 1, 2, 3, 4
+        m_num = re.search(r'\b([1-9])\b', s)
+        if m_num:
+            idx = int(m_num.group(1)) - 1
+            if 0 <= idx < len(opts_list):
+                return idx
+
+        # 5. Exact match with option text
+        s_lower = s.lower()
+        for idx, opt in enumerate(opts_list):
+            if opt.lower().strip() == s_lower:
+                return idx
+
+        return 0
+
+    # Clean headers & footers from raw lines before creating blocks
+    filtered_lines = []
+    for line in raw_lines:
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+        if _is_header_or_page_line(line_clean):
+            continue
+        filtered_lines.append(line_clean)
+
     blocks = []
     current_block = []
 
-    for line in raw_lines:
+    for line in filtered_lines:
         if question_start_re.match(line):
             if current_block:
                 blocks.append(current_block)
@@ -3378,29 +3486,54 @@ def parse_bulk_questions_document(file_obj, filename: str = "") -> list:
     if current_block:
         blocks.append(current_block)
 
+    mode_val = (import_mode or "auto").strip().lower()
     questions = []
     for block in blocks:
         if not block:
             continue
+
         first_line = block[0]
         m_start = question_start_re.match(first_line)
-        cleaned_first = m_start.group(4).strip() if m_start else first_line
+        cleaned_first = ""
+        if m_start:
+            cleaned_first = (m_start.group(4) or "").strip()
+        else:
+            cleaned_first = first_line.strip()
 
-        prompt_lines = [cleaned_first] if cleaned_first else []
-        options = {}
-        ans_str = None
+        # Extract marks from prompt line if specified
         marks = None
+        m_m_first = marks_re.search(cleaned_first)
+        if m_m_first:
+            v = m_m_first.group(1) or m_m_first.group(2)
+            if v:
+                try:
+                    marks = int(v)
+                except ValueError:
+                    pass
+            cleaned_first = marks_re.sub("", cleaned_first).strip(" ()[]:-.")
+
+        # Determine if prompt begins with descriptive or action verbs
+        initial_check_text = cleaned_first
+        if not initial_check_text and len(block) > 1:
+            initial_check_text = block[1].strip()
+
+        is_essay_keyword = _starts_with_essay_verb(initial_check_text)
+
+        body_lines = [cleaned_first] if cleaned_first else []
+        uppercase_opts = {}
+        lowercase_opts = {}
+        explicit_ans_str = None
+        has_explicit_ans = False
 
         for line in block[1:]:
-            m_ans = answer_re.match(line)
-            if m_ans:
-                ans_str = m_ans.group(1).strip()
+            if _is_header_or_page_line(line):
                 continue
 
-            m_marks = marks_re.search(line)
-            if m_marks:
-                val = m_marks.group(1) or m_marks.group(2)
-                if val:
+            # Check marks in subsequent lines
+            m_m = marks_re.search(line)
+            if m_m:
+                val = m_m.group(1) or m_m.group(2)
+                if val and marks is None:
                     try:
                         marks = int(val)
                     except ValueError:
@@ -3408,53 +3541,168 @@ def parse_bulk_questions_document(file_obj, filename: str = "") -> list:
                 clean_line = marks_re.sub("", line).strip(" ()[]:-.")
                 if not clean_line:
                     continue
+                line = clean_line
 
-            m_opt = option_re.match(line)
-            if m_opt:
-                opt_letter = (m_opt.group(1) or m_opt.group(2)).upper()
-                opt_text = m_opt.group(3).strip()
-                options[opt_letter] = opt_text
+            # Check explicit answer metadata
+            m_ans = answer_re.match(line)
+            if m_ans:
+                explicit_ans_str = m_ans.group(1).strip()
+                has_explicit_ans = True
                 continue
 
-            if not options:
-                prompt_lines.append(line)
+            if mode_val == "essay" or (mode_val == "auto" and is_essay_keyword):
+                # For descriptive/essay questions, keep any sub-points
+                # ('a.', 'b.', 'c.', 'i.', 'ii.') inside the question's text body separated
+                # by newlines so the student sees the full problem statement above the answer textarea.
+                body_lines.append(line)
+                continue
 
-        prompt = " ".join(prompt_lines).strip()
-        if not prompt and options:
-            prompt = "Question"
+            # Check uppercase options (A., B., C., D. or (A), (B), (C), (D))
+            m_u = uppercase_opt_re.match(line)
+            if m_u:
+                let = (m_u.group(1) or m_u.group(2)).upper()
+                uppercase_opts[let] = m_u.group(3).strip()
+                body_lines.append(line)
+                continue
 
-        if len(options) >= 2:
-            # MCQ
-            sorted_keys = sorted(options.keys())
-            opts_list = [options[k] for k in sorted_keys]
+            # Check lowercase options (a., b., c., d. or (a), (b), (c), (d))
+            m_l = lowercase_opt_re.match(line)
+            if m_l:
+                let = (m_l.group(1) or m_l.group(2)).upper()
+                lowercase_opts[let] = m_l.group(3).strip()
+                body_lines.append(line)
+                continue
 
-            correct_index = 0
-            if ans_str:
-                ans_upper = ans_str.upper()
-                letter_match = re.search(r'\b([A-D])\b', ans_upper)
-                if letter_match and letter_match.group(1) in sorted_keys:
-                    correct_index = sorted_keys.index(letter_match.group(1))
-                else:
-                    for idx, o in enumerate(opts_list):
-                        if o.lower() == ans_str.lower():
-                            correct_index = idx
-                            break
-            questions.append({
-                "type": "mcq",
-                "text": prompt,
-                "options": opts_list,
-                "correct_index": correct_index,
-                "marks": marks if marks is not None else 1
-            })
-        else:
-            # Essay / Descriptive
+            # Regular text line or subpoint
+            body_lines.append(line)
+
+        # Mode-based Classification:
+        mode_val = (import_mode or "auto").strip().lower()
+
+        if mode_val == "essay":
+            # Host forced "All Essay / Descriptive":
+            # Treat every extracted question block strictly as an "essay".
+            # Keep all text lines and sub-points (a., b., c., 1., 2.) joined in the question text.
+            # Set options = None, correct_index = None, and type = 'essay'.
+            body_cleaned = [l.strip() for l in body_lines if l.strip() and not _is_header_or_page_line(l)]
+            full_text = "\n".join(body_cleaned)
             questions.append({
                 "type": "essay",
-                "text": prompt,
+                "text": full_text or "Essay Question",
                 "options": None,
                 "correct_index": None,
                 "marks": marks if marks is not None else 5
             })
+        elif mode_val == "mcq":
+            # Host forced "All Multiple Choice (MCQ)":
+            # Strictly parse blocks as MCQs, extracting options and answer keys.
+            opts_dict = uppercase_opts if len(uppercase_opts) >= 2 else lowercase_opts
+            if len(opts_dict) >= 2:
+                sorted_keys = sorted(opts_dict.keys())
+                opts_list = [opts_dict[k] for k in sorted_keys]
+
+                prompt_lines = []
+                for bl in body_lines:
+                    if (uppercase_opts and uppercase_opt_re.match(bl)) or (lowercase_opts and lowercase_opt_re.match(bl)):
+                        break
+                    if not _is_header_or_page_line(bl):
+                        prompt_lines.append(bl)
+                prompt = " ".join([p.strip() for p in prompt_lines if p.strip()]).strip()
+                if not prompt:
+                    prompt = "Question"
+
+                correct_index = _extract_answer_index(explicit_ans_str, sorted_keys, opts_list)
+
+                questions.append({
+                    "type": "mcq",
+                    "text": prompt,
+                    "options": opts_list,
+                    "correct_index": correct_index,
+                    "marks": marks if marks is not None else 1
+                })
+            else:
+                body_cleaned = [l.strip() for l in body_lines if l.strip() and not _is_header_or_page_line(l)]
+                full_text = "\n".join(body_cleaned)
+                questions.append({
+                    "type": "essay",
+                    "text": full_text or "Question",
+                    "options": None,
+                    "correct_index": None,
+                    "marks": marks if marks is not None else 5
+                })
+        else:
+            # Mode "auto": balanced detection (explicit answer keys for MCQs or action verbs for essays)
+            is_essay = (
+                is_essay_keyword
+                or (len(lowercase_opts) >= 2 and not has_explicit_ans)
+                or (not has_explicit_ans and len(uppercase_opts) < 2 and len(lowercase_opts) < 2)
+            )
+
+            if is_essay:
+                body_cleaned = [l.strip() for l in body_lines if l.strip() and not _is_header_or_page_line(l)]
+                full_text = "\n".join(body_cleaned)
+                questions.append({
+                    "type": "essay",
+                    "text": full_text or "Essay Question",
+                    "options": None,
+                    "correct_index": None,
+                    "marks": marks if marks is not None else 5
+                })
+            elif has_explicit_ans and (len(uppercase_opts) >= 2 or len(lowercase_opts) >= 2):
+                opts_dict = uppercase_opts if len(uppercase_opts) >= 2 else lowercase_opts
+                sorted_keys = sorted(opts_dict.keys())
+                opts_list = [opts_dict[k] for k in sorted_keys]
+
+                prompt_lines = []
+                for bl in body_lines:
+                    if (uppercase_opts and uppercase_opt_re.match(bl)) or (lowercase_opts and lowercase_opt_re.match(bl)):
+                        break
+                    if not _is_header_or_page_line(bl):
+                        prompt_lines.append(bl)
+                prompt = " ".join([p.strip() for p in prompt_lines if p.strip()]).strip()
+                if not prompt:
+                    prompt = "Question"
+
+                correct_index = _extract_answer_index(explicit_ans_str, sorted_keys, opts_list)
+
+                questions.append({
+                    "type": "mcq",
+                    "text": prompt,
+                    "options": opts_list,
+                    "correct_index": correct_index,
+                    "marks": marks if marks is not None else 1
+                })
+            elif len(uppercase_opts) >= 2:
+                sorted_keys = sorted(uppercase_opts.keys())
+                opts_list = [uppercase_opts[k] for k in sorted_keys]
+
+                prompt_lines = []
+                for bl in body_lines:
+                    if uppercase_opt_re.match(bl):
+                        break
+                    if not _is_header_or_page_line(bl):
+                        prompt_lines.append(bl)
+                prompt = " ".join([p.strip() for p in prompt_lines if p.strip()]).strip()
+                if not prompt:
+                    prompt = "Question"
+
+                questions.append({
+                    "type": "mcq",
+                    "text": prompt,
+                    "options": opts_list,
+                    "correct_index": 0,
+                    "marks": marks if marks is not None else 1
+                })
+            else:
+                body_cleaned = [l.strip() for l in body_lines if l.strip() and not _is_header_or_page_line(l)]
+                full_text = "\n".join(body_cleaned)
+                questions.append({
+                    "type": "essay",
+                    "text": full_text or "Question",
+                    "options": None,
+                    "correct_index": None,
+                    "marks": marks if marks is not None else 5
+                })
 
     return questions
 
@@ -3487,8 +3735,10 @@ def host_import_doc_questions(exam_id):
     if fname_lower.endswith(".pdf") and pypdf is None:
         return jsonify({"status": "error", "message": "pypdf library not installed on server."}), 500
 
+    import_mode = (request.form.get("import_mode") or request.args.get("import_mode") or "auto").strip().lower()
+
     try:
-        parsed_questions = parse_bulk_questions_document(file_obj, filename=filename)
+        parsed_questions = parse_bulk_questions_document(file_obj, filename=filename, import_mode=import_mode)
         audit("host_bulk_questions_parsed", exam_id=str(exam_id), count=len(parsed_questions), filename=filename, ip=get_remote_address())
         return jsonify({
             "status": "success",

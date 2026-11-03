@@ -98,10 +98,18 @@
             <p class="text-muted small mb-3">
               Upload a Word document, PDF, or text file. Questions (MCQ &amp; Essay) are parsed in-memory and added to your bank.
             </p>
-            <input type="file" id="bulkDocInput" accept=".docx,.txt,.pdf" style="display: none;" onchange="handleBulkDocUpload(this)">
-            <button type="button" class="btn btn-outline-primary btn-sm px-3 fw-semibold" onclick="document.getElementById('bulkDocInput').click()">
-              📁 Select Document
-            </button>
+            <div class="d-flex align-items-center justify-content-center flex-wrap gap-2">
+              <label for="importModeSelect" class="small fw-semibold text-muted mb-0">Question Type:</label>
+              <select id="importModeSelect" class="form-select form-select-sm" style="width: auto;">
+                <option value="essay" selected>All Essay / Descriptive</option>
+                <option value="auto">Auto-Detect (MCQ + Essay)</option>
+                <option value="mcq">All Multiple Choice (MCQ)</option>
+              </select>
+              <input type="file" id="bulkDocInput" accept=".docx,.txt,.pdf" style="display: none;" onchange="handleBulkDocUpload(this)">
+              <button type="button" class="btn btn-primary btn-sm fw-semibold" onclick="document.getElementById('bulkDocInput').click()">
+                📁 Upload Document
+              </button>
+            </div>
             <div id="bulkUploadStatus" class="mt-2 small" style="display: none;"></div>
           </div>
         </div>
@@ -600,6 +608,8 @@
         // Step A: Send file to parse endpoint
         const formData = new FormData();
         formData.append('file', file);
+        const mode = document.getElementById('importModeSelect') ? document.getElementById('importModeSelect').value : 'essay';
+        formData.append('import_mode', mode);
 
         const parseHeaders = {};
         if (csrfToken) parseHeaders['X-CSRFToken'] = csrfToken;

@@ -302,6 +302,7 @@ code, .text-break {
   padding: 1rem;
 }
 
+#questionText { white-space: pre-line !important; }
 .question-card {
   width: 100%;
   max-width: 760px;
