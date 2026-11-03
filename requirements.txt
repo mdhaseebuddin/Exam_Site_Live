@@ -32,3 +32,4 @@ psycopg[binary]>=3.1.18
 
 
 python-docx
+pypdf>=4.0.0

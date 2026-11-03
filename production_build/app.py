@@ -33,6 +33,10 @@ try:
     import docx
 except ImportError:
     docx = None
+try:
+    import pypdf
+except ImportError:
+    pypdf = None
 import hashlib
 import hmac
 import html
@@ -3297,7 +3301,7 @@ def delete_exam(exam_id):
 
 def parse_bulk_questions_document(file_obj, filename: str = "") -> list:
     """
-    Extract paragraphs/lines from an uploaded .docx or .txt file in-memory
+    Extract paragraphs/lines from an uploaded .docx, .pdf, or .txt file in-memory
     (without saving temporary files to disk) and parse them into MCQ and Essay questions.
     """
     raw_lines = []
@@ -3320,6 +3324,13 @@ def parse_bulk_questions_document(file_obj, filename: str = "") -> list:
                             txt = (p.text or "").strip()
                             if txt:
                                 raw_lines.append(txt)
+    elif fname_lower.endswith(".pdf"):
+        if pypdf is None:
+            raise RuntimeError("pypdf library not installed on server.")
+        file_bytes = io.BytesIO(file_obj.read())
+        reader = pypdf.PdfReader(file_bytes)
+        pdf_text = "\n".join([page.extract_text() or "" for page in reader.pages])
+        raw_lines = [l.strip() for l in pdf_text.splitlines() if l.strip()]
     else:
         content = file_obj.read()
         if isinstance(content, bytes):
@@ -3463,14 +3474,18 @@ def host_import_doc_questions(exam_id):
         or request.files.get("document")
     )
     if not file_obj or not file_obj.filename:
-        return jsonify({"status": "error", "message": "No file uploaded. Please upload a .docx or .txt file."}), 400
+        return jsonify({"status": "error", "message": "No file uploaded. Please upload a .docx, .pdf, or .txt file."}), 400
 
     filename = file_obj.filename
-    if not (filename.lower().endswith(".docx") or filename.lower().endswith(".txt")):
-        return jsonify({"status": "error", "message": "Unsupported file format. Please upload a .docx or .txt file."}), 400
+    fname_lower = filename.lower()
+    if not (fname_lower.endswith(".docx") or fname_lower.endswith(".pdf") or fname_lower.endswith(".txt")):
+        return jsonify({"status": "error", "message": "Unsupported file format. Please upload a .docx, .pdf, or .txt file."}), 400
 
-    if filename.lower().endswith(".docx") and docx is None:
+    if fname_lower.endswith(".docx") and docx is None:
         return jsonify({"status": "error", "message": "python-docx library not installed on server."}), 500
+
+    if fname_lower.endswith(".pdf") and pypdf is None:
+        return jsonify({"status": "error", "message": "pypdf library not installed on server."}), 500
 
     try:
         parsed_questions = parse_bulk_questions_document(file_obj, filename=filename)

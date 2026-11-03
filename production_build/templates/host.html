@@ -94,11 +94,11 @@
         <div class="card mb-4" style="border: 2px dashed var(--bs-primary, #0d6efd); background: rgba(13, 110, 253, 0.03);">
           <div class="card-body text-center py-4">
             <div class="mb-2" style="font-size: 2rem;">📄</div>
-            <h6 class="fw-bold mb-1">Bulk Upload Questions (.docx / .txt)</h6>
+            <h6 class="fw-bold mb-1">Bulk Upload Questions (.docx / .pdf / .txt)</h6>
             <p class="text-muted small mb-3">
-              Upload a Word document or text file. Questions (MCQ &amp; Essay) are parsed in-memory and added to your bank.
+              Upload a Word document, PDF, or text file. Questions (MCQ &amp; Essay) are parsed in-memory and added to your bank.
             </p>
-            <input type="file" id="bulkDocInput" accept=".docx,.txt" style="display: none;" onchange="handleBulkDocUpload(this)">
+            <input type="file" id="bulkDocInput" accept=".docx,.txt,.pdf" style="display: none;" onchange="handleBulkDocUpload(this)">
             <button type="button" class="btn btn-outline-primary btn-sm px-3 fw-semibold" onclick="document.getElementById('bulkDocInput').click()">
               📁 Select Document
             </button>
@@ -580,7 +580,7 @@
       proctoringCheckbox.addEventListener('change', syncProctoringState);
       syncProctoringState(); // apply on load
     }
-    // Bulk Question Importer Handler (.docx / .txt)
+    // Bulk Question Importer Handler (.docx / .pdf / .txt)
     async function handleBulkDocUpload(input) {
       const file = input && input.files && input.files[0];
       if (!file) return;
