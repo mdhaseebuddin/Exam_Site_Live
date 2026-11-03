@@ -90,6 +90,22 @@
     <div class="row g-4">
       <!-- ================= LEFT: Build the bank ================= -->
       <div class="col-lg-5">
+        <!-- Bulk Question Importer -->
+        <div class="card mb-4" style="border: 2px dashed var(--bs-primary, #0d6efd); background: rgba(13, 110, 253, 0.03);">
+          <div class="card-body text-center py-4">
+            <div class="mb-2" style="font-size: 2rem;">📄</div>
+            <h6 class="fw-bold mb-1">Bulk Upload Questions (.docx / .txt)</h6>
+            <p class="text-muted small mb-3">
+              Upload a Word document or text file. Questions (MCQ &amp; Essay) are parsed in-memory and added to your bank.
+            </p>
+            <input type="file" id="bulkDocInput" accept=".docx,.txt" style="display: none;" onchange="handleBulkDocUpload(this)">
+            <button type="button" class="btn btn-outline-primary btn-sm px-3 fw-semibold" onclick="document.getElementById('bulkDocInput').click()">
+              📁 Select Document
+            </button>
+            <div id="bulkUploadStatus" class="mt-2 small" style="display: none;"></div>
+          </div>
+        </div>
+
         <!-- Add question -->
         <div class="card mb-4">
           <div class="card-header fw-semibold">➕ Add Question to Bank</div>
@@ -563,6 +579,86 @@
       };
       proctoringCheckbox.addEventListener('change', syncProctoringState);
       syncProctoringState(); // apply on load
+    }
+    // Bulk Question Importer Handler (.docx / .txt)
+    async function handleBulkDocUpload(input) {
+      const file = input && input.files && input.files[0];
+      if (!file) return;
+
+      const statusEl = document.getElementById('bulkUploadStatus');
+      if (statusEl) {
+        statusEl.style.display = 'block';
+        statusEl.className = 'mt-2 small text-primary';
+        statusEl.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span> Parsing document in memory...';
+      }
+
+      try {
+        const urlParams = new URLSearchParams(window.location.search);
+        const activeExamId = urlParams.get('exam_id') || '{{ exams[0].exam_id if (exams and exams|length > 0) else 0 }}' || 0;
+        const csrfToken = document.querySelector('input[name="csrf_token"]')?.value || '';
+
+        // Step A: Send file to parse endpoint
+        const formData = new FormData();
+        formData.append('file', file);
+
+        const parseHeaders = {};
+        if (csrfToken) parseHeaders['X-CSRFToken'] = csrfToken;
+
+        const parseRes = await fetch(`/host/exam/${activeExamId}/import-doc`, {
+          method: 'POST',
+          body: formData,
+          headers: parseHeaders
+        });
+
+        const parseData = await parseRes.json().catch(() => ({}));
+        if (!parseRes.ok || parseData.status !== 'success') {
+          throw new Error(parseData.message || 'Failed to parse document.');
+        }
+
+        if (!parseData.questions || parseData.questions.length === 0) {
+          throw new Error('No valid questions found in document.');
+        }
+
+        // Step B: Send parsed questions to confirm endpoint
+        if (statusEl) {
+          statusEl.className = 'mt-2 small text-info';
+          statusEl.innerHTML = `<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span> Parsed ${parseData.count} question(s). Persisting to database...`;
+        }
+
+        const confirmHeaders = {
+          'Content-Type': 'application/json'
+        };
+        if (csrfToken) confirmHeaders['X-CSRFToken'] = csrfToken;
+
+        const confirmRes = await fetch(`/host/exam/${activeExamId}/confirm-bulk-questions`, {
+          method: 'POST',
+          headers: confirmHeaders,
+          body: JSON.stringify({ questions: parseData.questions })
+        });
+
+        const confirmData = await confirmRes.json().catch(() => ({}));
+        if (!confirmRes.ok || confirmData.status !== 'success') {
+          throw new Error(confirmData.message || 'Failed to persist questions.');
+        }
+
+        // Step C: Success message & reload view
+        if (statusEl) {
+          statusEl.className = 'mt-2 small text-success fw-semibold';
+          statusEl.innerHTML = `✅ Successfully imported ${confirmData.count} question(s)! Refreshing...`;
+        }
+        input.value = '';
+        setTimeout(() => {
+          window.location.reload();
+        }, 1200);
+
+      } catch (err) {
+        // Step D: Error handling
+        if (statusEl) {
+          statusEl.className = 'mt-2 small text-danger fw-semibold';
+          statusEl.textContent = `❌ ${err.message || 'Error uploading document.'}`;
+        }
+        input.value = '';
+      }
     }
   </script>
 </body>
