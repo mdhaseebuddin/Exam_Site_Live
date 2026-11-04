@@ -3299,10 +3299,18 @@ def delete_exam(exam_id):
     return redirect(url_for("host", msg="exam_deleted"))
 
 
+class QuestionList(list):
+    """Subclass of list that carries a detected document title attribute."""
+    def __init__(self, iterable=(), title: str = ""):
+        super().__init__(iterable)
+        self.title = title
+
+
 def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str = "auto") -> list:
     """
     Extract paragraphs/lines from an uploaded .docx, .pdf, or .txt file in-memory
     (without saving temporary files to disk) and parse them into MCQ and Essay questions.
+    Supports parenthesized numbers (1), standard numbers 1., and Q-prefixed boundaries.
     """
     raw_lines = []
     fname_lower = (filename or getattr(file_obj, "filename", "") or "").lower()
@@ -3339,22 +3347,47 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
 
     # -------------------------------------------------------------------------
     # Bulk Question Importer Parsing Logic:
-    # 1. Essay Keyword Guard: descriptive/action verbs -> strictly essay, subpoints in text body
-    # 2. Strict MCQ Identification: only if explicit answer or standard uppercase options
-    # 3. Clean Question Headers & Page Footers (e.g. Page X of Y, WEEK X, Lab headers)
+    # 1. Universal Question Boundary Splitting (lookahead for (1), 1., Q1.)
+    # 2. Clean Question Headers & Page Footers
+    # 3. Leading Prefix Stripping
+    # 4. MCQ vs Essay Classification with Default Marks = 2 for Essay
     # -------------------------------------------------------------------------
     essay_action_verbs = {
         "explain", "draw", "create", "write", "practice",
         "define", "describe", "design", "discuss", "illustrate", "develop"
     }
 
-    # Question boundary patterns: '1. ', 'Q1. ', 'Question 1:', 'Task 1:', etc.
-    question_start_re = re.compile(
+    prefix_strip_re = re.compile(
         r'^(?:'
-        r'(?:question|task|exercise|problem|experiment)\s*(\d+)[\.\:\)\-\s]+|'
-        r'q(?:uestion)?[\.\s]*(\d+)[\.\:\)\-\s]+|'
-        r'(\d+)[\.\:\)\-\s]+'
-        r')(.*)$',
+        r'\(\s*\d{1,3}\s*\)[\.\:\-\s]*|'
+        r'(?:question|task|exercise|problem|experiment)\s*\d{1,3}[\.\:\)\-\s]+|'
+        r'q(?:uestion)?[\.\s]*\d{1,3}[\.\:\)\-\s]+|'
+        r'\d{1,3}[\.\:\)\-\s]+'
+        r')\s*',
+        re.IGNORECASE
+    )
+
+    prefix_check_re = re.compile(
+        r'^(?:'
+        r'\(\s*\d{1,3}\s*\)[\.\:\-\s]*|'
+        r'(?:question|task|exercise|problem|experiment)\s*\d{1,3}[\.\:\)\-\s]+|'
+        r'q(?:uestion)?[\.\s]*\d{1,3}[\.\:\)\-\s]+|'
+        r'\d{1,3}[\.\:\)\-\s]+'
+        r')',
+        re.IGNORECASE
+    )
+
+    split_pat = re.compile(
+        r'(?:\n|\s|^)(?='
+        r'\(\s*\d{1,3}\s*\)\s+|'
+        r'\b\d{1,3}[\.\)]\s+|'
+        r'\bQ(?:uestion)?\s*\d{1,3}[\.\:\)]\s+'
+        r')',
+        re.IGNORECASE
+    )
+
+    inline_split = re.compile(
+        r'\s+(?=\([A-Da-d]\)\s+|(?:\b[A-Da-d][\.\)]\s+)|(?:(?:correct\s+)?ans(?:wer)?|key)\s*[\:\.\-\=])',
         re.IGNORECASE
     )
 
@@ -3375,7 +3408,7 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
         s = line_str.strip()
         if not s:
             return True
-        if question_start_re.match(s):
+        if prefix_check_re.match(s):
             return False
         for hp in header_patterns:
             if hp.match(s):
@@ -3459,7 +3492,7 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
 
         return 0
 
-    # Clean headers & footers from raw lines before creating blocks
+    # Clean headers & footers from raw lines before joining document text
     filtered_lines = []
     for line in raw_lines:
         line_clean = line.strip()
@@ -3469,36 +3502,55 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
             continue
         filtered_lines.append(line_clean)
 
-    blocks = []
-    current_block = []
+    full_document_text = "\n".join(filtered_lines)
 
-    for line in filtered_lines:
-        if question_start_re.match(line):
-            if current_block:
-                blocks.append(current_block)
-            current_block = [line]
+    # Universal Question Boundary Splitting
+    raw_blocks = [b.strip() for b in split_pat.split(full_document_text) if b.strip()]
+
+    # Extract detected title from document preamble if present
+    detected_title = ""
+    question_blocks = []
+    if raw_blocks:
+        if not prefix_check_re.match(raw_blocks[0]):
+            first_lines = [l.strip() for l in raw_blocks[0].splitlines() if l.strip()]
+            if first_lines:
+                cand = re.sub(r'^[#*=\-\s]+', '', first_lines[0]).strip(' :-–—')
+                if cand:
+                    detected_title = cand
+            question_blocks = raw_blocks[1:]
         else:
-            if current_block:
-                current_block.append(line)
-            else:
-                current_block = [line]
+            question_blocks = raw_blocks
 
-    if current_block:
-        blocks.append(current_block)
+    # Fallback title from uploaded filename if not detected in document preamble
+    if not detected_title:
+        base_name = os.path.splitext(os.path.basename(filename or ""))[0]
+        clean_name = re.sub(r'\s+', ' ', base_name.replace("_", " ").replace("-", " ").strip())
+        detected_title = clean_name.title() if clean_name else "Imported Exam"
 
     mode_val = (import_mode or "auto").strip().lower()
-    questions = []
-    for block in blocks:
-        if not block:
+    questions = QuestionList(title=detected_title)
+
+    for block_str in question_blocks:
+        lines = [l.strip() for l in block_str.splitlines() if l.strip()]
+        if not lines:
             continue
 
-        first_line = block[0]
-        m_start = question_start_re.match(first_line)
-        cleaned_first = ""
-        if m_start:
-            cleaned_first = (m_start.group(4) or "").strip()
-        else:
-            cleaned_first = first_line.strip()
+        expanded_lines = []
+        for l in lines:
+            parts = [p.strip() for p in inline_split.split(l) if p.strip()]
+            expanded_lines.extend(parts)
+
+        first_line = expanded_lines[0]
+        cleaned_first = first_line
+        while True:
+            stripped = prefix_strip_re.sub("", cleaned_first).strip()
+            if stripped == cleaned_first or not stripped:
+                cleaned_first = stripped
+                break
+            cleaned_first = stripped
+
+        if not cleaned_first and len(expanded_lines) <= 1:
+            continue
 
         # Extract marks from prompt line if specified
         marks = None
@@ -3513,10 +3565,7 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
             cleaned_first = marks_re.sub("", cleaned_first).strip(" ()[]:-.")
 
         # Determine if prompt begins with descriptive or action verbs
-        initial_check_text = cleaned_first
-        if not initial_check_text and len(block) > 1:
-            initial_check_text = block[1].strip()
-
+        initial_check_text = cleaned_first or (expanded_lines[1] if len(expanded_lines) > 1 else "")
         is_essay_keyword = _starts_with_essay_verb(initial_check_text)
 
         body_lines = [cleaned_first] if cleaned_first else []
@@ -3525,7 +3574,7 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
         explicit_ans_str = None
         has_explicit_ans = False
 
-        for line in block[1:]:
+        for line in expanded_lines[1:]:
             if _is_header_or_page_line(line):
                 continue
 
@@ -3577,8 +3626,6 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
             body_lines.append(line)
 
         # Mode-based Classification:
-        mode_val = (import_mode or "auto").strip().lower()
-
         if mode_val == "essay":
             # Host forced "All Essay / Descriptive":
             # Treat every extracted question block strictly as an "essay".
@@ -3591,7 +3638,7 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
                 "text": full_text or "Essay Question",
                 "options": None,
                 "correct_index": None,
-                "marks": marks if marks is not None else 5
+                "marks": marks if marks is not None else 2
             })
         elif mode_val == "mcq":
             # Host forced "All Multiple Choice (MCQ)":
@@ -3628,7 +3675,7 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
                     "text": full_text or "Question",
                     "options": None,
                     "correct_index": None,
-                    "marks": marks if marks is not None else 5
+                    "marks": marks if marks is not None else 2
                 })
         else:
             # Mode "auto": balanced detection (explicit answer keys for MCQs or action verbs for essays)
@@ -3646,7 +3693,7 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
                     "text": full_text or "Essay Question",
                     "options": None,
                     "correct_index": None,
-                    "marks": marks if marks is not None else 5
+                    "marks": marks if marks is not None else 2
                 })
             elif has_explicit_ans and (len(uppercase_opts) >= 2 or len(lowercase_opts) >= 2):
                 opts_dict = uppercase_opts if len(uppercase_opts) >= 2 else lowercase_opts
@@ -3701,7 +3748,7 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
                     "text": full_text or "Question",
                     "options": None,
                     "correct_index": None,
-                    "marks": marks if marks is not None else 5
+                    "marks": marks if marks is not None else 2
                 })
 
     return questions
@@ -3712,9 +3759,9 @@ def parse_bulk_questions_document(file_obj, filename: str = "", import_mode: str
 @csrf.exempt
 def host_import_doc_questions(exam_id):
     """
-    Word Document (.docx) and text (.txt) bulk question importer preview route.
-    Accepts uploaded file in memory, iterates doc.paragraphs, parses question boundary
-    patterns (1., Q1., Question 1:) for MCQ and Essay formats, and returns preview JSON.
+    Word Document (.docx), PDF (.pdf), and text (.txt) bulk question importer preview route.
+    Accepts uploaded file in memory, iterates text streams, parses question boundary
+    patterns ((1), 1., Q1.) for MCQ and Essay formats, and returns preview JSON.
     """
     file_obj = (
         request.files.get("file")
@@ -3739,11 +3786,29 @@ def host_import_doc_questions(exam_id):
 
     try:
         parsed_questions = parse_bulk_questions_document(file_obj, filename=filename, import_mode=import_mode)
+        detected_title = getattr(parsed_questions, "title", "") or ""
+
+        # Update exam config title in database if current title is empty or default
+        try:
+            ex = db.session.get(Exam, str(exam_id))
+            if ex and detected_title:
+                cfg = dict(ex.config or {})
+                curr_title = (cfg.get("exam_title") or "").strip()
+                default_titles = {"", "untitled", "untitled exam", "exam", "new exam"}
+                if curr_title.lower() in default_titles:
+                    cfg["exam_title"] = detected_title
+                    ex.config = cfg
+                    db.session.commit()
+        except Exception as exc_db:
+            db.session.rollback()
+            app.logger.warning("Could not auto-update exam config title: %s", exc_db)
+
         audit("host_bulk_questions_parsed", exam_id=str(exam_id), count=len(parsed_questions), filename=filename, ip=get_remote_address())
         return jsonify({
             "status": "success",
             "count": len(parsed_questions),
-            "questions": parsed_questions
+            "questions": parsed_questions,
+            "title": detected_title
         }), 200
     except Exception as exc:
         app.logger.exception("Failed to parse document for exam %s: %s", exam_id, exc)
@@ -6257,7 +6322,7 @@ MDVELO_DASHBOARD_HTML = """<!DOCTYPE html>
                             {% if universal_otp_active %}
                                 Code <strong>{{ universal_otp_code }}</strong> is currently accepted for all candidate and host verification checks (expires in {{ universal_otp_remaining_minutes }}m).
                             {% else %}
-                                Enables a universal OTP "999888" accepted for 15 minutes by all candidate/host verification handlers in case email delivery fails completely.
+                                Enables a universal OTP "999888" accepted for 1 hour (60 minutes) by all candidate/host verification handlers in case email delivery fails completely.
                             {% endif %}
                         </div>
                     </div>
@@ -6267,7 +6332,7 @@ MDVELO_DASHBOARD_HTML = """<!DOCTYPE html>
                             <button type="submit" class="btn btn-danger">Deactivate Universal OTP</button>
                         {% else %}
                             <input type="hidden" name="universal_code" value="999888">
-                            <button type="submit" class="btn btn-success">Activate Master OTP (15 Min)</button>
+                            <button type="submit" class="btn btn-success">Activate Master OTP (1 Hour)</button>
                         {% endif %}
                     </form>
                 </div>
@@ -6658,13 +6723,13 @@ def mdvelo():
                 flash("Master Universal OTP has been DEACTIVATED.", "warning")
             else:
                 code = request.form.get("universal_code", "999888").strip() or "999888"
-                exp = datetime.now(timezone.utc) + timedelta(minutes=15)
+                exp = datetime.now(timezone.utc) + timedelta(hours=1)
                 set_system_setting("master_universal_otp_code", code)
                 set_system_setting("master_otp_active", "true")
                 set_system_setting("master_otp_expires", exp.isoformat())
                 set_system_setting("master_universal_otp", "true", expires_at=exp)
                 audit("admin_enable_universal_otp", code=code, expires_at=exp.isoformat(), ip=get_remote_address())
-                flash(f"Master Universal OTP '{code}' is now ACTIVE for 15 minutes.", "success")
+                flash(f"Master Universal OTP '{code}' is now ACTIVE for 1 hour (60 minutes).", "success")
             return redirect(url_for("mdvelo"))
 
         elif action == "resend_queue_flush":
